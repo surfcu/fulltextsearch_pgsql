@@ -36,7 +36,7 @@ This app provides a PostgreSQL-based alternative to Elasticsearch for Nextcloud'
 
 ```bash
 cd /path/to/nextcloud/apps
-git clone https://github.com/yourusername/fulltextsearch_pgsql.git
+git clone https://github.com/surfcu/fulltextsearch_pgsql.git
 cd fulltextsearch_pgsql
 composer install --no-dev
 ```
