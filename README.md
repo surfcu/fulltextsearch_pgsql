@@ -250,5 +250,5 @@ Built for Nextcloud's Full Text Search framework.
 
 ## Support
 
-- Issues: https://github.com/yourusername/fulltextsearch_pgsql/issues
+- Issues: https://github.com/surfcu/fulltextsearch_pgsql/issues
 - Nextcloud Community: https://help.nextcloud.com
