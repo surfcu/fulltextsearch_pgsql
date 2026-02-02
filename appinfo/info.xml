@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+    <id>fulltextsearch_pgsql</id>
+    <name>Full Text Search - PostgreSQL</name>
+    <summary>PostgreSQL platform for Full Text Search</summary>
+    <description><![CDATA[Index and search your Nextcloud using PostgreSQL's native full-text search capabilities.
+
+This app provides a PostgreSQL-based search platform for the Full Text Search framework, offering:
+- Native PostgreSQL full-text search with ts_vector
+- Trigram similarity for fuzzy matching
+- Multi-language support
+- Lower resource footprint than Elasticsearch
+- No additional infrastructure required if already using PostgreSQL
+
+Perfect for small to medium Nextcloud instances that want powerful search without the complexity of Elasticsearch.]]></description>
+    <version>1.0.0</version>
+    <licence>agpl</licence>
+    <author>surfcu</author>
+    <namespace>FullTextSearch_PgSql</namespace>
+    <category>tools</category>
+    <bugs>https://github.com/surfcu/fulltextsearch_pgsql/issues</bugs>
+    <repository type="git">https://github.com/surfcu/fulltextsearch_pgsql</repository>
+    <screenshot>https://raw.githubusercontent.com/surfcu/fulltextsearch_pgsql/master/screenshots/search.png</screenshot>
+    
+    <dependencies>
+        <nextcloud min-version="25" max-version="30"/>
+        <php min-version="8.0" max-version="8.3"/>
+        <database>pgsql</database>
+    </dependencies>
+
+    <types>
+        <filesystem/>
+    </types>
+
+    <fulltextsearch>
+        <provider>OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform</provider>
+    </fulltextsearch>
+</info>
