@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-10-03
+
+### Changed
+- Supports Nextcloud 29–35. The full-text search interfaces and the server classes this app uses are unchanged through Nextcloud 35; checked with Psalm against the Nextcloud 34 and 35 APIs and with the framework's own test searches.
+- CI covers Nextcloud 30/34/35 APIs and PHP 8.1–8.5, and the test suite now fails on PHP deprecation notices from the app.
+
 ## [1.1.0] - 2026-10-03
 
 A rewrite. Version 1.0.0 did not implement Nextcloud's `IFullTextSearchPlatform` interface and could not be loaded by the Full Text Search framework, so there is no index data to migrate. After upgrading, run `occ fulltextsearch:index`.
@@ -37,7 +43,7 @@ A rewrite. Version 1.0.0 did not implement Nextcloud's `IFullTextSearchPlatform`
 - Documentation describing features that did not exist; docs were rewritten to match the code.
 
 ### Changed
-- Requires Nextcloud 29–32 and PHP 8.1+.
+- Requires Nextcloud 29 or newer and PHP 8.1+.
 
 ## [1.0.0] - 2025-02-02
 

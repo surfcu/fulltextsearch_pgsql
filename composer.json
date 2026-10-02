@@ -26,9 +26,6 @@
         "test": "php tests/run.php"
     },
     "config": {
-        "platform": {
-            "php": "8.1"
-        },
         "sort-packages": true
     }
 }

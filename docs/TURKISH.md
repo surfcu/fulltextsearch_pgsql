@@ -6,7 +6,7 @@ Bu uygulama, Nextcloud'un Full Text Search altyapısı için PostgreSQL'in yerle
 
 ## Kurulum
 
-Gereksinimler: Nextcloud 29–32, PostgreSQL 12 veya üstü (Nextcloud'un kendi veritabanı), **Full Text Search** ve **Full Text Search - Files** uygulamaları.
+Gereksinimler: Nextcloud 29–35, PostgreSQL 12 veya üstü (Nextcloud'un kendi veritabanı), **Full Text Search** ve **Full Text Search - Files** uygulamaları.
 
 ```bash
 cd /var/www/nextcloud/apps

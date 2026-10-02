@@ -33,6 +33,16 @@ use ZipArchive;
 
 require __DIR__ . '/bootstrap.php';
 
+// Any warning, notice or deprecation raised from the app's own code fails the run. This is
+// what makes the PHP 8.4/8.5 CI jobs meaningful. Errors silenced with @ are ignored.
+$appIssues = [];
+set_error_handler(static function (int $level, string $message, string $file, int $line) use (&$appIssues): bool {
+	if ((error_reporting() & $level) && str_starts_with($file, dirname(__DIR__) . '/lib/')) {
+		$appIssues[] = "$message at " . substr($file, strlen(dirname(__DIR__)) + 1) . ":$line";
+	}
+	return false;
+});
+
 $dsn = getenv('FTSPG_TEST_DSN') ?: 'pgsql:host=/var/tmp;port=5544;dbname=postgres;user=postgres';
 
 // ---------------------------------------------------------------- tiny test framework
@@ -412,6 +422,9 @@ try {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";
 }
+
+section('PHP warnings and deprecations from app code');
+same([], array_values(array_unique($appIssues)), 'none raised');
 
 echo "\n$passes passed, $failures failed\n";
 exit($failures === 0 ? 0 : 1);

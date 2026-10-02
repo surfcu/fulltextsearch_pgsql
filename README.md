@@ -15,9 +15,9 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 
 ## Requirements
 
-- Nextcloud 29–32 running on **PostgreSQL 12 or newer**
+- Nextcloud 29–35 running on **PostgreSQL 12 or newer**
 - The **Full Text Search** app plus at least one content provider, e.g. **Full Text Search - Files**
-- PHP 8.1+ with `zip` (for office documents)
+- The PHP version your Nextcloud release requires (8.1+ for Nextcloud 29, 8.3+ for 35), with `zip` for office documents
 - Optional: `poppler-utils` for PDF text (`apt install poppler-utils`)
 - Optional: the `pg_trgm` extension for typo tolerance. Since PostgreSQL 13 it is a trusted extension and the app creates it automatically when the Nextcloud database user owns the database. Otherwise a superuser can run `CREATE EXTENSION pg_trgm;` in the Nextcloud database.
 
@@ -118,7 +118,7 @@ composer psalm            # static analysis against the real Nextcloud interface
 FTSPG_TEST_DSN="pgsql:host=localhost;dbname=fts_test;user=postgres;password=postgres" composer test
 ```
 
-The integration tests run against a real, disposable PostgreSQL database. CI runs them on PHP 8.1/PostgreSQL 13 and PHP 8.3/PostgreSQL 17.
+The integration tests run against a real, disposable PostgreSQL database. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, and the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13 and 17. To check against a specific Nextcloud release, install its API stubs first: `composer require --dev nextcloud/ocp:dev-stable35`.
 
 ## License
 

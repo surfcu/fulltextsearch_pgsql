@@ -10,15 +10,19 @@ permissions:
 
 jobs:
   test:
+    name: NC ${{ matrix.nextcloud }} / PHP ${{ matrix.php }} / PG ${{ matrix.postgres }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - php: '8.1'
-            postgres: '13'
-          - php: '8.3'
-            postgres: '17'
+          # Oldest supported (nextcloud-deps/ocp has no stable29 branch; 30 is the closest API).
+          - { nextcloud: '30', php: '8.1', postgres: '13', psalm: true }
+          - { nextcloud: '34', php: '8.3', postgres: '16', psalm: true }
+          - { nextcloud: '35', php: '8.3', postgres: '17', psalm: true }
+          # Psalm 5 does not install on PHP 8.4+; these jobs check runtime behaviour and deprecations.
+          - { nextcloud: '35', php: '8.4', postgres: '17', psalm: false }
+          - { nextcloud: '35', php: '8.5', postgres: '17', psalm: false }
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -29,20 +33,25 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
           extensions: pdo_pgsql, zip, mbstring
           coverage: none
-      - name: Install pdftotext
+      - name: Install pdftotext and xmllint
         run: sudo apt-get update && sudo apt-get install -y poppler-utils libxml2-utils
-      - run: composer install --no-interaction --no-progress
+      - name: Select Nextcloud API version
+        run: |
+          composer require --dev --no-update "nextcloud/ocp:dev-stable${{ matrix.nextcloud }}"
+          if [ "${{ matrix.psalm }}" != "true" ]; then composer remove --dev --no-update vimeo/psalm; fi
+      - run: composer update --no-interaction --no-progress
       - name: Validate appinfo/info.xml
         run: |
           curl -sSfL -o /tmp/info.xsd https://apps.nextcloud.com/schema/apps/info.xsd
           xmllint --noout --schema /tmp/info.xsd appinfo/info.xml
       - name: Psalm
+        if: matrix.psalm
         run: composer psalm
       - name: Integration tests
         env:
