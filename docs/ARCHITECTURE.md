@@ -1,477 +1,129 @@
-# Architecture Documentation
+# Architecture
 
-## Overview
+How the PostgreSQL platform plugs into Nextcloud Full Text Search, and why it is built the way it is.
 
-Full Text Search - PostgreSQL is a platform provider for Nextcloud's Full Text Search framework. It implements native PostgreSQL full-text search capabilities to provide fast, efficient search functionality without requiring external services like Elasticsearch.
-
-## System Architecture
+## Where it sits
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Nextcloud Core                        │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │         Full Text Search Framework                 │ │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────┐│ │
-│  │  │   Content    │  │   Content    │  │ Content  ││ │
-│  │  │  Providers   │  │  Providers   │  │ Provider ││ │
-│  │  │   (Files)    │  │  (Bookmarks) │  │  (Talk)  ││ │
-│  │  └──────┬───────┘  └──────┬───────┘  └────┬─────┘│ │
-│  │         │                  │                │      │ │
-│  │         └──────────────────┴────────────────┘      │ │
-│  │                           │                        │ │
-│  │              ┌────────────▼───────────┐            │ │
-│  │              │  Platform Interface    │            │ │
-│  │              │ IFullTextSearchPlatform│            │ │
-│  │              └────────────┬───────────┘            │ │
-│  └───────────────────────────┼────────────────────────┘ │
-└────────────────────────────────────────────────────────┘
-                               │
-                               │
-┌──────────────────────────────▼───────────────────────────┐
-│         Full Text Search - PostgreSQL App                 │
-│  ┌─────────────────────────────────────────────────────┐ │
-│  │         PostgreSQLPlatform (Main Class)             │ │
-│  └──┬──────────────────┬──────────────────┬───────────┘ │
-│     │                  │                  │              │
-│     ▼                  ▼                  ▼              │
-│  ┌─────────┐    ┌──────────┐      ┌──────────┐         │
-│  │ Config  │    │  Index   │      │  Search  │         │
-│  │ Service │    │ Service  │      │ Service  │         │
-│  └────┬────┘    └────┬─────┘      └────┬─────┘         │
-│       │              │                  │               │
-│       └──────────────┴──────────────────┘               │
-│                      │                                  │
-│              ┌───────▼────────┐                         │
-│              │  IndexMapper   │                         │
-│              │  (Data Access) │                         │
-│              └───────┬────────┘                         │
-└──────────────────────┼──────────────────────────────────┘
-                       │
-                       ▼
-         ┌─────────────────────────┐
-         │  PostgreSQL Database    │
-         │  ┌───────────────────┐  │
-         │  │ fts_pgsql_index   │  │
-         │  │  - content_tsv    │  │
-         │  │  - GIN indexes    │  │
-         │  │  - trigram index  │  │
-         │  └───────────────────┘  │
-         └─────────────────────────┘
+ Content providers                 Full Text Search app               This app
+ (Files, Deck, Bookmarks…)  ──►   (queues, locking, occ,      ──►   PostgreSQLPlatform
+  produce IIndexDocument           unified search UI)                implements IFullTextSearchPlatform
+                                                                          │
+                                                                          ▼
+                                                              Nextcloud's own PostgreSQL DB
+                                                              table ftspg_<prefix>index
 ```
 
-## Component Details
+The framework calls the platform through `OCP\FullTextSearch\IFullTextSearchPlatform`:
 
-### 1. PostgreSQLPlatform
+| Method | What happens here |
+|---|---|
+| `loadPlatform()` | Creates the table if it is missing. |
+| `testPlatform()` | Checks the database is PostgreSQL and the schema is in place. |
+| `initializeIndex()` | Creates table and indexes (idempotent). |
+| `indexDocument()` | Extracts text, then upserts one row. Reports warnings to the runner. |
+| `deleteIndexes()` | Deletes rows. |
+| `resetIndex($provider)` | Deletes a provider's rows; `all` truncates the table. |
+| `searchRequest()` | Runs a search for one provider and fills the `ISearchResult`. |
+| `getDocument()` | Rebuilds an `IIndexDocument` from a row (used by `occ fulltextsearch:document:platform` and `occ fulltextsearch:test`). |
 
-**Location:** `lib/Platform/PostgreSQLPlatform.php`
+## Code layout
 
-**Purpose:** Main entry point that implements `IFullTextSearchPlatform` interface.
+| Class | Role |
+|---|---|
+| `Platform\PostgreSQLPlatform` | The interface implementation; thin, delegates to services and maps results to index statuses. |
+| `Service\SchemaService` | Creates/drops the table, detects `pg_trgm` and installed text search configurations. |
+| `Service\IndexService` | Builds the row and runs the upsert. |
+| `Service\ContentExtractor` | base64 decoding and text extraction (plain text, ODF, OOXML, PDF). |
+| `Service\TsQueryBuilder` | Parses the user's query into parameterised tsquery expressions. |
+| `Service\SearchService` | Search and `getDocument`. |
+| `Service\AccessTokens` | Encodes document access and the viewer's identity as comparable tokens. |
+| `Service\ConfigService` | Validated settings stored in app config. |
+| `Command\Configure` | `occ fulltextsearch_pgsql:configure`. |
+| `Migration\CreateIndexTable`, `DropIndexTable` | Repair steps run on install/upgrade and uninstall. |
 
-**Responsibilities:**
-- Platform identification and metadata
-- Delegating operations to service classes
-- Configuration management
-- Platform testing and initialization
-
-**Key Methods:**
-- `getId()`: Returns unique platform ID ('pgsql')
-- `testPlatform()`: Validates PostgreSQL availability
-- `indexDocument()`: Delegates document indexing
-- `search()`: Delegates search operations
-
-### 2. ConfigService
-
-**Location:** `lib/Service/ConfigService.php`
-
-**Purpose:** Manages platform configuration settings.
-
-**Configuration Options:**
-- `language`: PostgreSQL text search language (default: 'english')
-- `use_trigram`: Enable trigram similarity search (default: true)
-- `min_word_length`: Minimum word length for indexing (default: 3)
-- `max_results`: Maximum search results per page (default: 100)
-
-**Storage:** Uses Nextcloud's `IConfig` interface for persistent storage.
-
-### 3. IndexService
-
-**Location:** `lib/Service/IndexService.php`
-
-**Purpose:** Handles all document indexing operations.
-
-**Key Operations:**
-- **Platform Initialization**: Creates database structures and enables extensions
-- **Document Indexing**: Processes documents and creates searchable entries
-- **Document Updates**: Handles document modifications
-- **Index Management**: Reset and delete operations
-
-**Indexing Process:**
-1. Receive document from content provider
-2. Extract and prepare content (title, body, tags, metadata)
-3. Create database entry with ts_vector
-4. Update GIN indexes
-5. Return index status
-
-### 4. SearchService
-
-**Location:** `lib/Service/SearchService.php`
-
-**Purpose:** Executes search queries and returns results.
-
-**Search Features:**
-- Full-text search using `ts_query` and `ts_vector`
-- Relevance ranking with `ts_rank()`
-- Trigram similarity for fuzzy matching
-- Tag and metadata filtering
-- Access control enforcement
-- Result pagination
-
-**Search Process:**
-1. Receive search request
-2. Sanitize search query
-3. Build PostgreSQL query with filters
-4. Execute search with ranking
-5. Generate excerpts
-6. Return formatted results
-
-### 5. IndexMapper
-
-**Location:** `lib/Db/IndexMapper.php`
-
-**Purpose:** Data access layer for database operations.
-
-**Database Schema:**
+## The table
 
 ```sql
-CREATE TABLE fts_pgsql_index (
-    id BIGSERIAL PRIMARY KEY,
-    provider_id VARCHAR(64) NOT NULL,
-    document_id VARCHAR(255) NOT NULL,
-    user_id VARCHAR(64) NOT NULL,
-    access TEXT,
-    content TEXT NOT NULL,
-    title VARCHAR(255),
-    tags TEXT,
-    metatags TEXT,
-    subtags TEXT,
-    indexed_at INTEGER NOT NULL,
-    content_tsv tsvector,  -- Full-text search vector
-    
-    UNIQUE(provider_id, document_id)
+CREATE TABLE ftspg_oc_index (
+  id            bigserial PRIMARY KEY,
+  provider_id   varchar(64)  NOT NULL,
+  document_id   varchar(254) NOT NULL,
+  owner_id      varchar(64)  NOT NULL DEFAULT '',
+  access        text[]       NOT NULL DEFAULT '{}',   -- u:alice, g:sales, c:<circle>, u:__all
+  links         text[]       NOT NULL DEFAULT '{}',
+  tags, metatags, subtags     text[],
+  source, hash, modified_time, indexed_at,
+  config        regconfig    NOT NULL,                -- language the row was indexed with
+  title, tags_text, parts (jsonb), parts_text, content, info (jsonb),
+  tsv tsvector GENERATED ALWAYS AS (
+        setweight(to_tsvector(config, title),      'A')
+     || setweight(to_tsvector(config, tags_text),  'B')
+     || setweight(to_tsvector(config, parts_text), 'C')
+     || setweight(to_tsvector(config, content),    'D')
+  ) STORED,
+  UNIQUE (provider_id, document_id)
 );
-
--- Indexes
-CREATE INDEX ON fts_pgsql_index USING GIN (content_tsv);
-CREATE INDEX ON fts_pgsql_index USING GIN (content gin_trgm_ops);
-CREATE INDEX ON fts_pgsql_index (provider_id);
-CREATE INDEX ON fts_pgsql_index (document_id);
-CREATE INDEX ON fts_pgsql_index (user_id);
+-- GIN indexes on tsv, access, metatags, subtags; trigram GIN index on title when pg_trgm exists
 ```
 
-**Key Methods:**
-- `createIndexTable()`: Creates database schema
-- `insertDocument()`: Adds document to index
-- `search()`: Executes search queries
-- `searchCount()`: Returns total result count
-- `deleteDocument()`: Removes document from index
+(For Turkish rows each column is first passed through `translate(col, 'Iİ', 'ıi')`; see below.)
 
-## Data Flow
+### Why raw SQL and an unprefixed table name
 
-### Indexing Flow
+Nextcloud manages schemas through Doctrine, and Doctrine has no mapping for `tsvector`, `text[]` or `regconfig`. Nextcloud introspects **every** table that starts with its table prefix whenever any app runs a migration. A prefixed table with these columns would make all of those migrations fail with *"Unknown database type tsvector requested"*.
 
-```
-Content Provider
-      │
-      ▼
-IIndexDocument ──────────► PostgreSQLPlatform.indexDocument()
-                                    │
-                                    ▼
-                          IndexService.indexDocument()
-                                    │
-                    ┌───────────────┴────────────────┐
-                    │                                │
-                    ▼                                ▼
-          Prepare Content                  Extract Metadata
-                    │                                │
-                    └───────────────┬────────────────┘
-                                    ▼
-                        IndexMapper.insertDocument()
-                                    │
-                    ┌───────────────┴────────────────┐
-                    │                                │
-                    ▼                                ▼
-           Insert into database            Update ts_vector
-                    │                                │
-                    └───────────────┬────────────────┘
-                                    ▼
-                              Return IIndex
-```
+So the table is created with raw SQL by a repair step and named `ftspg_` + prefix + `index`, which Nextcloud's schema filter skips. The app also drops `oc_fts_pgsql_index`, the table version 1.0.0 tried to create, for the same reason.
 
-### Search Flow
+### Why a generated column
 
-```
-Search Request
-      │
-      ▼
-ISearchRequest ───────────► PostgreSQLPlatform.search()
-                                    │
-                                    ▼
-                          SearchService.search()
-                                    │
-                    ┌───────────────┴────────────────┐
-                    │                                │
-                    ▼                                ▼
-          Sanitize Query                    Apply Filters
-                    │                                │
-                    └───────────────┬────────────────┘
-                                    ▼
-                          IndexMapper.search()
-                                    │
-                    ┌───────────────┴────────────────┐
-                    │                                │
-                    ▼                                ▼
-        Build PostgreSQL Query              Execute with Ranking
-                    │                                │
-                    └───────────────┬────────────────┘
-                                    ▼
-                          Format Results & Excerpts
-                                    │
-                                    ▼
-                            ISearchResult
-```
+The search vector is always consistent with the stored text, a single `INSERT … ON CONFLICT DO UPDATE` writes a document atomically, and weights come for free. Storing `config` per row keeps old rows valid if the language setting changes, until they are reindexed.
 
-## PostgreSQL Full-Text Search Explained
+## Indexing
 
-### ts_vector
+1. The framework hands over an `IIndexDocument` whose `IIndex` status says what changed.
+2. If only metadata changed (`INDEX_META` without `INDEX_CONTENT`), the stored content and parts are kept: a new share does not wipe the text.
+3. Otherwise `ContentExtractor` produces text:
+   - not encoded → used as is (HTML tags stripped if present);
+   - base64 → decoded, then by magic bytes: `%PDF-` → `pdftotext`; `PK\x03\x04` → zip, reading `content.xml` (ODF) or `word/*.xml`, `xl/sharedStrings.xml`, `ppt/slides/*.xml` (OOXML); text-like → UTF-8 / UTF-16 / Windows-1254; other binaries → no content plus a warning.
+   - Result is valid UTF-8, has no NUL bytes, whitespace is collapsed, and it is cut to `max_content_size` bytes on a character boundary.
+4. One upsert writes the row. If it fails while content is present (typically the 1 MB `tsvector` limit), it is retried without content so the document stays findable by title, and the runner gets a warning.
 
-A `ts_vector` is a sorted list of distinct lexemes (normalized words). It's the indexed representation of a document.
+## Access control
 
-Example:
-```sql
-SELECT to_tsvector('english', 'The quick brown fox jumps over the lazy dog');
--- Result: 'brown':3 'dog':9 'fox':4 'jump':5 'lazi':8 'quick':2
-```
-
-### ts_query
-
-A `ts_query` represents a search query with operators:
-- `&` (AND)
-- `|` (OR)
-- `!` (NOT)
-- `<->` (phrase search)
-
-Example:
-```sql
-SELECT to_tsquery('english', 'quick & fox');
--- Matches documents containing both "quick" and "fox"
-```
-
-### Searching
-
-The `@@` operator checks if a `ts_vector` matches a `ts_query`:
+Document access becomes an array of tokens: the owner and shared users as `u:<uid>`, groups as `g:<gid>`, circles as `c:<id>`, and `u:__all` for public documents. At search time the framework passes an `IDocumentAccess` with the viewer's id, groups and circles, which becomes the same kind of tokens. A row is visible when the arrays overlap:
 
 ```sql
-SELECT * FROM fts_pgsql_index
-WHERE content_tsv @@ to_tsquery('english', 'search:* & terms:*');
+WHERE d.access && '{u:alice,u:__all,g:sales,c:team1}'::text[]
 ```
 
-### Ranking
+That is a single GIN-indexed test. Share links are stored for `getDocument()` but never grant search access. An empty viewer id returns no results.
 
-`ts_rank()` calculates relevance scores:
+## Searching
 
-```sql
-SELECT 
-    title,
-    ts_rank(content_tsv, to_tsquery('english', 'search:*')) as rank
-FROM fts_pgsql_index
-WHERE content_tsv @@ to_tsquery('english', 'search:*')
-ORDER BY rank DESC;
-```
+`TsQueryBuilder` follows the framework's query contract (verified by `occ fulltextsearch:test`):
 
-### Trigram Similarity
+| Input | Meaning | tsquery |
+|---|---|---|
+| `word` | optional, prefix | `to_tsquery(cfg, '''word'':*')` |
+| `+word` | required, prefix | same, ANDed |
+| `-word` | excluded, exact | `!! to_tsquery(cfg, '''word''')` |
+| `"a b"` / `+"a b"` / `-"a b"` | phrase | `phraseto_tsquery(cfg, 'a b')` |
 
-The `pg_trgm` extension enables fuzzy matching:
+User text is always a bound parameter and quoted as a tsquery literal, so neither SQL nor tsquery operators can be injected. Three expressions are built:
 
-```sql
-SELECT * FROM fts_pgsql_index
-WHERE content % 'serch';  -- Finds 'search' even with typo
-```
+- **match**: required terms ANDed (or, if there are none, optional terms ORed), minus exclusions;
+- **rank**: every positive term, for `ts_rank_cd`;
+- **all**: every positive term ANDed. Rows matching it sort first, so precise matches are never buried under partial ones.
 
-## Performance Characteristics
+The query pages inside a subquery and computes `count(*) OVER ()` for the total; `ts_headline` then runs only on the returned page. Excerpts are plain text (no markup), split into fragments.
 
-### Indexing Performance
+If page 1 has no results and `pg_trgm` is available, titles are searched with `word_similarity` (`<%`, GIN-indexed) for typo tolerance.
 
-| Document Count | Index Time (avg) | Disk Usage |
-|----------------|------------------|------------|
-| 1,000          | ~5 seconds       | ~10 MB     |
-| 10,000         | ~45 seconds      | ~80 MB     |
-| 100,000        | ~7 minutes       | ~700 MB    |
-| 1,000,000      | ~60 minutes      | ~6 GB      |
+## Turkish dotted and dotless I
 
-### Search Performance
+PostgreSQL lowercases with the database's `LC_CTYPE`. Unless that is `tr_TR`, `I` lowercases to `i`, which is wrong for Turkish (`ı`), so `ISPARTA` would index as `isparta` while users type `ısparta`, and uppercase text would miss its lowercase forms. For rows with the `turkish` configuration the generated column applies `translate(text, 'Iİ', 'ıi')` before `to_tsvector`, and `TsQueryBuilder` applies the same mapping to the query. Both sides agree regardless of the database locale.
 
-| Document Count | Search Time (avg) |
-|----------------|-------------------|
-| 1,000          | < 10 ms           |
-| 10,000         | < 20 ms           |
-| 100,000        | < 50 ms           |
-| 1,000,000      | < 150 ms          |
+## Tests
 
-*Performance measured on typical hardware (4 cores, 8GB RAM, SSD)*
-
-## Scalability Considerations
-
-### Vertical Scaling
-- Increase PostgreSQL `shared_buffers`
-- Add more RAM for caching
-- Use faster storage (NVMe SSD)
-
-### Horizontal Scaling Limitations
-- PostgreSQL FTS doesn't support distributed search
-- For multi-server setups, consider database replication
-- Read replicas can handle search queries
-
-### When to Consider Elasticsearch
-- Document count > 10 million
-- Need for distributed search
-- Complex aggregations required
-- Multiple data centers
-
-## Security
-
-### Access Control
-
-Documents are filtered by user access:
-
-```sql
-WHERE (user_id = ? OR access IS NULL OR access = '[]')
-```
-
-### SQL Injection Prevention
-
-All queries use parameterized statements:
-
-```php
-$qb->where($qb->expr()->eq('user_id', $qb->createNamedParameter($userId)))
-```
-
-### Privilege Separation
-
-The app uses Nextcloud's database connection with appropriate permissions.
-
-## Extension Requirements
-
-### Required: None (uses standard PostgreSQL)
-
-### Optional but Recommended: pg_trgm
-
-Enables fuzzy/similarity search:
-
-```sql
-CREATE EXTENSION pg_trgm;
-```
-
-Benefits:
-- Typo tolerance
-- Similarity ranking
-- Partial word matching
-
-## Integration Points
-
-### Nextcloud Full Text Search Framework
-
-Implements these interfaces:
-- `IFullTextSearchPlatform`: Main platform interface
-- Works with `IIndexDocument`: Document to index
-- Works with `ISearchRequest`: Search parameters
-- Works with `ISearchResult`: Search results
-
-### Content Providers
-
-Compatible with any FTS content provider:
-- Files
-- Bookmarks
-- Talk
-- Deck
-- Custom providers
-
-### Database
-
-Requires PostgreSQL as Nextcloud database:
-- Version 12+
-- Standard SQL support
-- Extension support
-
-## Monitoring and Debugging
-
-### Logging
-
-Uses Nextcloud's PSR-3 logger:
-
-```php
-$this->logger->error('Error message', ['exception' => $e]);
-$this->logger->info('Operation completed');
-```
-
-Logs appear in: `data/nextcloud.log`
-
-### Database Queries
-
-Enable PostgreSQL query logging in `postgresql.conf`:
-
-```conf
-log_statement = 'all'
-log_duration = on
-log_min_duration_statement = 100
-```
-
-### Performance Monitoring
-
-```sql
--- Active queries
-SELECT * FROM pg_stat_activity WHERE state = 'active';
-
--- Index usage
-SELECT * FROM pg_stat_user_indexes WHERE tablename = 'fts_pgsql_index';
-
--- Table statistics
-SELECT * FROM pg_stat_user_tables WHERE tablename = 'fts_pgsql_index';
-```
-
-## Future Enhancements
-
-### Planned Features
-1. Autocomplete/suggestion support
-2. Advanced query syntax
-3. Highlighting in results
-4. Faceted search
-5. Multi-language document support
-6. Custom ranking algorithms
-7. Search analytics
-
-### Performance Improvements
-1. Parallel indexing
-2. Incremental index updates
-3. Smarter caching
-4. Query optimization
-5. Index compression
-
-## Comparison with Elasticsearch
-
-| Feature                | PostgreSQL FTS | Elasticsearch |
-|-----------------------|----------------|---------------|
-| Setup Complexity      | Low            | High          |
-| Resource Usage        | Low            | High          |
-| Search Speed          | Fast           | Very Fast     |
-| Distributed Search    | No             | Yes           |
-| Fuzzy Search          | Yes            | Yes           |
-| Language Support      | Good           | Excellent     |
-| Aggregations          | Limited        | Extensive     |
-| Real-time Indexing    | Yes            | Yes           |
-| Scalability           | Good (< 1M)    | Excellent     |
-| Maintenance           | Low            | Medium        |
-| Cost                  | Included       | Separate      |
-
-## Conclusion
-
-Full Text Search - PostgreSQL provides a robust, efficient search solution for small to medium Nextcloud instances. By leveraging PostgreSQL's native capabilities, it eliminates the need for additional infrastructure while delivering excellent search performance.
+`tests/run.php` runs against a real PostgreSQL database: schema creation, access control, Turkish handling, query syntax including the framework's own test searches, extraction of every supported format, size limits, partial updates, `getDocument` round trips, deletes and resets, and that the GIN indexes are used. Psalm checks the code against the real `nextcloud/ocp` interfaces.

@@ -4,138 +4,124 @@ declare(strict_types=1);
 
 namespace OCA\FullTextSearch_PgSql\Service;
 
-use OCP\IConfig;
+use InvalidArgumentException;
+use OCA\FullTextSearch_PgSql\AppInfo\Application;
+use OCP\IAppConfig;
 
+/**
+ * Typed access to the app's settings.
+ *
+ * Keys are compatible with `occ config:app:set fulltextsearch_pgsql <key> --value=<value>`,
+ * but `occ fulltextsearch_pgsql:configure` is preferred because it validates values.
+ */
 class ConfigService {
-    
-    private const APP_ID = 'fulltextsearch_pgsql';
-    
-    /**
-     * PostgreSQL built-in text search configurations
-     * Reference: https://www.postgresql.org/docs/current/textsearch-dictionaries.html
-     */
-    private const SUPPORTED_LANGUAGES = [
-        'arabic',
-        'armenian',
-        'basque',
-        'catalan',
-        'danish',
-        'dutch',
-        'english',
-        'finnish',
-        'french',
-        'german',
-        'greek',
-        'hindi',
-        'hungarian',
-        'indonesian',
-        'irish',
-        'italian',
-        'lithuanian',
-        'nepali',
-        'norwegian',
-        'portuguese',
-        'romanian',
-        'russian',
-        'serbian',
-        'spanish',
-        'swedish',
-        'tamil',
-        'turkish',  // Turkish is fully supported!
-        'yiddish',
-    ];
-    
-    private IConfig $config;
 
-    public function __construct(IConfig $config) {
-        $this->config = $config;
-    }
+	public const LANGUAGE = 'language';
+	public const USE_TRIGRAM = 'use_trigram';
+	public const MAX_RESULTS = 'max_results';
+	public const MAX_CONTENT_SIZE = 'max_content_size';
+	public const PDFTOTEXT_PATH = 'pdftotext_path';
 
-    /**
-     * Get platform configuration
-     */
-    public function getConfig(): array {
-        return [
-            'language' => $this->getAppValue('language', 'english'),
-            'use_trigram' => $this->getAppValue('use_trigram', 'true') === 'true',
-            'min_word_length' => (int)$this->getAppValue('min_word_length', '3'),
-            'max_results' => (int)$this->getAppValue('max_results', '100'),
-        ];
-    }
+	public const DEFAULTS = [
+		self::LANGUAGE => 'english',
+		self::USE_TRIGRAM => true,
+		self::MAX_RESULTS => 100,
+		// Bytes of extracted text kept per document. PostgreSQL refuses tsvectors over 1 MB.
+		self::MAX_CONTENT_SIZE => 512000,
+		// Empty means "look for pdftotext on PATH".
+		self::PDFTOTEXT_PATH => '',
+	];
 
-    /**
-     * Set platform configuration
-     */
-    public function setConfig(array $config): void {
-        if (isset($config['language'])) {
-            // Validate language is supported
-            if ($this->isLanguageSupported($config['language'])) {
-                $this->setAppValue('language', $config['language']);
-            } else {
-                throw new \InvalidArgumentException(
-                    'Unsupported language: ' . $config['language'] . 
-                    '. Supported languages: ' . implode(', ', self::SUPPORTED_LANGUAGES)
-                );
-            }
-        }
-        if (isset($config['use_trigram'])) {
-            $this->setAppValue('use_trigram', $config['use_trigram'] ? 'true' : 'false');
-        }
-        if (isset($config['min_word_length'])) {
-            $this->setAppValue('min_word_length', (string)$config['min_word_length']);
-        }
-        if (isset($config['max_results'])) {
-            $this->setAppValue('max_results', (string)$config['max_results']);
-        }
-    }
+	public function __construct(
+		private IAppConfig $appConfig,
+		private SchemaService $schemaService,
+	) {
+	}
 
-    /**
-     * Get PostgreSQL text search language configuration
-     */
-    public function getLanguage(): string {
-        return $this->getAppValue('language', 'english');
-    }
+	public function getConfig(): array {
+		return [
+			self::LANGUAGE => $this->getLanguage(),
+			self::USE_TRIGRAM => $this->useTrigram(),
+			self::MAX_RESULTS => $this->getMaxResults(),
+			self::MAX_CONTENT_SIZE => $this->getMaxContentSize(),
+			self::PDFTOTEXT_PATH => $this->getPdfToTextPath(),
+		];
+	}
 
-    /**
-     * Get list of supported languages
-     */
-    public function getSupportedLanguages(): array {
-        return self::SUPPORTED_LANGUAGES;
-    }
+	/**
+	 * Validate and store settings. Unknown keys are rejected.
+	 *
+	 * @return bool true when the language changed (existing documents need reindexing)
+	 * @throws InvalidArgumentException
+	 */
+	public function setConfig(array $config): bool {
+		$unknown = array_diff(array_keys($config), array_keys(self::DEFAULTS));
+		if ($unknown !== []) {
+			throw new InvalidArgumentException('Unknown setting(s): ' . implode(', ', $unknown));
+		}
 
-    /**
-     * Validate if a language is supported
-     */
-    public function isLanguageSupported(string $language): bool {
-        return in_array($language, self::SUPPORTED_LANGUAGES, true);
-    }
+		$languageChanged = false;
+		if (array_key_exists(self::LANGUAGE, $config)) {
+			$language = (string)$config[self::LANGUAGE];
+			$available = $this->schemaService->getTextSearchConfigs();
+			if (!in_array($language, $available, true)) {
+				throw new InvalidArgumentException(
+					'Unsupported language "' . $language . '". This PostgreSQL server supports: '
+					. implode(', ', $available)
+				);
+			}
+			$languageChanged = $language !== $this->getLanguage();
+			$this->appConfig->setValueString(Application::APP_ID, self::LANGUAGE, $language);
+		}
 
-    /**
-     * Check if trigram similarity search is enabled
-     */
-    public function useTrigramSearch(): bool {
-        return $this->getAppValue('use_trigram', 'true') === 'true';
-    }
+		if (array_key_exists(self::USE_TRIGRAM, $config)) {
+			$value = filter_var($config[self::USE_TRIGRAM], FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE);
+			if ($value === null) {
+				throw new InvalidArgumentException(self::USE_TRIGRAM . ' must be true or false');
+			}
+			$this->appConfig->setValueBool(Application::APP_ID, self::USE_TRIGRAM, $value);
+		}
 
-    /**
-     * Get minimum word length for indexing
-     */
-    public function getMinWordLength(): int {
-        return (int)$this->getAppValue('min_word_length', '3');
-    }
+		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, 1000000]] as $key => [$min, $max]) {
+			if (!array_key_exists($key, $config)) {
+				continue;
+			}
+			$value = filter_var($config[$key], FILTER_VALIDATE_INT, ['options' => ['min_range' => $min, 'max_range' => $max]]);
+			if ($value === false) {
+				throw new InvalidArgumentException("$key must be an integer between $min and $max");
+			}
+			$this->appConfig->setValueInt(Application::APP_ID, $key, $value);
+		}
 
-    /**
-     * Get maximum number of search results
-     */
-    public function getMaxResults(): int {
-        return (int)$this->getAppValue('max_results', '100');
-    }
+		if (array_key_exists(self::PDFTOTEXT_PATH, $config)) {
+			$path = (string)$config[self::PDFTOTEXT_PATH];
+			if ($path !== '' && !is_executable($path)) {
+				throw new InvalidArgumentException('pdftotext_path is not an executable file: ' . $path);
+			}
+			$this->appConfig->setValueString(Application::APP_ID, self::PDFTOTEXT_PATH, $path);
+		}
 
-    private function getAppValue(string $key, string $default = ''): string {
-        return $this->config->getAppValue(self::APP_ID, $key, $default);
-    }
+		return $languageChanged;
+	}
 
-    private function setAppValue(string $key, string $value): void {
-        $this->config->setAppValue(self::APP_ID, $key, $value);
-    }
+	/** PostgreSQL text search configuration (regconfig) used for new documents and queries. */
+	public function getLanguage(): string {
+		return $this->appConfig->getValueString(Application::APP_ID, self::LANGUAGE, self::DEFAULTS[self::LANGUAGE]);
+	}
+
+	public function useTrigram(): bool {
+		return $this->appConfig->getValueBool(Application::APP_ID, self::USE_TRIGRAM, self::DEFAULTS[self::USE_TRIGRAM]);
+	}
+
+	public function getMaxResults(): int {
+		return max(1, $this->appConfig->getValueInt(Application::APP_ID, self::MAX_RESULTS, self::DEFAULTS[self::MAX_RESULTS]));
+	}
+
+	public function getMaxContentSize(): int {
+		return max(0, $this->appConfig->getValueInt(Application::APP_ID, self::MAX_CONTENT_SIZE, self::DEFAULTS[self::MAX_CONTENT_SIZE]));
+	}
+
+	public function getPdfToTextPath(): string {
+		return $this->appConfig->getValueString(Application::APP_ID, self::PDFTOTEXT_PATH, self::DEFAULTS[self::PDFTOTEXT_PATH]);
+	}
 }

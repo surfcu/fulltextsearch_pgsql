@@ -4,212 +4,164 @@ declare(strict_types=1);
 
 namespace OCA\FullTextSearch_PgSql\Service;
 
-use OCA\FullTextSearch_PgSql\Db\IndexMapper;
+use OCA\FullTextSearch_PgSql\Tools\PgArray;
 use OCP\FullTextSearch\Model\IIndex;
 use OCP\FullTextSearch\Model\IIndexDocument;
-use OCP\FullTextSearch\Model\IRunner;
 use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
+use Throwable;
 
 class IndexService {
-    
-    private IDBConnection $db;
-    private IndexMapper $indexMapper;
-    private ConfigService $configService;
-    private LoggerInterface $logger;
 
-    public function __construct(
-        IDBConnection $db,
-        IndexMapper $indexMapper,
-        ConfigService $configService,
-        LoggerInterface $logger
-    ) {
-        $this->db = $db;
-        $this->indexMapper = $indexMapper;
-        $this->configService = $configService;
-        $this->logger = $logger;
-    }
+	public function __construct(
+		private IDBConnection $db,
+		private SchemaService $schemaService,
+		private ConfigService $configService,
+		private ContentExtractor $extractor,
+		private LoggerInterface $logger,
+	) {
+	}
 
-    /**
-     * Test if PostgreSQL platform is available and properly configured
-     */
-    public function testPlatform(): bool {
-        try {
-            // Check if we're using PostgreSQL
-            if ($this->db->getDatabasePlatform()->getName() !== 'postgresql') {
-                $this->logger->error('Database is not PostgreSQL');
-                return false;
-            }
+	/**
+	 * Insert or update a document.
+	 *
+	 * When the provider only flagged metadata as changed (e.g. a share was added), the
+	 * stored content and parts are kept instead of being overwritten with nothing.
+	 *
+	 * @return list<string> warnings worth reporting to the index runner
+	 * @throws Throwable when the document could not be stored at all
+	 */
+	public function indexDocument(IIndexDocument $document): array {
+		$index = $document->getIndex();
+		$updateAll = !$index->isStatus(IIndex::INDEX_META)
+			&& !$index->isStatus(IIndex::INDEX_CONTENT)
+			&& !$index->isStatus(IIndex::INDEX_PARTS);
+		$updateContent = $updateAll || $index->isStatus(IIndex::INDEX_CONTENT);
+		$updateParts = $updateAll || $index->isStatus(IIndex::INDEX_PARTS);
 
-            // Check if required extensions are available
-            $qb = $this->db->getQueryBuilder();
-            $result = $qb->select('*')
-                ->from('pg_extension')
-                ->where($qb->expr()->eq('extname', $qb->createNamedParameter('pg_trgm')))
-                ->executeQuery();
-            
-            $hasExtension = $result->rowCount() > 0;
-            $result->closeCursor();
+		$warnings = [];
+		$content = '';
+		if ($updateContent) {
+			$extracted = $this->extractor->extract($document);
+			$content = $extracted->text;
+			if ($extracted->warning !== null) {
+				$warnings[] = $extracted->warning;
+			}
+		}
 
-            if (!$hasExtension) {
-                $this->logger->warning('pg_trgm extension not found. Trigram search will be disabled.');
-            }
+		try {
+			$this->upsert($document, $content, $updateContent, $updateParts);
+		} catch (Throwable $e) {
+			if ($content === '') {
+				throw $e;
+			}
+			// Most likely "string is too long for tsvector": keep the document findable by title.
+			$this->logger->warning('Indexing content failed, retrying without content', [
+				'provider' => $document->getProviderId(),
+				'document' => $document->getId(),
+				'exception' => $e,
+			]);
+			$this->upsert($document, '', true, $updateParts);
+			$warnings[] = 'indexed without content: ' . $e->getMessage();
+		}
 
-            return true;
-        } catch (\Exception $e) {
-            $this->logger->error('Error testing PostgreSQL platform: ' . $e->getMessage());
-            return false;
-        }
-    }
+		return $warnings;
+	}
 
-    /**
-     * Initialize the platform by creating necessary database structures
-     */
-    public function initializePlatform(): void {
-        try {
-            // Enable pg_trgm extension if not already enabled
-            if ($this->configService->useTrigramSearch()) {
-                $this->db->executeStatement('CREATE EXTENSION IF NOT EXISTS pg_trgm');
-            }
-        } catch (\Exception $e) {
-            $this->logger->error('Error initializing platform: ' . $e->getMessage());
-        }
-    }
+	public function deleteDocument(string $providerId, string $documentId): void {
+		$this->db->executeStatement(
+			'DELETE FROM ' . $this->schemaService->getTableName() . ' WHERE provider_id = ? AND document_id = ?',
+			[$providerId, $documentId]
+		);
+	}
 
-    /**
-     * Initialize indexes for all providers
-     */
-    public function initializeIndex(array $providers): void {
-        try {
-            $this->indexMapper->createIndexTable();
-            $this->logger->info('Index table initialized for ' . count($providers) . ' providers');
-        } catch (\Exception $e) {
-            $this->logger->error('Error initializing index: ' . $e->getMessage());
-            throw $e;
-        }
-    }
+	public function resetProvider(string $providerId): void {
+		if ($providerId === 'all') {
+			$this->schemaService->truncate();
+			return;
+		}
+		$this->db->executeStatement(
+			'DELETE FROM ' . $this->schemaService->getTableName() . ' WHERE provider_id = ?',
+			[$providerId]
+		);
+	}
 
-    /**
-     * Reset index for a specific provider
-     */
-    public function resetIndex(string $providerId): void {
-        try {
-            $this->indexMapper->deleteByProvider($providerId);
-            $this->logger->info('Reset index for provider: ' . $providerId);
-        } catch (\Exception $e) {
-            $this->logger->error('Error resetting index: ' . $e->getMessage());
-            throw $e;
-        }
-    }
+	private function upsert(IIndexDocument $document, string $content, bool $updateContent, bool $updateParts): void {
+		$access = $document->getAccess();
+		$extractor = $this->extractor;
 
-    /**
-     * Delete all indexes
-     */
-    public function deleteIndexes(): void {
-        try {
-            $this->indexMapper->deleteAll();
-            $this->logger->info('All indexes deleted');
-        } catch (\Exception $e) {
-            $this->logger->error('Error deleting indexes: ' . $e->getMessage());
-            throw $e;
-        }
-    }
+		$tags = array_map([$extractor, 'sanitize'], $this->strings($document->getTags()));
+		$metaTags = array_map([$extractor, 'sanitize'], $this->strings($document->getMetaTags()));
+		$parts = [];
+		foreach ($document->getParts() as $name => $value) {
+			$parts[(string)$name] = $extractor->clean((string)$value);
+		}
 
-    /**
-     * Index a document
-     */
-    public function indexDocument(IIndexDocument $document, IRunner $runner): IIndex {
-        try {
-            $index = $document->getIndex();
-            
-            // Prepare document content for indexing
-            $content = $this->prepareContent($document);
-            
-            // Insert into database with ts_vector
-            $this->indexMapper->insertDocument(
-                $document->getProviderId(),
-                $document->getId(),
-                $document->getAccess(),
-                $document->getOwnerId(),
-                $content,
-                $document->getTitle(),
-                json_encode($document->getTags()),
-                json_encode($document->getMetaTags()),
-                json_encode($document->getSubTags()),
-                $this->configService->getLanguage()
-            );
+		$t = $this->schemaService->getTableName();
+		$this->db->executeStatement(<<<SQL
+			INSERT INTO $t AS d (
+				provider_id, document_id, owner_id, access, links, tags, metatags, subtags,
+				source, hash, modified_time, indexed_at, config,
+				title, tags_text, parts, parts_text, content, info
+			) VALUES (
+				?, ?, ?, CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]),
+				?, ?, ?, ?, CAST(? AS regconfig),
+				?, ?, CAST(? AS jsonb), ?, ?, CAST(? AS jsonb)
+			)
+			ON CONFLICT (provider_id, document_id) DO UPDATE SET
+				owner_id = EXCLUDED.owner_id,
+				access = EXCLUDED.access,
+				links = EXCLUDED.links,
+				tags = EXCLUDED.tags,
+				metatags = EXCLUDED.metatags,
+				subtags = EXCLUDED.subtags,
+				source = EXCLUDED.source,
+				hash = EXCLUDED.hash,
+				modified_time = EXCLUDED.modified_time,
+				indexed_at = EXCLUDED.indexed_at,
+				config = EXCLUDED.config,
+				title = EXCLUDED.title,
+				tags_text = EXCLUDED.tags_text,
+				info = EXCLUDED.info,
+				parts = CASE WHEN CAST(? AS boolean) THEN EXCLUDED.parts ELSE d.parts END,
+				parts_text = CASE WHEN CAST(? AS boolean) THEN EXCLUDED.parts_text ELSE d.parts_text END,
+				content = CASE WHEN CAST(? AS boolean) THEN EXCLUDED.content ELSE d.content END
+			SQL,
+			[
+				$document->getProviderId(),
+				$document->getId(),
+				$access->getOwnerId(),
+				PgArray::toLiteral(AccessTokens::forDocument($access)),
+				PgArray::toLiteral($this->strings($access->getLinks())),
+				PgArray::toLiteral($tags),
+				PgArray::toLiteral($metaTags),
+				PgArray::toLiteral($this->strings($document->getSubTags(true))),
+				$document->getSource(),
+				$document->getHash(),
+				(string)$document->getModifiedTime(),
+				(string)time(),
+				$this->configService->getLanguage(),
+				$extractor->sanitize($document->getTitle()),
+				$extractor->clean(implode(' ', array_merge($tags, $metaTags))),
+				json_encode((object)$parts, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE),
+				implode(' ', $parts),
+				$content,
+				json_encode((object)$document->getInfoAll(), JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE),
+				$updateParts ? 'true' : 'false',
+				$updateParts ? 'true' : 'false',
+				$updateContent ? 'true' : 'false',
+			]
+		);
+	}
 
-            $index->setStatus(IIndex::INDEX_OK);
-            $index->setMessage('Document indexed successfully');
-            
-            return $index;
-        } catch (\Exception $e) {
-            $this->logger->error('Error indexing document: ' . $e->getMessage());
-            $index = $document->getIndex();
-            $index->setStatus(IIndex::INDEX_FAILED);
-            $index->setMessage($e->getMessage());
-            return $index;
-        }
-    }
-
-    /**
-     * Update a document
-     */
-    public function updateDocument(IIndexDocument $document, IRunner $runner): IIndex {
-        try {
-            // Delete old document
-            $this->deleteDocument($document->getProviderId(), $document->getId());
-            
-            // Index new version
-            return $this->indexDocument($document, $runner);
-        } catch (\Exception $e) {
-            $this->logger->error('Error updating document: ' . $e->getMessage());
-            $index = $document->getIndex();
-            $index->setStatus(IIndex::INDEX_FAILED);
-            $index->setMessage($e->getMessage());
-            return $index;
-        }
-    }
-
-    /**
-     * Delete a document from the index
-     */
-    public function deleteDocument(string $providerId, string $documentId): void {
-        try {
-            $this->indexMapper->deleteDocument($providerId, $documentId);
-        } catch (\Exception $e) {
-            $this->logger->error('Error deleting document: ' . $e->getMessage());
-            throw $e;
-        }
-    }
-
-    /**
-     * Prepare document content for indexing
-     */
-    private function prepareContent(IIndexDocument $document): string {
-        $parts = [];
-        
-        // Add title with higher weight
-        if ($document->getTitle()) {
-            $parts[] = $document->getTitle();
-            $parts[] = $document->getTitle(); // Add twice for higher weight
-        }
-        
-        // Add content
-        if ($document->getContent()) {
-            $parts[] = $document->getContent();
-        }
-        
-        // Add tags
-        foreach ($document->getTags() as $tag) {
-            $parts[] = $tag;
-        }
-        
-        // Add meta tags
-        foreach ($document->getMetaTags() as $meta) {
-            $parts[] = $meta;
-        }
-        
-        return implode(' ', $parts);
-    }
+	/** @return list<string> */
+	private function strings(array $values): array {
+		$out = [];
+		foreach ($values as $value) {
+			if (is_scalar($value) && (string)$value !== '') {
+				$out[] = (string)$value;
+			}
+		}
+		return array_values(array_unique($out));
+	}
 }

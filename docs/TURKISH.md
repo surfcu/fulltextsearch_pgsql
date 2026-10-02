@@ -1,324 +1,99 @@
-# Türkçe Dil Desteği / Turkish Language Support
+# Türkçe Kullanım Kılavuzu
 
-Full Text Search - PostgreSQL, PostgreSQL'in yerel tam metin arama özelliklerini kullanarak **Türkçe dilinde arama** desteği sağlar.
+*English summary: setup and Turkish-specific behaviour (stemming, dotted/dotless I) for this platform. The main [README](../README.md) is in English.*
 
-This app provides **full Turkish language support** for text search using PostgreSQL's native capabilities.
+Bu uygulama, Nextcloud'un Full Text Search altyapısı için PostgreSQL'in yerleşik tam metin aramasını kullanır. Nextcloud zaten PostgreSQL üzerinde çalışıyorsa ayrıca bir arama sunucusu (Elasticsearch vb.) kurmanız gerekmez.
 
-## Kurulum / Installation
+## Kurulum
 
-### Türkçe Dil Yapılandırması / Turkish Language Configuration
-
-```bash
-# Set Turkish as the search language
-sudo -u www-data php /path/to/nextcloud/occ config:app:set fulltextsearch_pgsql language --value=turkish
-```
-
-### Doğrulama / Verification
+Gereksinimler: Nextcloud 29–32, PostgreSQL 12 veya üstü (Nextcloud'un kendi veritabanı), **Full Text Search** ve **Full Text Search - Files** uygulamaları.
 
 ```bash
-# Check current language setting
-sudo -u www-data php /path/to/nextcloud/occ config:app:get fulltextsearch_pgsql language
+cd /var/www/nextcloud/apps
+git clone https://github.com/surfcu/fulltextsearch_pgsql.git
+sudo -u www-data php /var/www/nextcloud/occ app:enable fulltextsearch_pgsql
+
+occ fulltextsearch:configure '{"search_platform":"OCA\\FullTextSearch_PgSql\\Platform\\PostgreSQLPlatform"}'
+occ fulltextsearch_pgsql:configure '{"language":"turkish"}'
+occ fulltextsearch:test
+occ fulltextsearch:index
 ```
 
-Output should be: `turkish`
-
-## Türkçe Özellikleri / Turkish Features
-
-PostgreSQL'in Türkçe metin arama desteği şunları içerir:
-
-PostgreSQL's Turkish text search support includes:
-
-### 1. Türkçe Dilbilgisi / Turkish Stemming
-
-PostgreSQL automatically handles Turkish word stemming:
-
-**Examples:**
-- "kitaplar" → "kitap"
-- "çalışıyorum" → "çalış"
-- "gidiyorlar" → "git"
-
-### 2. Türk Dili Stopwords / Turkish Stop Words
-
-Common Turkish words are automatically filtered:
-
-- ve, veya, ile, için
-- bu, şu, o
-- bir, bir
-- ne, nasıl, neden
-
-### 3. Özel Karakterler / Special Characters
-
-Türkçe özel karakterleri destekler:
-- ç, Ç
-- ğ, Ğ
-- ı, İ
-- ö, Ö
-- ş, Ş
-- ü, Ü
-
-## Kullanım Örnekleri / Usage Examples
-
-### Belgeleri İndeksleme / Indexing Documents
+PDF içeriklerinin de aranabilmesi için `poppler-utils` paketini kurun:
 
 ```bash
-# Index all content with Turkish language support
-sudo -u www-data php /path/to/nextcloud/occ fulltextsearch:index
+sudo apt install poppler-utils
 ```
 
-### Arama Yapma / Searching
-
-After indexing, searches will use Turkish text search configuration:
-
-**Web Interface:**
-1. Nextcloud'a giriş yapın / Log in to Nextcloud
-2. Üst kısımdaki arama çubuğunu kullanın / Use the search bar at the top
-3. Türkçe kelimeler arayın / Search in Turkish
-
-**Command Line:**
-```bash
-sudo -u www-data php /path/to/nextcloud/occ fulltextsearch:search "kitap"
-sudo -u www-data php /path/to/nextcloud/occ fulltextsearch:search "çalışma"
-```
-
-## Arama Örnekleri / Search Examples
-
-### Basit Arama / Simple Search
-```
-Query: "kitap"
-Matches: kitap, kitaplar, kitabı, kitaba, kitaptan
-```
-
-### Birden Fazla Kelime / Multiple Words
-```
-Query: "türkçe belge"
-Matches documents containing both "türkçe" AND "belge"
-```
-
-### Benzerlik Araması / Fuzzy Search
-
-Trigram özelliği ile yazım hatalarını tolere eder:
-With trigram enabled, tolerates typos:
-
-```
-Query: "ktiap" (typo)
-Still matches: "kitap"
-```
-
-Enable trigram for better fuzzy matching:
-```bash
-sudo -u www-data php /path/to/nextcloud/occ config:app:set fulltextsearch_pgsql use_trigram --value=true
-```
-
-## PostgreSQL Türkçe Yapılandırması / PostgreSQL Turkish Configuration
-
-### Test Turkish Configuration
-
-PostgreSQL'de Türkçe yapılandırmayı test edin:
-
-Test the Turkish configuration in PostgreSQL:
-
-```sql
--- Connect to database
-sudo -u postgres psql nextcloud
-
--- Test Turkish stemming
-SELECT to_tsvector('turkish', 'Kitapları okuyorum');
--- Result: 'kitap':1 'oku':2
-
--- Test search
-SELECT to_tsvector('turkish', 'Çalışıyorum') @@ to_tsquery('turkish', 'çalış');
--- Result: true
-```
-
-### Custom Turkish Dictionary (Advanced)
-
-For advanced users who need custom Turkish word handling:
-
-```sql
--- Create custom dictionary (optional)
-CREATE TEXT SEARCH DICTIONARY turkish_custom (
-    TEMPLATE = snowball,
-    Language = turkish,
-    StopWords = turkish
-);
-
--- Create custom configuration (optional)
-CREATE TEXT SEARCH CONFIGURATION turkish_custom (COPY = turkish);
-```
-
-## Performans İpuçları / Performance Tips
-
-### 1. Minimum Kelime Uzunluğu / Minimum Word Length
-
-Türkçe için önerilen minimum kelime uzunluğu: 2-3 harf
-
-Recommended minimum word length for Turkish: 2-3 characters
+Yazım hatalarına toleranslı arama için `pg_trgm` eklentisi gerekir. PostgreSQL 13 ve sonrasında, veritabanının sahibi Nextcloud kullanıcısıysa uygulama bunu kendisi oluşturur. Değilse bir süper kullanıcı şunu çalıştırabilir:
 
 ```bash
-sudo -u www-data php /path/to/nextcloud/occ config:app:set fulltextsearch_pgsql min_word_length --value=2
+sudo -u postgres psql nextcloud -c "CREATE EXTENSION pg_trgm;"
 ```
 
-### 2. Index Bakımı / Index Maintenance
+## Türkçeye özgü davranışlar
 
-Düzenli bakım için:
-For regular maintenance:
+### Kök bulma (stemming)
+
+`turkish` yapılandırması, PostgreSQL'in Snowball tabanlı Türkçe kök bulucusunu kullanır. Ekler kök bulunurken atılır:
+
+| Aranan | Bulunanlar |
+|---|---|
+| `çalışma` | çalışma, çalışmalar, çalışmalarımız |
+| `rapor` | rapor, raporu, raporlar, raporlarda |
+| `ev` | ev, evler, evde, evimiz |
+
+Kelimeler ayrıca **önek** olarak da eşleşir, yani yazarken sonuçlar gelir: `rap` yazınca *rapor* ve *raporlar* bulunur.
+
+### Noktalı ve noktasız I
+
+PostgreSQL küçük harfe çevirirken veritabanının yerel ayarını (locale) kullanır. Bu ayar neredeyse hiçbir zaman `tr_TR` değildir, bu yüzden normalde `I` harfi `ı` yerine `i` olur. Sonuç olarak `ISPARTA` aramada `ısparta` ile eşleşmez, büyük harfle yazılmış metinler kaçar.
+
+Uygulama, dil `turkish` olduğunda hem dizinlenen metinde hem de aramada `I → ı` ve `İ → i` dönüşümünü önceden yapar. Bu sayede veritabanının yerel ayarı ne olursa olsun:
+
+| Metin | Arama | Sonuç |
+|---|---|---|
+| ISPARTA GÜLLERİ | `ısparta`, `Isparta` | ✓ |
+| IŞIK | `ışık` | ✓ |
+| İstanbul | `istanbul`, `İSTANBUL` | ✓ |
+| ÇALIŞMALARIMIZ | `çalışma` | ✓ |
+
+### Eski kodlamalı dosyalar
+
+Windows-1254 (Türkçe) kodlamasıyla kaydedilmiş eski metin dosyaları otomatik olarak UTF-8'e çevrilir; `ö`, `ç`, `ş`, `ğ`, `ı` gibi harfler bozulmadan aranabilir.
+
+## Arama sözdizimi
+
+| Yazılan | Anlamı |
+|---|---|
+| `bütçe rapor` | En az biri geçen belgeler; ikisini birden içerenler önce gelir |
+| `+bütçe +rapor` | İkisi de geçmeli |
+| `bütçe -taslak` | "taslak" geçenler hariç |
+| `"yıllık rapor"` | Tam ifade |
+| `+"yıllık rapor" -2023` | Birleştirilebilir |
+
+Hiçbir sonuç yoksa başlıklarda benzerlik araması yapılır; örneğin `rapr` yazınca (eksik harf) başlığında *rapor* geçen belgeler bulunur.
+
+## Ayarlar
 
 ```bash
-# Weekly maintenance
-sudo -u postgres psql nextcloud -c "ANALYZE fts_pgsql_index;"
+occ fulltextsearch_pgsql:configure                  # mevcut ayarlar
+occ fulltextsearch_pgsql:configure --languages      # sunucunun desteklediği diller
+occ fulltextsearch_pgsql:configure '{"language":"turkish"}'
 ```
 
-### 3. Bellek Optimizasyonu / Memory Optimization
-
-PostgreSQL yapılandırması için (`postgresql.conf`):
-
-For PostgreSQL configuration:
-
-```conf
-# Increase shared buffers
-shared_buffers = 2GB
-
-# Work memory for Turkish text processing
-work_mem = 64MB
-```
-
-## Sorun Giderme / Troubleshooting
-
-### Türkçe Karakterler Düzgün Gösterilmiyor
-### Turkish Characters Not Displaying Properly
-
-Ensure database encoding is UTF-8:
-
-```sql
--- Check encoding
-SELECT current_setting('server_encoding');
--- Should return: UTF8
-
--- Check locale
-SELECT current_setting('lc_collate');
--- Should include: tr_TR.UTF-8 or similar
-```
-
-### Arama Sonuç Vermiyor
-### Search Returns No Results
-
-1. Verify language is set to Turkish:
-```bash
-php occ config:app:get fulltextsearch_pgsql language
-```
-
-2. Re-index with Turkish configuration:
-```bash
-php occ fulltextsearch:reset
-php occ config:app:set fulltextsearch_pgsql language --value=turkish
-php occ fulltextsearch:index
-```
-
-3. Test search in database:
-```sql
-SELECT * FROM fts_pgsql_index 
-WHERE content_tsv @@ to_tsquery('turkish', 'test');
-```
-
-### Performans Sorunları
-### Performance Issues
-
-For large Turkish document collections:
+Dili değiştirdikten sonra mevcut belgelerin yeni dille işlenmesi için dizini yeniden oluşturun:
 
 ```bash
-# Analyze Turkish text search performance
-sudo -u postgres psql nextcloud -c "
-EXPLAIN ANALYZE
-SELECT * FROM fts_pgsql_index
-WHERE content_tsv @@ to_tsquery('turkish', 'kitap:*')
-LIMIT 10;
-"
+occ fulltextsearch:reset && occ fulltextsearch:index
 ```
 
-## Örnek Türkçe Belgeler / Sample Turkish Documents
+Türkçe ve İngilizce belgeler karışıksa, kök bulma yapmayan `simple` yapılandırması bir seçenektir: ekli hâller (ör. *raporlar*) yalnızca önek eşleşmesiyle bulunur, ama hiçbir dilin kurallarını yanlış uygulamaz.
 
-Test için örnek belgeler:
+## Sorun giderme
 
-Sample documents for testing:
+**Büyük harfli Türkçe kelimeler bulunmuyor.** Dilin `turkish` olduğundan emin olun ve dizini yeniden oluşturun. Bu düzeltme yalnızca `turkish` yapılandırmasıyla dizinlenmiş belgelerde geçerlidir.
 
-```sql
--- Insert test documents
-INSERT INTO fts_pgsql_index (provider_id, document_id, user_id, content, title, indexed_at)
-VALUES 
-    ('test', 'tr1', 'admin', 'Türkçe tam metin arama özellikleri', 'Test Belgesi 1', EXTRACT(EPOCH FROM NOW())),
-    ('test', 'tr2', 'admin', 'PostgreSQL Türkçe dil desteği çok güçlü', 'Test Belgesi 2', EXTRACT(EPOCH FROM NOW()));
+**PDF'lerin içeriği aranmıyor.** `poppler-utils` kurulu mu kontrol edin. Taranmış (görüntü) PDF'lerde metin yoktur; bunlar yalnızca adlarıyla bulunur.
 
--- Update ts_vector
-UPDATE fts_pgsql_index 
-SET content_tsv = to_tsvector('turkish', content)
-WHERE provider_id = 'test';
-
--- Search
-SELECT title, ts_rank(content_tsv, to_tsquery('turkish', 'türkçe')) as rank
-FROM fts_pgsql_index
-WHERE content_tsv @@ to_tsquery('turkish', 'türkçe')
-ORDER BY rank DESC;
-```
-
-## Kaynaklar / Resources
-
-### PostgreSQL Turkish Documentation
-- Official: https://www.postgresql.org/docs/current/textsearch-dictionaries.html
-- Turkish Snowball Stemmer: https://snowballstem.org/algorithms/turkish/stemmer.html
-
-### Nextcloud Turkish Community
-- Forum: https://help.nextcloud.com
-- Turkish Users: Search for "Türkçe" in forums
-
-## Sık Sorulan Sorular / FAQ
-
-**S: Türkçe karakterler arama yapılırken dikkate alınır mı?**
-**Q: Are Turkish characters considered during search?**
-
-A: Evet! PostgreSQL Türkçe yapılandırması ç, ğ, ı, ö, ş, ü karakterlerini tam olarak destekler.
-
-Yes! PostgreSQL's Turkish configuration fully supports ç, ğ, ı, ö, ş, ü characters.
-
----
-
-**S: Hem Türkçe hem İngilizce belgelerde arama yapabilir miyim?**
-**Q: Can I search both Turkish and English documents?**
-
-A: Evet, ancak bir seferde tek bir dil yapılandırması kullanılır. Çok dilli arama için gelecek sürümlerde destek eklenecektir.
-
-Yes, but one language configuration is used at a time. Multi-language search support will be added in future versions.
-
----
-
-**S: Trigram özelliği Türkçe için önerilir mi?**
-**Q: Is trigram recommended for Turkish?**
-
-A: Evet! Türkçe'de yazım hatalarını tolere etmek için trigram özelliğini etkinleştirin.
-
-Yes! Enable trigram to tolerate typos in Turkish.
-
----
-
-## Destek / Support
-
-Türkçe destek için / For Turkish language support:
-
-- GitHub Issues: Report language-specific issues
-- Community Forum: Ask in Nextcloud forums
-- Documentation: See main README.md
-
-## Katkıda Bulunma / Contributing
-
-Türkçe dil desteğini geliştirmek için katkılarınızı bekliyoruz!
-
-We welcome contributions to improve Turkish language support!
-
-- Custom stopwords list
-- Better stemming rules
-- Turkish-specific optimizations
-
-See `docs/DEVELOPMENT.md` for contribution guidelines.
-
----
-
-**Başarılar! / Good luck with Turkish full-text search!** 🇹🇷
+**Yazım hatası toleransı çalışmıyor.** `occ fulltextsearch:check` çıktısında `"pg_trgm": false` görünüyorsa eklentiyi oluşturun ve ardından `occ fulltextsearch:test` çalıştırın.

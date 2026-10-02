@@ -6,118 +6,131 @@ namespace OCA\FullTextSearch_PgSql\Platform;
 
 use OCA\FullTextSearch_PgSql\Service\ConfigService;
 use OCA\FullTextSearch_PgSql\Service\IndexService;
+use OCA\FullTextSearch_PgSql\Service\SchemaService;
 use OCA\FullTextSearch_PgSql\Service\SearchService;
 use OCP\FullTextSearch\IFullTextSearchPlatform;
+use OCP\FullTextSearch\Model\IDocumentAccess;
 use OCP\FullTextSearch\Model\IIndex;
 use OCP\FullTextSearch\Model\IIndexDocument;
 use OCP\FullTextSearch\Model\IRunner;
-use OCP\FullTextSearch\Model\ISearchRequest;
 use OCP\FullTextSearch\Model\ISearchResult;
+use Psr\Log\LoggerInterface;
+use Throwable;
 
 class PostgreSQLPlatform implements IFullTextSearchPlatform {
-    
-    private ConfigService $configService;
-    private IndexService $indexService;
-    private SearchService $searchService;
 
-    public function __construct(
-        ConfigService $configService,
-        IndexService $indexService,
-        SearchService $searchService
-    ) {
-        $this->configService = $configService;
-        $this->indexService = $indexService;
-        $this->searchService = $searchService;
-    }
+	private ?IRunner $runner = null;
 
-    /**
-     * Return the unique ID of the platform
-     */
-    public function getId(): string {
-        return 'pgsql';
-    }
+	public function __construct(
+		private ConfigService $configService,
+		private SchemaService $schemaService,
+		private IndexService $indexService,
+		private SearchService $searchService,
+		private LoggerInterface $logger,
+	) {
+	}
 
-    /**
-     * Return the display name of the platform
-     */
-    public function getName(): string {
-        return 'PostgreSQL Full Text Search';
-    }
+	public function getId(): string {
+		return 'pgsql';
+	}
 
-    /**
-     * Return the configuration array
-     */
-    public function getConfiguration(): array {
-        return $this->configService->getConfig();
-    }
+	public function getName(): string {
+		return 'PostgreSQL';
+	}
 
-    /**
-     * Set configuration
-     */
-    public function setConfiguration(array $config): void {
-        $this->configService->setConfig($config);
-    }
+	public function getConfiguration(): array {
+		$config = $this->configService->getConfig();
+		$config['table'] = $this->schemaService->getTableName();
+		$config['pg_trgm'] = $this->schemaService->isPostgres() && $this->schemaService->hasTrigram();
+		return $config;
+	}
 
-    /**
-     * Check if the platform is properly configured and available
-     */
-    public function testPlatform(): bool {
-        return $this->indexService->testPlatform();
-    }
+	public function setRunner(IRunner $runner) {
+		$this->runner = $runner;
+	}
 
-    /**
-     * Load platform configuration panel
-     */
-    public function loadPlatform(): void {
-        $this->indexService->initializePlatform();
-    }
+	public function loadPlatform() {
+		if ($this->schemaService->isPostgres() && !$this->schemaService->tableExists()) {
+			$this->schemaService->ensureSchema();
+		}
+	}
 
-    /**
-     * Called when initializing the index
-     */
-    public function initializeIndex(array $providers): void {
-        $this->indexService->initializeIndex($providers);
-    }
+	public function testPlatform(): bool {
+		try {
+			if (!$this->schemaService->isPostgres()) {
+				$this->logger->error('fulltextsearch_pgsql requires Nextcloud to run on PostgreSQL');
+				return false;
+			}
+			$this->schemaService->ensureSchema();
+			return $this->schemaService->tableExists();
+		} catch (Throwable $e) {
+			$this->logger->error('PostgreSQL full text search platform test failed', ['exception' => $e]);
+			return false;
+		}
+	}
 
-    /**
-     * Reset the indexes for a specific provider
-     */
-    public function resetIndex(string $providerId): void {
-        $this->indexService->resetIndex($providerId);
-    }
+	public function initializeIndex() {
+		$this->schemaService->ensureSchema();
+	}
 
-    /**
-     * Delete the complete indexes
-     */
-    public function deleteIndexes(): void {
-        $this->indexService->deleteIndexes();
-    }
+	public function resetIndex(string $providerId) {
+		$this->indexService->resetProvider($providerId);
+	}
 
-    /**
-     * Index a document
-     */
-    public function indexDocument(IIndexDocument $document, IRunner $runner): IIndex {
-        return $this->indexService->indexDocument($document, $runner);
-    }
+	/**
+	 * @param IIndex[] $indexes
+	 */
+	public function deleteIndexes(array $indexes) {
+		foreach ($indexes as $index) {
+			try {
+				$this->indexService->deleteDocument($index->getProviderId(), $index->getDocumentId());
+				$this->runner?->newIndexResult($index, 'index deleted', 'success', IRunner::RESULT_TYPE_SUCCESS);
+			} catch (Throwable $e) {
+				$this->logger->warning('Could not delete document from index', ['exception' => $e]);
+				$this->runner?->newIndexResult($index, 'index not deleted', 'issue while deleting index', IRunner::RESULT_TYPE_WARNING);
+			}
+		}
+	}
 
-    /**
-     * Update a document
-     */
-    public function updateDocument(IIndexDocument $document, IRunner $runner): IIndex {
-        return $this->indexService->updateDocument($document, $runner);
-    }
+	public function indexDocument(IIndexDocument $document): IIndex {
+		$document->initHash();
+		$index = $document->getIndex();
+		$this->runner?->updateAction('indexDocument', true);
 
-    /**
-     * Delete a document from the index
-     */
-    public function deleteDocument(string $providerId, string $documentId): void {
-        $this->indexService->deleteDocument($providerId, $documentId);
-    }
+		try {
+			$warnings = $this->indexService->indexDocument($document);
+		} catch (Throwable $e) {
+			$this->logger->warning('Could not index document', [
+				'provider' => $document->getProviderId(),
+				'document' => $document->getId(),
+				'exception' => $e,
+			]);
+			$index->setStatus(IIndex::INDEX_FAILED);
+			$index->addError($e->getMessage(), get_class($e), IIndex::ERROR_SEV_3);
+			$this->runner?->newIndexError($index, $e->getMessage(), get_class($e), IIndex::ERROR_SEV_3);
+			$this->runner?->newIndexResult($index, '', 'fail', IRunner::RESULT_TYPE_FAIL);
+			return $index;
+		}
 
-    /**
-     * Perform a search
-     */
-    public function search(ISearchRequest $request, ISearchResult $result): void {
-        $this->searchService->search($request, $result);
-    }
+		$index->setLastIndex();
+		if ($index->getErrorCount() === 0) {
+			$index->setStatus(IIndex::INDEX_DONE);
+		}
+
+		if ($warnings === []) {
+			$this->runner?->newIndexResult($index, 'ok', 'ok', IRunner::RESULT_TYPE_SUCCESS);
+		} else {
+			$this->runner?->newIndexResult($index, implode('; ', $warnings), 'warning', IRunner::RESULT_TYPE_WARNING);
+		}
+
+		return $index;
+	}
+
+	public function searchRequest(ISearchResult $result, IDocumentAccess $access) {
+		$this->searchService->searchRequest($result, $access);
+	}
+
+	public function getDocument(string $providerId, string $documentId): IIndexDocument {
+		return $this->searchService->getDocument($providerId, $documentId);
+	}
 }

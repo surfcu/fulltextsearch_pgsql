@@ -4,36 +4,47 @@
     <id>fulltextsearch_pgsql</id>
     <name>Full Text Search - PostgreSQL</name>
     <summary>PostgreSQL platform for Full Text Search</summary>
-    <description><![CDATA[Index and search your Nextcloud using PostgreSQL's native full-text search capabilities.
+    <description><![CDATA[Index and search your Nextcloud using PostgreSQL's built-in full-text search, with no extra search server.
 
-This app provides a PostgreSQL-based search platform for the Full Text Search framework, offering:
-- Native PostgreSQL full-text search with ts_vector
-- Trigram similarity for fuzzy matching
-- Multi-language support
-- Lower resource footprint than Elasticsearch
-- No additional infrastructure required if already using PostgreSQL
+- Weighted ranking (title > tags > comments/parts > content) with highlighted excerpts
+- Prefix matching while typing, "exact phrases", -exclusions and OR
+- Typo-tolerant title matching with pg_trgm
+- Every text search language your PostgreSQL server ships, including Turkish
+- Respects ownership and shares to users, groups and teams
+- Text extraction for plain text, OpenDocument and Office files, and PDFs (with pdftotext)
 
-Perfect for small to medium Nextcloud instances that want powerful search without the complexity of Elasticsearch.]]></description>
-    <version>1.0.0</version>
+Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
+    <version>1.1.0</version>
     <licence>agpl</licence>
     <author>surfcu</author>
     <namespace>FullTextSearch_PgSql</namespace>
-    <category>tools</category>
+    <category>search</category>
     <bugs>https://github.com/surfcu/fulltextsearch_pgsql/issues</bugs>
     <repository type="git">https://github.com/surfcu/fulltextsearch_pgsql</repository>
-    <screenshot>https://raw.githubusercontent.com/surfcu/fulltextsearch_pgsql/master/screenshots/search.png</screenshot>
-    
+
     <dependencies>
-        <nextcloud min-version="25" max-version="30"/>
-        <php min-version="8.0" max-version="8.3"/>
-        <database>pgsql</database>
+        <php min-version="8.1"/>
+        <database min-version="12">pgsql</database>
+        <nextcloud min-version="29" max-version="32"/>
     </dependencies>
 
-    <types>
-        <filesystem/>
-    </types>
+    <repair-steps>
+        <post-migration>
+            <step>OCA\FullTextSearch_PgSql\Migration\CreateIndexTable</step>
+        </post-migration>
+        <install>
+            <step>OCA\FullTextSearch_PgSql\Migration\CreateIndexTable</step>
+        </install>
+        <uninstall>
+            <step>OCA\FullTextSearch_PgSql\Migration\DropIndexTable</step>
+        </uninstall>
+    </repair-steps>
+
+    <commands>
+        <command>OCA\FullTextSearch_PgSql\Command\Configure</command>
+    </commands>
 
     <fulltextsearch>
-        <provider>OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform</provider>
+        <platform>OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform</platform>
     </fulltextsearch>
 </info>

@@ -4,146 +4,239 @@ declare(strict_types=1);
 
 namespace OCA\FullTextSearch_PgSql\Service;
 
-use OCA\FullTextSearch_PgSql\Db\IndexMapper;
+use OC\FullTextSearch\Model\DocumentAccess;
+use OC\FullTextSearch\Model\IndexDocument;
+use OCA\FullTextSearch_PgSql\Exceptions\DocumentNotFoundException;
+use OCA\FullTextSearch_PgSql\Model\ParsedQuery;
+use OCA\FullTextSearch_PgSql\Tools\PgArray;
+use OCP\FullTextSearch\Model\IDocumentAccess;
+use OCP\FullTextSearch\Model\IIndexDocument;
 use OCP\FullTextSearch\Model\ISearchRequest;
 use OCP\FullTextSearch\Model\ISearchResult;
-use OCP\FullTextSearch\Model\SearchResult;
-use OCP\IUserSession;
-use Psr\Log\LoggerInterface;
+use OCP\IDBConnection;
 
 class SearchService {
-    
-    private IndexMapper $indexMapper;
-    private ConfigService $configService;
-    private IUserSession $userSession;
-    private LoggerInterface $logger;
 
-    public function __construct(
-        IndexMapper $indexMapper,
-        ConfigService $configService,
-        IUserSession $userSession,
-        LoggerInterface $logger
-    ) {
-        $this->indexMapper = $indexMapper;
-        $this->configService = $configService;
-        $this->userSession = $userSession;
-        $this->logger = $logger;
-    }
+	private const FRAGMENT_DELIMITER = '|||';
+	private const HEADLINE_OPTIONS = 'StartSel="",StopSel="",MaxFragments=3,MaxWords=30,MinWords=12,FragmentDelimiter="' . self::FRAGMENT_DELIMITER . '"';
 
-    /**
-     * Perform a search using PostgreSQL full-text search
-     */
-    public function search(ISearchRequest $request, ISearchResult $result): void {
-        try {
-            $user = $this->userSession->getUser();
-            if ($user === null) {
-                return;
-            }
+	public function __construct(
+		private IDBConnection $db,
+		private SchemaService $schemaService,
+		private ConfigService $configService,
+		private TsQueryBuilder $queryBuilder,
+	) {
+	}
 
-            $userId = $user->getUID();
-            $search = $request->getSearch();
-            
-            if (empty($search)) {
-                return;
-            }
+	public function searchRequest(ISearchResult $result, IDocumentAccess $access): void {
+		$start = microtime(true);
+		$request = $result->getRequest();
+		$providerId = $result->getProvider()->getId();
 
-            // Sanitize search query
-            $search = $this->sanitizeSearchQuery($search);
+		$viewerTokens = AccessTokens::forViewer($access);
+		$query = $this->queryBuilder->build($request->getSearch(), $this->configService->getLanguage());
+		if ($viewerTokens === [] || $query === null) {
+			$result->setTotal(0);
+			return;
+		}
 
-            // Get search parameters
-            $providers = $request->getProviders();
-            $tags = $request->getTags();
-            $metaTags = $request->getMetaTags();
-            $limit = min($request->getSize(), $this->configService->getMaxResults());
-            $offset = $request->getPage() * $limit;
+		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
+		$page = max(1, $request->getPage());
+		[$filterSql, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
 
-            // Perform the search
-            $documents = $this->indexMapper->search(
-                $search,
-                $userId,
-                $providers,
-                $tags,
-                $metaTags,
-                $limit,
-                $offset,
-                $this->configService->getLanguage(),
-                $this->configService->useTrigramSearch()
-            );
+		$rows = $this->fullTextSearch($query, $filterSql, $filterParams, $size, ($page - 1) * $size);
+		if ($rows === [] && $page === 1 && $this->fuzzyAvailable() && $query->plainText !== '') {
+			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
+			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size);
+		}
 
-            // Get total count
-            $total = $this->indexMapper->searchCount(
-                $search,
-                $userId,
-                $providers,
-                $tags,
-                $metaTags,
-                $this->configService->getLanguage(),
-                $this->configService->useTrigramSearch()
-            );
+		$maxScore = 0;
+		foreach ($rows as $row) {
+			$score = round((float)$row['rank'] * 100, 2);
+			$maxScore = max($maxScore, (int)ceil($score));
+			$result->addDocument($this->toResultDocument($providerId, $row, (string)$score, $access->getViewerId()));
+		}
 
-            // Add documents to result
-            foreach ($documents as $doc) {
-                $searchResult = new SearchResult();
-                $searchResult->setProviderId($doc['provider_id']);
-                $searchResult->setDocumentId($doc['document_id']);
-                $searchResult->setTitle($doc['title']);
-                $searchResult->setExcerpt($this->generateExcerpt($doc['content'], $search));
-                $searchResult->setScore((float)$doc['rank']);
-                
-                $result->addDocument($searchResult);
-            }
+		$result->setTotal($rows === [] ? 0 : (int)$rows[0]['total']);
+		$result->setMaxScore($maxScore);
+		$result->setTime((int)round((microtime(true) - $start) * 1000));
+		$result->setTimedOut(false);
+	}
 
-            $result->setTotal($total);
-            $result->setMaxScore(1.0);
+	/**
+	 * @throws DocumentNotFoundException
+	 */
+	public function getDocument(string $providerId, string $documentId): IIndexDocument {
+		$result = $this->db->executeQuery(
+			'SELECT owner_id, array_to_json(access) AS access, array_to_json(links) AS links,
+					array_to_json(tags) AS tags, array_to_json(metatags) AS metatags, array_to_json(subtags) AS subtags,
+					source, hash, modified_time, title, parts, content, info
+			 FROM ' . $this->schemaService->getTableName() . ' WHERE provider_id = ? AND document_id = ?',
+			[$providerId, $documentId]
+		);
+		$row = $result->fetch();
+		$result->closeCursor();
+		if (!is_array($row)) {
+			throw new DocumentNotFoundException("Document $providerId:$documentId is not indexed");
+		}
 
-        } catch (\Exception $e) {
-            $this->logger->error('Error performing search: ' . $e->getMessage());
-        }
-    }
+		$ownerId = (string)$row['owner_id'];
+		$shares = AccessTokens::split($this->decode($row['access']), $ownerId);
+		$access = new DocumentAccess($ownerId);
+		$access->setUsers($shares['users']);
+		$access->setGroups($shares['groups']);
+		$access->setCircles($shares['circles']);
+		$access->setLinks($this->decode($row['links']));
 
-    /**
-     * Sanitize search query for PostgreSQL full-text search
-     */
-    private function sanitizeSearchQuery(string $query): string {
-        // Remove special characters that could break ts_query
-        $query = preg_replace('/[^\w\s\-]/', ' ', $query);
-        
-        // Collapse multiple spaces
-        $query = preg_replace('/\s+/', ' ', $query);
-        
-        return trim($query);
-    }
+		$document = new IndexDocument($providerId, $documentId);
+		$document->setAccess($access);
+		$document->setTags($this->decode($row['tags']));
+		$document->setMetaTags($this->decode($row['metatags']));
+		$document->setSubTags($this->decode($row['subtags']));
+		$document->setSource((string)$row['source']);
+		$document->setHash((string)$row['hash']);
+		$document->setModifiedTime((int)$row['modified_time']);
+		$document->setTitle((string)$row['title']);
+		$document->setParts($this->decode($row['parts']));
+		$document->setContent((string)$row['content']);
+		foreach ($this->decode($row['info']) as $key => $value) {
+			match (true) {
+				is_array($value) => $document->setInfoArray((string)$key, $value),
+				is_bool($value) => $document->setInfoBool((string)$key, $value),
+				is_int($value) => $document->setInfoInt((string)$key, $value),
+				default => $document->setInfo((string)$key, (string)$value),
+			};
+		}
+		return $document;
+	}
 
-    /**
-     * Generate search excerpt with highlighted terms
-     */
-    private function generateExcerpt(string $content, string $search, int $length = 200): string {
-        $content = strip_tags($content);
-        
-        // Find the position of the search term
-        $searchTerms = explode(' ', $search);
-        $position = 0;
-        
-        foreach ($searchTerms as $term) {
-            $pos = stripos($content, $term);
-            if ($pos !== false) {
-                $position = $pos;
-                break;
-            }
-        }
-        
-        // Extract excerpt around the search term
-        $start = max(0, $position - (int)($length / 2));
-        $excerpt = substr($content, $start, $length);
-        
-        // Add ellipsis if needed
-        if ($start > 0) {
-            $excerpt = '...' . $excerpt;
-        }
-        if (strlen($content) > $start + $length) {
-            $excerpt .= '...';
-        }
-        
-        return $excerpt;
-    }
+	/**
+	 * @param list<string> $viewerTokens
+	 * @return array{0: string, 1: list<string>}
+	 */
+	private function filters(ISearchRequest $request, string $providerId, array $viewerTokens): array {
+		$sql = 'd.provider_id = ? AND d.access && CAST(? AS text[])';
+		$params = [$providerId, PgArray::toLiteral($viewerTokens)];
+
+		$metaTags = array_values(array_map('strval', $request->getMetaTags()));
+		if ($metaTags !== []) {
+			// any of the requested meta tags
+			$sql .= ' AND d.metatags && CAST(? AS text[])';
+			$params[] = PgArray::toLiteral($metaTags);
+		}
+
+		$subTags = array_values(array_map('strval', $request->getSubTags(true)));
+		if ($subTags !== []) {
+			// all of the requested sub tags
+			$sql .= ' AND d.subtags @> CAST(? AS text[])';
+			$params[] = PgArray::toLiteral($subTags);
+		}
+
+		$since = (int)$request->getOption('since');
+		if ($since > 0) {
+			$sql .= ' AND d.modified_time >= ?';
+			$params[] = (string)$since;
+		}
+
+		return [$sql, $params];
+	}
+
+	/**
+	 * @param list<string> $filterParams
+	 * @return list<array<string, mixed>>
+	 */
+	private function fullTextSearch(ParsedQuery $query, string $filterSql, array $filterParams, int $limit, int $offset): array {
+		$t = $this->schemaService->getTableName();
+		// The inner query filters, ranks and pages; ts_headline (expensive) only runs on the page.
+		// Documents containing every search term come first, then partial (OR) matches.
+		$sql = <<<SQL
+			WITH q AS (
+				SELECT {$query->sql} AS query, {$query->rankSql} AS rank_query, {$query->allSql} AS all_query
+			)
+			SELECT m.document_id, m.title, m.source, m.hash, m.modified_time, m.rank, m.total,
+				   ts_headline(m.config, m.body, m.rank_query, ?) AS excerpt
+			FROM (
+				SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config,
+					   CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END AS body,
+					   q.rank_query,
+					   (d.tsv @@ q.all_query) AS all_match,
+					   ts_rank_cd(d.tsv, q.rank_query, 32) AS rank,
+					   count(*) OVER () AS total
+				FROM $t d, q
+				WHERE d.tsv @@ q.query AND $filterSql
+				ORDER BY all_match DESC, rank DESC, d.modified_time DESC, d.id
+				LIMIT ? OFFSET ?
+			) m
+			ORDER BY m.all_match DESC, m.rank DESC, m.modified_time DESC, m.id
+			SQL;
+
+		$params = array_merge(
+			$query->params, $query->rankParams, $query->allParams,
+			[self::HEADLINE_OPTIONS], $filterParams, [(string)$limit, (string)$offset]
+		);
+		$result = $this->db->executeQuery($sql, $params);
+		$rows = $result->fetchAll();
+		$result->closeCursor();
+		return $rows;
+	}
+
+	/**
+	 * @param list<string> $filterParams
+	 * @return list<array<string, mixed>>
+	 */
+	private function titleSimilaritySearch(string $text, string $filterSql, array $filterParams, int $limit): array {
+		$t = $this->schemaService->getTableName();
+		$sql = <<<SQL
+			SELECT d.document_id, d.title, d.source, d.hash, d.modified_time,
+				   word_similarity(?, d.title) AS rank,
+				   count(*) OVER () AS total,
+				   left(CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END, 300) AS excerpt
+			FROM $t d
+			WHERE ? <% d.title AND $filterSql
+			ORDER BY rank DESC, d.modified_time DESC, d.id
+			LIMIT ?
+			SQL;
+
+		$params = array_merge([$text, $text], $filterParams, [(string)$limit]);
+		$result = $this->db->executeQuery($sql, $params);
+		$rows = $result->fetchAll();
+		$result->closeCursor();
+		return $rows;
+	}
+
+	private function fuzzyAvailable(): bool {
+		return $this->configService->useTrigram() && $this->schemaService->hasTrigram();
+	}
+
+	private function toResultDocument(string $providerId, array $row, string $score, string $viewerId): IIndexDocument {
+		$access = new DocumentAccess();
+		$access->setViewerId($viewerId);
+
+		$document = new IndexDocument($providerId, (string)$row['document_id']);
+		$document->setAccess($access);
+		$document->setTitle((string)$row['title']);
+		$document->setSource((string)$row['source']);
+		$document->setHash((string)$row['hash']);
+		$document->setModifiedTime((int)$row['modified_time']);
+		$document->setScore($score);
+
+		$excerpts = [];
+		foreach (explode(self::FRAGMENT_DELIMITER, (string)$row['excerpt']) as $fragment) {
+			$fragment = trim($fragment);
+			if ($fragment !== '') {
+				$excerpts[] = ['source' => 'content', 'excerpt' => $fragment];
+			}
+		}
+		$document->setExcerpts($excerpts);
+
+		return $document;
+	}
+
+	private function decode(mixed $json): array {
+		if (!is_string($json) || $json === '') {
+			return [];
+		}
+		$value = json_decode($json, true);
+		return is_array($value) ? $value : [];
+	}
 }

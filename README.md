@@ -1,254 +1,125 @@
 # Full Text Search - PostgreSQL
 
-A PostgreSQL-based search platform provider for Nextcloud's Full Text Search framework.
-
-## Description
-
-This app provides a PostgreSQL-based alternative to Elasticsearch for Nextcloud's Full Text Search framework. It uses PostgreSQL's native full-text search capabilities including:
-
-- **ts_vector** and **ts_query** for efficient full-text indexing
-- **GIN indexes** for fast search performance
-- **pg_trgm** extension for fuzzy/similarity matching
-- Multi-language support with PostgreSQL's text search dictionaries
-- Relevance ranking with **ts_rank**
+A search platform for Nextcloud's [Full Text Search](https://github.com/nextcloud/fulltextsearch) that uses PostgreSQL's built-in full-text search instead of Elasticsearch. If Nextcloud already runs on PostgreSQL, there is nothing else to install or operate.
 
 ## Features
 
-- ✅ No additional infrastructure required (uses your existing PostgreSQL database)
-- ✅ Lower resource footprint compared to Elasticsearch
-- ✅ Native full-text search with PostgreSQL
-- ✅ Trigram similarity for fuzzy matching
-- ✅ **Multi-language support including Turkish (Türkçe)** - 28 languages supported
-- ✅ Relevance ranking
-- ✅ Tag and metadata filtering
-- ✅ Access control integration
+- **Ranked results with excerpts.** Title matches outrank tags, which outrank comments and other document parts, which outrank body text. Excerpts come from `ts_headline`.
+- **Search-as-you-type.** Words match as prefixes: `rap` finds *rapor*, *raporlar*.
+- **Query syntax** (the Full Text Search framework's standard, same as the Elasticsearch platform): plain words are optional and any of them can match, `+word` is required, `-word` is excluded, `"exact phrase"` works with or without `+`/`-`. Documents containing every word are always listed before partial matches. Queries made only of exclusions or stopwords return nothing rather than everything.
+- **Typo tolerance.** When nothing matches, titles are searched by trigram similarity (`markting` finds *Marketing plan*). Needs the `pg_trgm` extension.
+- **Any language your PostgreSQL ships**, including Turkish, with correct dotted/dotless I handling (see below).
+- **Access control.** Users only see documents they own or that are shared with them, their groups, or their teams (circles).
+- **Text extraction** for plain text (UTF-8, UTF-16, legacy Windows-1254), OpenDocument and Office Open XML files (odt/ods/odp, docx/xlsx/pptx), and PDFs when `pdftotext` is installed.
+- **Partial updates.** When only metadata changes (a new share, a rename), the stored text is kept instead of being re-extracted.
 
 ## Requirements
 
-- Nextcloud 25 or higher
-- PostgreSQL 12 or higher (as your Nextcloud database)
-- PHP 8.0 or higher
-- Full Text Search app installed and enabled
+- Nextcloud 29–32 running on **PostgreSQL 12 or newer**
+- The **Full Text Search** app plus at least one content provider, e.g. **Full Text Search - Files**
+- PHP 8.1+ with `zip` (for office documents)
+- Optional: `poppler-utils` for PDF text (`apt install poppler-utils`)
+- Optional: the `pg_trgm` extension for typo tolerance. Since PostgreSQL 13 it is a trusted extension and the app creates it automatically when the Nextcloud database user owns the database. Otherwise a superuser can run `CREATE EXTENSION pg_trgm;` in the Nextcloud database.
 
 ## Installation
 
-### 1. Install the app
-
 ```bash
-cd /path/to/nextcloud/apps
+cd /var/www/nextcloud/apps
 git clone https://github.com/surfcu/fulltextsearch_pgsql.git
-cd fulltextsearch_pgsql
-composer install --no-dev
+sudo -u www-data php /var/www/nextcloud/occ app:enable fulltextsearch_pgsql
 ```
 
-### 2. Enable the app
+No `composer install` is needed: the app has no runtime dependencies.
+
+Then choose it as the platform and build the index:
 
 ```bash
-sudo -u www-data php /path/to/nextcloud/occ app:enable fulltextsearch_pgsql
+occ fulltextsearch:configure '{"search_platform":"OCA\\FullTextSearch_PgSql\\Platform\\PostgreSQLPlatform"}'
+occ fulltextsearch_pgsql:configure '{"language":"english"}'   # or turkish, german, simple, ...
+occ fulltextsearch:test
+occ fulltextsearch:index
 ```
 
-### 3. Enable PostgreSQL extensions
+The platform can also be picked in **Administration settings → Full text search**.
 
-The app requires the `pg_trgm` extension for trigram similarity search. Connect to your PostgreSQL database and run:
-
-```sql
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-```
-
-### 4. Configure Full Text Search
-
-Set PostgreSQL as your search platform:
-
-```bash
-sudo -u www-data php /path/to/nextcloud/occ fulltextsearch:configure
-```
-
-When prompted, select `pgsql` as the search platform.
-
-### 5. Index your content
-
-Start indexing your content:
-
-```bash
-sudo -u www-data php /path/to/nextcloud/occ fulltextsearch:index
-```
+Keep the index current with the live indexer (`occ fulltextsearch:live`, e.g. as a systemd service) or the framework's cron job.
 
 ## Configuration
 
-### Language Configuration
-
-PostgreSQL supports multiple languages for text search. Set your language in the app configuration:
-
 ```bash
-# For Turkish
-sudo -u www-data php /path/to/nextcloud/occ config:app:set fulltextsearch_pgsql language --value=turkish
-
-# For English (default)
-sudo -u www-data php /path/to/nextcloud/occ config:app:set fulltextsearch_pgsql language --value=english
+occ fulltextsearch_pgsql:configure                 # show current settings
+occ fulltextsearch_pgsql:configure --languages     # languages this PostgreSQL server supports
+occ fulltextsearch_pgsql:configure '{"language":"turkish","max_content_size":800000}'
 ```
 
-**Supported languages include:**
-- `arabic` - العربية
-- `armenian` - Հայերեն
-- `basque` - Euskara
-- `catalan` - Català
-- `danish` - Dansk
-- `dutch` - Nederlands
-- `english` - English (default)
-- `finnish` - Suomi
-- `french` - Français
-- `german` - Deutsch
-- `greek` - Ελληνικά
-- `hindi` - हिन्दी
-- `hungarian` - Magyar
-- `indonesian` - Bahasa Indonesia
-- `irish` - Gaeilge
-- `italian` - Italiano
-- `lithuanian` - Lietuvių
-- `nepali` - नेपाली
-- `norwegian` - Norsk
-- `portuguese` - Português
-- `romanian` - Română
-- `russian` - Русский
-- `serbian` - Српски
-- `spanish` - Español
-- `swedish` - Svenska
-- `tamil` - தமிழ்
-- **`turkish` - Türkçe** ✨
-- `yiddish` - ייִדיש
+| Setting | Default | Meaning |
+|---|---|---|
+| `language` | `english` | PostgreSQL text search configuration used for stemming and stopwords. Must be one listed by `--languages`. Use `simple` for no stemming (mixed-language content). |
+| `use_trigram` | `true` | Typo-tolerant title matching when a search has no exact results. Ignored if `pg_trgm` is unavailable. |
+| `max_results` | `100` | Upper limit for the page size a client may request. |
+| `max_content_size` | `512000` | Bytes of extracted text indexed per document. Larger documents are truncated. PostgreSQL rejects search vectors over 1 MB; if a document still exceeds that it is indexed by title and metadata only, with a warning. |
+| `pdftotext_path` | *(empty)* | Path to `pdftotext`. Empty means look it up on `PATH`. |
 
-### Other Configuration Options
+The configure command validates values. `occ config:app:set` works too but does not.
+
+**After changing `language`, rebuild the index** so existing documents are processed with it:
 
 ```bash
-# Enable/disable trigram search (fuzzy matching)
-sudo -u www-data php /path/to/nextcloud/occ config:app:set fulltextsearch_pgsql use_trigram --value=true
-
-# Set minimum word length for indexing
-sudo -u www-data php /path/to/nextcloud/occ config:app:set fulltextsearch_pgsql min_word_length --value=3
-
-# Set maximum search results
-sudo -u www-data php /path/to/nextcloud/occ config:app:set fulltextsearch_pgsql max_results --value=100
+occ fulltextsearch:reset && occ fulltextsearch:index
 ```
 
-## How It Works
+## Turkish
 
-### Indexing
+PostgreSQL lowercases text using the database's locale, which is rarely `tr_TR`. Under any other locale `I` becomes `i` instead of `ı`, so `ISPARTA` would never match `ısparta` and uppercase words would miss their lowercase forms. When `language` is `turkish`, the app maps `I→ı` and `İ→i` before stemming, both when indexing and when searching, so it works regardless of the database locale.
 
-When documents are indexed:
+A Turkish-language guide is in [docs/TURKISH.md](docs/TURKISH.md).
 
-1. Content is extracted from documents by content providers (Files, Bookmarks, etc.)
-2. Text is processed and stored in the `fts_pgsql_index` table
-3. PostgreSQL's `to_tsvector()` function creates a searchable text vector
-4. GIN indexes are used for fast lookups
+## What gets indexed from files
 
-### Searching
+| Content | How |
+|---|---|
+| Text files (txt, md, csv, code, …) | Decoded directly; UTF-8, UTF-16 with BOM, or Windows-1254 |
+| OpenDocument (odt, ods, odp) | `content.xml` |
+| Office Open XML (docx, xlsx, pptx) | Document body, headers/footers/notes, shared strings, slides and notes |
+| PDF | `pdftotext`, if installed (60 s timeout per file) |
+| Scanned PDFs, images, other binaries | Title, tags and comments only; logged as a warning |
 
-When you perform a search:
+Which files are sent for indexing at all (size limits, external storage, etc.) is decided by the Files provider's own settings.
 
-1. Your query is converted to a PostgreSQL `ts_query`
-2. The `@@` operator matches against indexed `ts_vector` columns
-3. Results are ranked using `ts_rank()` for relevance
-4. Trigram similarity provides fuzzy matching
-5. Access controls ensure users only see their own content
+## Limitations
 
-## Performance Considerations
+- Ranking is good but simpler than Elasticsearch's BM25; there are no synonyms or per-field boosting knobs.
+- One language per instance. Documents keep the language they were indexed with until they are reindexed.
+- No OCR, and no extraction for legacy `.doc`/`.xls`/`.ppt` binaries.
+- Excerpts are generated from at most `max_content_size` bytes of each document.
+- Everything lives in your Nextcloud database, so index size counts toward its storage and backups (roughly 1–2× the extracted text).
 
-### Indexing Performance
+## How it works
 
-- Initial indexing can take time for large document collections
-- Use background jobs or run indexing during off-peak hours
-- Consider partitioning the index table for very large instances
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). In short: one table, `ftspg_<prefix>index` (e.g. `ftspg_oc_index`), with a generated weighted `tsvector` column and GIN indexes on it and on an access-token array. The table is deliberately named outside Nextcloud's table prefix so Nextcloud's Doctrine schema tooling never sees its PostgreSQL-specific column types.
 
-### Search Performance
-
-- GIN indexes provide excellent search performance
-- Most searches complete in milliseconds
-- For very large instances (millions of documents), consider:
-  - Increasing PostgreSQL's `shared_buffers`
-  - Tuning `work_mem` for sorting operations
-  - Using table partitioning
-
-### Resource Usage
-
-PostgreSQL FTS uses significantly less memory than Elasticsearch:
-- No separate JVM required
-- Indexes are stored efficiently in PostgreSQL
-- Shared with your existing database resources
-
-## Comparison with Elasticsearch
-
-| Feature | PostgreSQL FTS | Elasticsearch |
-|---------|---------------|---------------|
-| Setup Complexity | Simple | Complex |
-| Resource Usage | Low | High |
-| Search Speed | Fast | Very Fast |
-| Distributed Search | No | Yes |
-| Fuzzy Search | Yes (trigram) | Yes |
-| Relevance Ranking | Yes | Yes (more advanced) |
-| Best For | Small-Medium instances | Large/distributed instances |
+Coming from Elasticsearch? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
 ## Troubleshooting
 
-### Extension not found
+**`occ fulltextsearch:test` fails.** Check `nextcloud.log`. The platform requires Nextcloud's own database to be PostgreSQL; it cannot use a separate PostgreSQL server.
 
-If you see errors about `pg_trgm` not being available:
+**No typo tolerance.** `occ fulltextsearch_pgsql:configure` shows the setting; `occ fulltextsearch:check` shows `"pg_trgm": false` if the extension is missing. Create it as a superuser, then run `occ fulltextsearch:test`, which adds the trigram index.
 
-```sql
--- Connect to your database and run:
-CREATE EXTENSION pg_trgm;
-```
+**PDFs have no content.** Install `poppler-utils`, or set `pdftotext_path`. Scanned PDFs contain images, not text.
 
-### Slow search performance
-
-1. Check that GIN indexes are created:
-```sql
-SELECT indexname FROM pg_indexes WHERE tablename = 'fts_pgsql_index';
-```
-
-2. Analyze the table:
-```sql
-ANALYZE fts_pgsql_index;
-```
-
-3. Check PostgreSQL configuration for full-text search optimization
-
-### Database not PostgreSQL
-
-This app requires PostgreSQL. If you're using MySQL/MariaDB, you'll need to use a different search platform provider.
+**Slow searches on very large instances.** Run `ANALYZE ftspg_oc_index;` after the initial index and make sure `shared_buffers` and `work_mem` are sized for your data. Very short prefixes (one or two letters) match many words and are inherently slower.
 
 ## Development
 
-### Running Tests
-
 ```bash
-composer install
-./vendor/bin/phpunit tests/
+composer install          # nextcloud/ocp stubs and Psalm
+composer psalm            # static analysis against the real Nextcloud interfaces
+FTSPG_TEST_DSN="pgsql:host=localhost;dbname=fts_test;user=postgres;password=postgres" composer test
 ```
 
-### Code Style
-
-```bash
-./vendor/bin/php-cs-fixer fix
-```
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
+The integration tests run against a real, disposable PostgreSQL database. CI runs them on PHP 8.1/PostgreSQL 13 and PHP 8.3/PostgreSQL 17.
 
 ## License
 
 AGPL-3.0-or-later
-
-## Credits
-
-Built for Nextcloud's Full Text Search framework.
-
-## Support
-
-- Issues: https://github.com/surfcu/fulltextsearch_pgsql/issues
-- Nextcloud Community: https://help.nextcloud.com
