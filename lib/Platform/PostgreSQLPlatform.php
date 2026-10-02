@@ -50,7 +50,8 @@ class PostgreSQLPlatform implements IFullTextSearchPlatform {
 	}
 
 	public function loadPlatform() {
-		if ($this->schemaService->isPostgres() && !$this->schemaService->tableExists()) {
+		// Normally done by the install/upgrade repair step; this covers skipped or failed runs.
+		if ($this->schemaService->isPostgres() && !$this->schemaService->isCurrent()) {
 			$this->schemaService->ensureSchema();
 		}
 	}

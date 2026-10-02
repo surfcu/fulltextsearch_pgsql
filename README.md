@@ -6,6 +6,8 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 
 - **Ranked results with excerpts.** Title matches outrank tags, which outrank comments and other document parts, which outrank body text. Excerpts come from `ts_headline`.
 - **Search-as-you-type.** Words match as prefixes: `rap` finds *rapor*, *raporlar*.
+- **File names are split into words.** `final`, `2025` or `final.pdf` all find *rapor_2025_final.pdf*; `img` finds *IMG20250412.jpg*. PostgreSQL would otherwise treat each file name as a single word.
+- **Substring matching in titles.** A word of three or more letters also matches anywhere inside a title: `butce` finds *YillikButceRaporu.xlsx*. These matches rank below normal word matches. Needs `pg_trgm`.
 - **Query syntax** (the Full Text Search framework's standard, same as the Elasticsearch platform): plain words are optional and any of them can match, `+word` is required, `-word` is excluded, `"exact phrase"` works with or without `+`/`-`. Documents containing every word are always listed before partial matches. Queries made only of exclusions or stopwords return nothing rather than everything.
 - **Typo tolerance.** When nothing matches, titles are searched by trigram similarity (`markting` finds *Marketing plan*). Needs the `pg_trgm` extension.
 - **Any language your PostgreSQL ships**, including Turkish, with correct dotted/dotless I handling (see below).
@@ -55,7 +57,7 @@ occ fulltextsearch_pgsql:configure '{"language":"turkish","max_content_size":800
 | Setting | Default | Meaning |
 |---|---|---|
 | `language` | `english` | PostgreSQL text search configuration used for stemming and stopwords. Must be one listed by `--languages`. Use `simple` for no stemming (mixed-language content). |
-| `use_trigram` | `true` | Typo-tolerant title matching when a search has no exact results. Ignored if `pg_trgm` is unavailable. |
+| `use_trigram` | `true` | Substring matching in titles, and typo-tolerant title matching when a search has no exact results. Ignored if `pg_trgm` is unavailable. |
 | `max_results` | `100` | Upper limit for the page size a client may request. |
 | `max_content_size` | `512000` | Bytes of extracted text indexed per document. Larger documents are truncated. PostgreSQL rejects search vectors over 1 MB; if a document still exceeds that it is indexed by title and metadata only, with a warning. |
 | `pdftotext_path` | *(empty)* | Path to `pdftotext`. Empty means look it up on `PATH`. |
@@ -96,7 +98,7 @@ Which files are sent for indexing at all (size limits, external storage, etc.) i
 
 ## How it works
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). In short: one table, `ftspg_<prefix>index` (e.g. `ftspg_oc_index`), with a generated weighted `tsvector` column and GIN indexes on it and on an access-token array. The table is deliberately named outside Nextcloud's table prefix so Nextcloud's Doctrine schema tooling never sees its PostgreSQL-specific column types.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). In short: one table, `ftspg_<prefix>index` (e.g. `ftspg_oc_index`), with a generated weighted `tsvector` column, GIN indexes on it and on an access-token array, and a trigram index on a lowercased copy of the title. The table is deliberately named outside Nextcloud's table prefix so Nextcloud's Doctrine schema tooling never sees its PostgreSQL-specific column types.
 
 Coming from Elasticsearch? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
@@ -104,7 +106,7 @@ Coming from Elasticsearch? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
 **`occ fulltextsearch:test` fails.** Check `nextcloud.log`. The platform requires Nextcloud's own database to be PostgreSQL; it cannot use a separate PostgreSQL server.
 
-**No typo tolerance.** `occ fulltextsearch_pgsql:configure` shows the setting; `occ fulltextsearch:check` shows `"pg_trgm": false` if the extension is missing. Create it as a superuser, then run `occ fulltextsearch:test`, which adds the trigram index.
+**No substring matching or typo tolerance.** `occ fulltextsearch_pgsql:configure` shows the setting; `occ fulltextsearch:check` shows `"pg_trgm": false` if the extension is missing. Create it as a superuser, then run `occ fulltextsearch:test`, which adds the trigram index.
 
 **PDFs have no content.** Install `poppler-utils`, or set `pdftotext_path`. Scanned PDFs contain images, not text.
 

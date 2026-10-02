@@ -411,12 +411,78 @@ try {
 	same('W2', search($platform, 'alice', 'zebra giraffe')['ids'][0] ?? null, 'all-terms match beats many repeats of one term');
 	same(['W1', 'W2'], sorted(search($platform, 'alice', 'zebra giraffe')['ids']), 'partial matches still included');
 
+	section('file names');
+	$config->setConfig(['language' => 'english']);
+	$platform->indexDocument(doc('N1', 'alice', 'rapor_2025_final.pdf', ''));
+	$platform->indexDocument(doc('N2', 'alice', 'Yillik-Butce-v2.xlsx', ''));
+	$platform->indexDocument(doc('N3', 'alice', 'IMG20250412.jpg', ''));
+	$platform->indexDocument(doc('N4', 'alice', 'Notes', 'Visit example.com or write to support@example.com'));
+	$ids = fn (string $q) => sorted(search($platform, 'alice', $q)['ids']);
+	same(['N1'], $ids('final'), 'word in the middle of a file name');
+	same(['N1', 'N3'], $ids('2025'), 'number inside file names (2025 and IMG2025…)');
+	same(['N2'], $ids('butce'), 'hyphen-separated part');
+	same(['N3'], $ids('img'), 'letters before digits');
+	same(['N1'], $ids('final.pdf'), 'typed file name fragment with a dot');
+	same(['N1'], $ids('rapor_2025'), 'typed file name fragment with an underscore');
+	same(['N1'], $ids('rapor_2025_final.pdf'), 'full file name');
+	same(['N4'], $ids('example.com'), 'host names in content still match whole');
+	same(['N4'], $ids('support@example.com'), 'e-mail addresses in content still match whole');
+
+	section('substring matching in titles');
+	$platform->indexDocument(doc('U1', 'alice', 'YillikButceRaporu.xlsx', ''));
+	$platform->indexDocument(doc('U2', 'alice', 'Proje sözleşmesi', 'tamamlandı'));
+	$platform->indexDocument(doc('U3', 'bob', 'GizliButce.ods', ''));
+	same(['N2', 'U1'], $ids('butce'), 'inside a camelCase name; only documents alice can see');
+	same(['U1'], $ids('raporu'), 'at the end of a joined name');
+	same(['U2'], $ids('özleş'), 'inside a word, non-ASCII');
+	same(['U1'], $ids('BUTCERAP'), 'case-insensitive');
+	same([], $ids('ce'), 'not for terms shorter than 3 characters');
+	same([], $ids('roj -sözleşmesi'), 'exclusions still apply');
+	same(['U1'], $ids('+utce +aporu'), 'required terms can be satisfied by substrings');
+	same([], $ids('the'), 'stopwords do not substring-match ("Other", "the…")');
+	same([], $ids('ut%ce'), 'a % in the query is not a wildcard');
+	same([], $ids('u_ce'), 'an _ in the query is not a wildcard');
+	$r = search($platform, 'alice', 'butce');
+	same('N2', $r['ids'][0], 'full-text matches rank above substring-only matches');
+	$config->setConfig(['use_trigram' => false]);
+	same(['N2'], $ids('butce'), 'substring matching off with use_trigram=false');
+	$config->setConfig(['use_trigram' => true]);
+
+	section('Turkish substrings');
+	$config->setConfig(['language' => 'turkish']);
+	$platform->indexDocument(doc('TU1', 'alice', 'ISIKLANDIRMA_PLANI.pdf', ''));
+	same(['TU1'], $ids('ıklandır'), 'dotless ı inside an uppercase title');
+	same(['TU1'], $ids('IKLANDIR'), 'uppercase query, Turkish case folding');
+	$config->setConfig(['language' => 'english']);
+
+	section('upgrading a 1.1.x table in place');
+	$t = $schema->getTableName();
+	$conn->executeStatement("DROP INDEX IF EXISTS {$t}_title_search_trgm_idx");
+	$conn->executeStatement("ALTER TABLE $t DROP COLUMN title_search, DROP COLUMN tsv");
+	$conn->executeStatement("ALTER TABLE $t ADD COLUMN tsv tsvector GENERATED ALWAYS AS (to_tsvector(config, title)) STORED");
+	if ($schema->hasTrigram()) {
+		$conn->executeStatement("CREATE INDEX {$t}_title_trgm_idx ON $t USING GIN (title gin_trgm_ops)");
+	}
+	same(false, $schema->isCurrent(), '1.1.x schema detected as outdated');
+	$platform->loadPlatform();
+	same(true, $schema->isCurrent(), 'loadPlatform upgrades it');
+	same(['N1'], $ids('final'), 'after upgrade: existing rows recomputed, file name parts searchable');
+	same(['N2', 'U1'], $ids('butce'), 'after upgrade: substring matching works');
+	$indexes = $conn->executeQuery('SELECT indexname FROM pg_indexes WHERE tablename = ?', [$t])->fetchAll(PDO::FETCH_COLUMN);
+	check(in_array("{$t}_title_search_trgm_idx", $indexes, true) && !in_array("{$t}_title_trgm_idx", $indexes, true), 'old trigram index replaced');
+	$platform->initializeIndex();
+	check(true, 'upgrade is idempotent');
+
 	section('query plan uses the indexes');
 	$conn->executeStatement('SET enable_seqscan = off');
 	$plan = implode("\n", array_column($conn->executeQuery(
 		"EXPLAIN SELECT id FROM ftspg_oc_index d WHERE d.tsv @@ to_tsquery('english', 'budget:*') AND d.access && '{u:alice}'::text[]"
 	)->fetchAll(), 'QUERY PLAN'));
 	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') || str_contains($plan, 'ftspg_oc_index_access_idx'), 'GIN index used');
+	$plan = implode("\n", array_column($conn->executeQuery(
+		"EXPLAIN SELECT id FROM ftspg_oc_index d WHERE d.title_search LIKE '%butce%'"
+	)->fetchAll(), 'QUERY PLAN'));
+	check(str_contains($plan, 'ftspg_oc_index_title_search_trgm_idx'), 'title substring search uses the trigram index');
 	$conn->executeStatement('SET enable_seqscan = on');
 } catch (Throwable $e) {
 	$failures++;

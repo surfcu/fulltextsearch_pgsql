@@ -34,7 +34,7 @@ class SearchService {
 		$providerId = $result->getProvider()->getId();
 
 		$viewerTokens = AccessTokens::forViewer($access);
-		$query = $this->queryBuilder->build($request->getSearch(), $this->configService->getLanguage());
+		$query = $this->queryBuilder->build($request->getSearch(), $this->configService->getLanguage(), $this->fuzzyAvailable());
 		if ($viewerTokens === [] || $query === null) {
 			$result->setTotal(0);
 			return;
@@ -150,20 +150,18 @@ class SearchService {
 		// The inner query filters, ranks and pages; ts_headline (expensive) only runs on the page.
 		// Documents containing every search term come first, then partial (OR) matches.
 		$sql = <<<SQL
-			WITH q AS (
-				SELECT {$query->sql} AS query, {$query->rankSql} AS rank_query, {$query->allSql} AS all_query
-			)
+			WITH q AS (SELECT {$query->rankSql} AS rank_query)
 			SELECT m.document_id, m.title, m.source, m.hash, m.modified_time, m.rank, m.total,
 				   ts_headline(m.config, m.body, m.rank_query, ?) AS excerpt
 			FROM (
 				SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config,
 					   CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END AS body,
 					   q.rank_query,
-					   (d.tsv @@ q.all_query) AS all_match,
+					   ({$query->allSql}) AS all_match,
 					   ts_rank_cd(d.tsv, q.rank_query, 32) AS rank,
 					   count(*) OVER () AS total
 				FROM $t d, q
-				WHERE d.tsv @@ q.query AND $filterSql
+				WHERE {$query->sql} AND $filterSql
 				ORDER BY all_match DESC, rank DESC, d.modified_time DESC, d.id
 				LIMIT ? OFFSET ?
 			) m
@@ -171,8 +169,8 @@ class SearchService {
 			SQL;
 
 		$params = array_merge(
-			$query->params, $query->rankParams, $query->allParams,
-			[self::HEADLINE_OPTIONS], $filterParams, [(string)$limit, (string)$offset]
+			$query->rankParams, [self::HEADLINE_OPTIONS], $query->allParams, $query->params,
+			$filterParams, [(string)$limit, (string)$offset]
 		);
 		$result = $this->db->executeQuery($sql, $params);
 		$rows = $result->fetchAll();
@@ -188,15 +186,16 @@ class SearchService {
 		$t = $this->schemaService->getTableName();
 		$sql = <<<SQL
 			SELECT d.document_id, d.title, d.source, d.hash, d.modified_time,
-				   word_similarity(?, d.title) AS rank,
+				   word_similarity(?, d.title_search) AS rank,
 				   count(*) OVER () AS total,
 				   left(CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END, 300) AS excerpt
 			FROM $t d
-			WHERE ? <% d.title AND $filterSql
+			WHERE ? <% d.title_search AND $filterSql
 			ORDER BY rank DESC, d.modified_time DESC, d.id
 			LIMIT ?
 			SQL;
 
+		$text = mb_strtolower($text, 'UTF-8');
 		$params = array_merge([$text, $text], $filterParams, [(string)$limit]);
 		$result = $this->db->executeQuery($sql, $params);
 		$rows = $result->fetchAll();

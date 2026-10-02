@@ -7,7 +7,7 @@ namespace OCA\FullTextSearch_PgSql\Service;
 use OCA\FullTextSearch_PgSql\Model\ParsedQuery;
 
 /**
- * Turns a user's search string into parameterised tsquery SQL expressions.
+ * Turns a user's search string into parameterised SQL.
  *
  * Follows the Full Text Search framework's query contract (the one Elasticsearch implements
  * and `occ fulltextsearch:test` checks):
@@ -18,18 +18,30 @@ use OCA\FullTextSearch_PgSql\Model\ParsedQuery;
  *   "two words"   phrase; can be prefixed with + or -
  * Documents containing every term are ranked ahead of partial matches.
  *
+ * With substring matching on (needs pg_trgm), a word of 3+ characters also matches when it
+ * appears anywhere inside a title: "butce" finds "YillikButceRaporu.xlsx".
+ *
  * User text never reaches SQL or the tsquery syntax unescaped: each term is a bound
- * parameter, quoted as a tsquery literal.
+ * parameter, quoted as a tsquery literal or escaped as a LIKE pattern.
  */
 class TsQueryBuilder {
 
 	private const MAX_TERMS = 32;
 	private const MAX_TERM_LENGTH = 100;
+	private const MIN_SUBSTRING_LENGTH = 3;
+
+	/** Same split as SchemaService::splitWords(), applied to search words. */
+	private const SPLIT_PATTERNS = [
+		'/(\p{L})(\p{N})/u' => '$1 $2',
+		'/(\p{N})(\p{L})/u' => '$1 $2',
+		'/[_.\-\/\\\\+~,;:()\[\]{}]+/u' => ' ',
+	];
 
 	/**
+	 * @param bool $substring also match words inside titles (title_search LIKE '%word%')
 	 * @return ParsedQuery|null null when there is nothing positive to look for
 	 */
-	public function build(string $search, string $language): ?ParsedQuery {
+	public function build(string $search, string $language, bool $substring = false): ?ParsedQuery {
 		$search = mb_scrub($search, 'UTF-8');
 		if ($language === 'turkish') {
 			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
@@ -37,7 +49,7 @@ class TsQueryBuilder {
 		}
 		preg_match_all('/([+-]?)"([^"]*)"?|([+-]?)(\S+)/u', $search, $matches, PREG_SET_ORDER);
 
-		/** @var array{optional: list<array{0: string, 1: list<string>}>, required: list<array{0: string, 1: list<string>}>, excluded: list<array{0: string, 1: list<string>}>} $terms */
+		/** @var array<string, list<array{ts: array{0: string, 1: list<string>}, pred: array{0: string, 1: list<string>}}>> $terms */
 		$terms = ['optional' => [], 'required' => [], 'excluded' => []];
 		$words = [];
 		$count = 0;
@@ -59,42 +71,77 @@ class TsQueryBuilder {
 				'-' => 'excluded',
 				default => 'optional',
 			};
+
 			if ($isPhrase) {
-				$term = ['phraseto_tsquery(CAST(? AS regconfig), ?)', [$language, $text]];
+				$ts = ['phraseto_tsquery(CAST(? AS regconfig), ?)', [$language, $text]];
 			} else {
-				$literal = $this->literal($text) . ($kind === 'excluded' ? '' : ':*');
-				$term = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $literal]];
+				$ts = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $this->wordQuery($text, $kind !== 'excluded')]];
 			}
-			$terms[$kind][] = $term;
+
+			$pred = ['d.tsv @@ ' . $ts[0], $ts[1]];
+			if ($substring && !$isPhrase && $kind !== 'excluded' && mb_strlen($text) >= self::MIN_SUBSTRING_LENGTH) {
+				$pattern = '%' . addcslashes(mb_strtolower($text, 'UTF-8'), '\\%_') . '%';
+				// numnode() = 0 for stopwords ("the"), which must not substring-match "Other".
+				// Its arguments are constants, so PostgreSQL evaluates it once while planning.
+				$pred = [
+					'(' . $pred[0] . ' OR (numnode(' . $ts[0] . ') > 0 AND d.title_search LIKE ?))',
+					[...$ts[1], ...$ts[1], $pattern],
+				];
+			}
+
+			$terms[$kind][] = ['ts' => $ts, 'pred' => $pred];
 			if ($kind !== 'excluded') {
 				$words[] = $text;
 			}
 			$count++;
 		}
 
-		$required = $this->combine($terms['required'], '&&');
-		$optional = $this->combine($terms['optional'], '||');
-		$excluded = $this->combine($terms['excluded'], '||');
+		$required = array_column($terms['required'], 'pred');
+		$optional = array_column($terms['optional'], 'pred');
+		$excluded = array_column($terms['excluded'], 'ts');
 
 		// A query made only of exclusions would scan the whole table and match nearly everything.
-		$base = $required ?? $optional;
+		$base = $required !== [] ? $this->join($required, 'AND') : ($optional !== [] ? $this->join($optional, 'OR') : null);
 		if ($base === null) {
 			return null;
 		}
 
-		$match = $excluded === null ? $base : $this->join([$base, ['(!! ' . $excluded[0] . ')', $excluded[1]]], '&&');
-		$rank = $required !== null && $optional !== null ? $this->join([$required, $optional], '||') : $base;
-		$all = $this->combine(array_merge($terms['required'], $terms['optional']), '&&') ?? $base;
+		$match = $base;
+		if ($excluded !== []) {
+			$none = $this->join($excluded, '||');
+			$match = ['(' . $base[0] . ' AND NOT (d.tsv @@ ' . $none[0] . '))', [...$base[1], ...$none[1]]];
+		}
+
+		/** @var list<array{0: string, 1: list<string>}> $positiveTs */
+		$positiveTs = array_merge(array_column($terms['required'], 'ts'), array_column($terms['optional'], 'ts'));
+		/** @var list<array{0: string, 1: list<string>}> $positivePreds */
+		$positivePreds = array_merge($required, $optional);
+		if ($positiveTs === [] || $positivePreds === []) {
+			return null; // unreachable: $base above guarantees a positive term
+		}
+		$rank = $this->join($positiveTs, '||');
+		$all = $this->join($positivePreds, 'AND');
 
 		return new ParsedQuery($match[0], $match[1], $rank[0], $rank[1], $all[0], $all[1], implode(' ', $words));
 	}
 
 	/**
-	 * @param list<array{0: string, 1: list<string>}> $terms
-	 * @return array{0: string, 1: list<string>}|null
+	 * tsquery text for one word: the word itself, or, when it contains punctuation or
+	 * letter/digit boundaries ("final.pdf", "rapor_2025"), either the whole word or its parts
+	 * in sequence. The whole form still matches host names and e-mail addresses in content;
+	 * the parts match the split copy of titles.
 	 */
-	private function combine(array $terms, string $operator): ?array {
-		return $terms === [] ? null : $this->join($terms, $operator);
+	private function wordQuery(string $word, bool $prefix): string {
+		$suffix = $prefix ? ':*' : '';
+		$whole = $this->literal($word) . $suffix;
+
+		$split = trim((string)preg_replace(array_keys(self::SPLIT_PATTERNS), array_values(self::SPLIT_PATTERNS), $word));
+		$parts = preg_split('/\s+/u', $split, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+		if (count($parts) < 2) {
+			return $whole;
+		}
+		$sequence = implode(' <-> ', array_map(fn (string $p): string => $this->literal($p) . $suffix, $parts));
+		return "($whole) | ($sequence)";
 	}
 
 	/**

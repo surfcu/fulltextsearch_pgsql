@@ -45,6 +45,10 @@ sudo -u postgres psql nextcloud -c "CREATE EXTENSION pg_trgm;"
 
 Kelimeler ayrıca **önek** olarak da eşleşir, yani yazarken sonuçlar gelir: `rap` yazınca *rapor* ve *raporlar* bulunur.
 
+### Dosya adları ve kelime içi arama
+
+Dosya adları kelimelere ayrılarak dizinlenir: `final`, `2025` veya `final.pdf` aramaları *rapor_2025_final.pdf* dosyasını bulur. `pg_trgm` kuruluysa, en az üç harfli bir kelime başlığın herhangi bir yerinde de eşleşir: `butce` aramasıyla *YillikButceRaporu.xlsx* bulunur. Bu eşleşmeler normal kelime eşleşmelerinin altında sıralanır ve noktalı/noktasız I kuralına uyar (`IKLANDIR` aramasıyla *ISIKLANDIRMA_PLANI.pdf* bulunur).
+
 ### Noktalı ve noktasız I
 
 PostgreSQL küçük harfe çevirirken veritabanının yerel ayarını (locale) kullanır. Bu ayar neredeyse hiçbir zaman `tr_TR` değildir, bu yüzden normalde `I` harfi `ı` yerine `i` olur. Sonuç olarak `ISPARTA` aramada `ısparta` ile eşleşmez, büyük harfle yazılmış metinler kaçar.

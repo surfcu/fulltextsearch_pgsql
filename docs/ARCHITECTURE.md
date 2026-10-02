@@ -58,6 +58,7 @@ CREATE TABLE ftspg_oc_index (
   title, tags_text, parts (jsonb), parts_text, content, info (jsonb),
   tsv tsvector GENERATED ALWAYS AS (
         setweight(to_tsvector(config, title),      'A')
+     || setweight(to_tsvector(config, split(title)), 'A')   -- file name parts, see below
      || setweight(to_tsvector(config, tags_text),  'B')
      || setweight(to_tsvector(config, parts_text), 'C')
      || setweight(to_tsvector(config, content),    'D')
@@ -67,7 +68,17 @@ CREATE TABLE ftspg_oc_index (
 -- GIN indexes on tsv, access, metatags, subtags; trigram GIN index on title when pg_trgm exists
 ```
 
+  title_search text GENERATED ALWAYS AS (lower(title)) STORED,   -- for substring and typo matching
+
 (For Turkish rows each column is first passed through `translate(col, 'Iİ', 'ıi')`; see below.)
+
+### File names
+
+PostgreSQL's text parser reads `rapor_2025_final.pdf` as a single "host" token, so `final` or `2025` would never match it. The title is therefore indexed twice: as written, and with `regexp_replace` splitting it at punctuation (`_ . - / + ~ , ; : ( ) [ ] { }`) and at letter/digit boundaries (`IMG20250412` → `IMG 20250412`). `TsQueryBuilder` splits search words the same way and matches either the whole word or its parts in sequence. The whole form keeps host names and e-mail addresses in document text searchable.
+
+### Schema versions
+
+The generated columns' definition version is stored as a comment on `tsv` (`ftspg schema 2`). When the repair step or `loadPlatform()` finds an older marker, it drops and re-adds the generated columns, and PostgreSQL recomputes them for every row. That rewrite locks the table while it runs; on large indexes, upgrade during a quiet period.
 
 ### Why raw SQL and an unprefixed table name
 
@@ -117,6 +128,8 @@ User text is always a bound parameter and quoted as a tsquery literal, so neithe
 - **all**: every positive term ANDed. Rows matching it sort first, so precise matches are never buried under partial ones.
 
 The query pages inside a subquery and computes `count(*) OVER ()` for the total; `ts_headline` then runs only on the returned page. Excerpts are plain text (no markup), split into fragments.
+
+With `pg_trgm` available, each plain search word of three or more characters can also be satisfied by `title_search LIKE '%word%'`, served by the trigram index. The planner combines it with the `tsv` index in one bitmap scan. Stopwords are excluded with `numnode(to_tsquery(…)) > 0`, which PostgreSQL evaluates once at planning time. Substring-only matches have no full-text rank, so they sort after real word matches.
 
 If page 1 has no results and `pg_trgm` is available, titles are searched with `word_similarity` (`<%`, GIN-indexed) for typo tolerance.
 

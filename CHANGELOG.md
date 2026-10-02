@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-03
+
+### Fixed
+- File names were indexed as single words because PostgreSQL's parser treats `rapor_2025_final.pdf` as one token, so searching `final`, `2025` or `butce` (in `Yillik-Butce-v2.xlsx`) found nothing. Titles are now also indexed split at punctuation and letter/digit boundaries, and search words are split the same way.
+
+### Added
+- Substring matching in titles with `pg_trgm`: words of three or more characters match anywhere inside a title (`butce` finds `YillikButceRaporu.xlsx`), ranked below word matches. Stopwords are excluded; Turkish case folding applies. Controlled by `use_trigram`.
+- Versioned generated columns: the upgrade rebuilds them in place and recomputes every row. This locks the index table while it runs, so upgrade large instances during a quiet period. No reindex is needed.
+
+### Changed
+- The trigram index moved from `title` to a lowercased `title_search` column, which typo-tolerant matching now uses as well.
+
 ## [1.1.1] - 2026-10-03
 
 ### Changed

@@ -21,6 +21,9 @@ use Throwable;
  */
 class SchemaService {
 
+	/** Version of the generated column definitions; bump when they change. */
+	private const SCHEMA_MARKER = 'ftspg schema 2';
+
 	private ?bool $trigram = null;
 
 	public function __construct(
@@ -41,6 +44,18 @@ class SchemaService {
 			throw new RuntimeException('Unsupported characters in dbtableprefix');
 		}
 		return 'ftspg_' . $prefix . 'index';
+	}
+
+	/** True when the table exists and its generated columns match this version of the app. */
+	public function isCurrent(): bool {
+		$t = $this->getTableName();
+		$result = $this->db->executeQuery(
+			"SELECT col_description(to_regclass(?), attnum) FROM pg_attribute WHERE attrelid = to_regclass(?) AND attname = 'tsv' AND NOT attisdropped",
+			[$t, $t]
+		);
+		$marker = $result->fetchOne();
+		$result->closeCursor();
+		return $marker === self::SCHEMA_MARKER;
 	}
 
 	public function tableExists(): bool {
@@ -84,15 +99,11 @@ class SchemaService {
 				parts_text    text         NOT NULL DEFAULT '',
 				content       text         NOT NULL DEFAULT '',
 				info          jsonb        NOT NULL DEFAULT '{}',
-				tsv tsvector GENERATED ALWAYS AS (
-					setweight(to_tsvector(config, {$this->normalized('title')}), 'A')
-					|| setweight(to_tsvector(config, {$this->normalized('tags_text')}), 'B')
-					|| setweight(to_tsvector(config, {$this->normalized('parts_text')}), 'C')
-					|| setweight(to_tsvector(config, {$this->normalized('content')}), 'D')
-				) STORED,
 				CONSTRAINT {$t}_doc_uniq UNIQUE (provider_id, document_id)
 			)
 			SQL);
+
+		$this->ensureGeneratedColumns();
 
 		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_tsv_idx ON $t USING GIN (tsv)");
 		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_access_idx ON $t USING GIN (access)");
@@ -101,8 +112,40 @@ class SchemaService {
 
 		if ($this->hasTrigram()) {
 			// Titles only: a trigram index over full content would be very large for little gain.
-			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_title_trgm_idx ON $t USING GIN (title gin_trgm_ops)");
+			// Serves substring matching (LIKE '%…%') and typo-tolerant matching (<%).
+			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_title_search_trgm_idx ON $t USING GIN (title_search gin_trgm_ops)");
 		}
+	}
+
+	/**
+	 * The generated columns change between versions. Their definition version is recorded as
+	 * a comment on the tsv column; when it is older than SCHEMA_VERSION they are rebuilt in
+	 * place. PostgreSQL recomputes them for every row, which locks the table while it runs.
+	 */
+	private function ensureGeneratedColumns(): void {
+		if ($this->isCurrent()) {
+			return;
+		}
+		$t = $this->getTableName();
+
+		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_tsv_idx");
+		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_title_trgm_idx");
+		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_title_search_trgm_idx");
+		$this->db->executeStatement("ALTER TABLE $t DROP COLUMN IF EXISTS tsv, DROP COLUMN IF EXISTS title_search");
+
+		$title = $this->normalized('title');
+		$this->db->executeStatement(<<<SQL
+			ALTER TABLE $t
+			ADD COLUMN tsv tsvector GENERATED ALWAYS AS (
+				setweight(to_tsvector(config, $title), 'A')
+				|| setweight(to_tsvector(config, {$this->splitWords($title)}), 'A')
+				|| setweight(to_tsvector(config, {$this->normalized('tags_text')}), 'B')
+				|| setweight(to_tsvector(config, {$this->normalized('parts_text')}), 'C')
+				|| setweight(to_tsvector(config, {$this->normalized('content')}), 'D')
+			) STORED,
+			ADD COLUMN title_search text GENERATED ALWAYS AS (lower($title)) STORED
+			SQL);
+		$this->db->executeStatement("COMMENT ON COLUMN $t.tsv IS '" . self::SCHEMA_MARKER . "'");
 	}
 
 	/**
@@ -112,6 +155,19 @@ class SchemaService {
 	 */
 	private function normalized(string $column): string {
 		return "CASE WHEN config = 'turkish'::regconfig THEN translate($column, 'Iİ', 'ıi') ELSE $column END";
+	}
+
+	/**
+	 * PostgreSQL's parser reads a file name like "rapor_2025_final.pdf" as one token, so
+	 * "final" or "2025" would never find it. Indexing a copy of the title split at
+	 * punctuation and at letter/digit boundaries makes each part searchable, while the
+	 * unsplit title stays indexed too. TsQueryBuilder::SPLIT_PATTERN mirrors this.
+	 */
+	private function splitWords(string $expression): string {
+		return "regexp_replace(regexp_replace(regexp_replace($expression, "
+			. "'([[:alpha:]])([[:digit:]])', '\\1 \\2', 'g'), "
+			. "'([[:digit:]])([[:alpha:]])', '\\1 \\2', 'g'), "
+			. "'[_.\\-/\\\\+~,;:()\\[\\]{}]+', ' ', 'g')";
 	}
 
 	public function dropSchema(): void {

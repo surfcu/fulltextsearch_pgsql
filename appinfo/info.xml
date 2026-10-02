@@ -14,7 +14,7 @@
 - Text extraction for plain text, OpenDocument and Office files, and PDFs (with pdftotext)
 
 Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
-    <version>1.1.1</version>
+    <version>1.2.0</version>
     <licence>agpl</licence>
     <author>surfcu</author>
     <namespace>FullTextSearch_PgSql</namespace>
