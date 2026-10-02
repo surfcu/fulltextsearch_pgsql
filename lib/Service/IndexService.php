@@ -18,6 +18,7 @@ class IndexService {
 		private SchemaService $schemaService,
 		private ConfigService $configService,
 		private ContentExtractor $extractor,
+		private VocabularyService $vocabulary,
 		private LoggerInterface $logger,
 	) {
 	}
@@ -63,6 +64,15 @@ class IndexService {
 			]);
 			$this->upsert($document, '', true, $updateParts);
 			$warnings[] = 'indexed without content: ' . $e->getMessage();
+		}
+
+		if ($this->configService->useTypoCorrection()) {
+			try {
+				$this->vocabulary->addDocument($document->getProviderId(), $document->getId());
+			} catch (Throwable $e) {
+				// Typo correction is a nicety; never fail indexing over it.
+				$this->logger->warning('Could not update the typo correction vocabulary', ['exception' => $e]);
+			}
 		}
 
 		return $warnings;

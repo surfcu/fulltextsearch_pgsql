@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-03
+
+### Added
+- Typo correction from a vocabulary of every indexed word, kept in a new `ftspg_<prefix>words` table:
+  - accent variants in both directions: `calisma` finds `çalışma`, `çalışma` finds text typed as `calisma`, `sozles` finds `sözleşme` while typing. Works without `pg_trgm`;
+  - spelling corrections for words that appear nowhere in the index, including swapped letters (`recieve` → `receive`). Uses `pg_trgm` to shortlist and an edit distance to decide.
+  Alternatives are ORed in, so the typed word is still searched. Controlled by the new `typo_correction` setting.
+- `occ fulltextsearch_pgsql:vocabulary [--rebuild]`. On upgrade the vocabulary is filled automatically for indexes of up to 10,000 documents; larger ones are told to run the command.
+
 ## [1.2.0] - 2026-10-03
 
 ### Fixed

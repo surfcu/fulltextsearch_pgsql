@@ -8,13 +8,14 @@
 
 - Weighted ranking (title > tags > comments/parts > content) with highlighted excerpts
 - Prefix matching while typing, "exact phrases", -exclusions and OR
-- Typo-tolerant title matching with pg_trgm
+- Typo correction and search without diacritics ("calisma" finds "çalışma")
+- Substring matching in titles and file names split into words
 - Every text search language your PostgreSQL server ships, including Turkish
 - Respects ownership and shares to users, groups and teams
 - Text extraction for plain text, OpenDocument and Office files, and PDFs (with pdftotext)
 
 Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
-    <version>1.2.0</version>
+    <version>1.3.0</version>
     <licence>agpl</licence>
     <author>surfcu</author>
     <namespace>FullTextSearch_PgSql</namespace>
@@ -42,6 +43,7 @@ Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search a
 
     <commands>
         <command>OCA\FullTextSearch_PgSql\Command\Configure</command>
+        <command>OCA\FullTextSearch_PgSql\Command\Vocabulary</command>
     </commands>
 
     <fulltextsearch>

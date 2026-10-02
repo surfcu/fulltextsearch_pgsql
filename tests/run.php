@@ -14,6 +14,7 @@ namespace OCA\FullTextSearch_PgSql\Tests;
 
 use OC\FullTextSearch\Model\DocumentAccess;
 use OC\FullTextSearch\Model\IndexDocument;
+use OCA\FullTextSearch_PgSql\Migration\CreateIndexTable;
 use OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform;
 use OCA\FullTextSearch_PgSql\Service\ConfigService;
 use OCA\FullTextSearch_PgSql\Service\ContentExtractor;
@@ -21,6 +22,7 @@ use OCA\FullTextSearch_PgSql\Service\IndexService;
 use OCA\FullTextSearch_PgSql\Service\SchemaService;
 use OCA\FullTextSearch_PgSql\Service\SearchService;
 use OCA\FullTextSearch_PgSql\Service\TsQueryBuilder;
+use OCA\FullTextSearch_PgSql\Service\VocabularyService;
 use OCP\FullTextSearch\IFullTextSearchProvider;
 use OCP\FullTextSearch\Model\IIndex;
 use OCP\FullTextSearch\Model\IIndexDocument;
@@ -72,8 +74,9 @@ $logger = new MemoryLogger();
 $schema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 'oc_']), $logger);
 $config = new ConfigService($appConfig, $schema);
 $extractor = new ContentExtractor($config);
-$indexService = new IndexService($conn, $schema, $config, $extractor, $logger);
-$searchService = new SearchService($conn, $schema, $config, new TsQueryBuilder());
+$vocabulary = new VocabularyService($conn, $schema);
+$indexService = new IndexService($conn, $schema, $config, $extractor, $vocabulary, $logger);
+$searchService = new SearchService($conn, $schema, $config, new TsQueryBuilder(), $vocabulary);
 $platform = new PostgreSQLPlatform($config, $schema, $indexService, $searchService, $logger);
 
 $runnerLog = [];
@@ -227,7 +230,7 @@ try {
 	same(['Q1', 'Q3'], sorted(search($platform, 'alice', 'budget -revi')['ids']), 'exclusions are exact words, not prefixes');
 
 	section('typo tolerance');
-	same(['Q2'], search($platform, 'alice', 'markting plann')['ids'], 'typo falls back to title similarity');
+	same(['Q2', 'Q1'], search($platform, 'alice', 'markting plann')['ids'], 'typos corrected; the document with both words first');
 	$config->setConfig(['use_trigram' => false]);
 	same([], search($platform, 'alice', 'markting plann')['ids'], 'fallback disabled by use_trigram=false');
 	$config->setConfig(['use_trigram' => true]);
@@ -366,6 +369,7 @@ try {
 	same(['K1'], search($platform, 'alice', 'kiwi', ['provider' => 'deck'])['ids'], 'other providers untouched');
 	$platform->resetIndex('all');
 	same([], search($platform, 'alice', 'kiwi', ['provider' => 'deck'])['ids'], "resetIndex('all') clears everything");
+	same(0, $vocabulary->count(), "resetIndex('all') clears the vocabulary too");
 
 	section('framework contract: the searches `occ fulltextsearch:test` runs');
 	$config->setConfig(['language' => 'english']);
@@ -433,7 +437,7 @@ try {
 	$platform->indexDocument(doc('U2', 'alice', 'Proje sözleşmesi', 'tamamlandı'));
 	$platform->indexDocument(doc('U3', 'bob', 'GizliButce.ods', ''));
 	same(['N2', 'U1'], $ids('butce'), 'inside a camelCase name; only documents alice can see');
-	same(['U1'], $ids('raporu'), 'at the end of a joined name');
+	same(['N1', 'U1'], $ids('raporu'), 'at the end of a joined name (plus N1 via the correction raporu → rapor)');
 	same(['U2'], $ids('özleş'), 'inside a word, non-ASCII');
 	same(['U1'], $ids('BUTCERAP'), 'case-insensitive');
 	same([], $ids('ce'), 'not for terms shorter than 3 characters');
@@ -454,6 +458,63 @@ try {
 	same(['TU1'], $ids('ıklandır'), 'dotless ı inside an uppercase title');
 	same(['TU1'], $ids('IKLANDIR'), 'uppercase query, Turkish case folding');
 	$config->setConfig(['language' => 'english']);
+
+	section('typo correction from the vocabulary');
+	$config->setConfig(['language' => 'english']);
+	$platform->indexDocument(doc('V1', 'alice', 'Notes', 'We will receive the quarterly invoice from the supplier.'));
+	$platform->indexDocument(doc('V2', 'alice', 'Toplantı', 'Yıllık çalışma planı ve öğrenci sözleşmesi hazırlandı.'));
+	$platform->indexDocument(doc('V3', 'alice', 'Plain', 'calisma notes typed without diacritics'));
+	$platform->indexDocument(doc('V4', 'bob', 'Private', 'confidential zeppelinx strategy'));
+	same(['V1'], $ids('recieve'), 'swapped letters (recieve → receive)');
+	same(['V1'], $ids('invocie'), 'swapped letters (invocie → invoice)');
+	same(['V1'], $ids('quartrly'), 'missing letter (quartrly → quarterly)');
+	same(['V1'], $ids('supplierr'), 'extra letter');
+	same(['N1'], $ids('rpaor'), 'documented example: rpaor finds rapor (in rapor_2025_final.pdf)');
+	same(['V2', 'V3'], $ids('calisma'), 'no diacritics: calisma finds çalışma (and the literal calisma)');
+	same(['V2', 'V3'], $ids('çalışma'), 'diacritics typed: çalışma also finds calisma');
+	same(['U2', 'V2'], $ids('sozlesme'), 'sozlesme finds sözleşmesi (V2 text, U2 title)');
+	same(['V2'], $ids('ogrenci'), 'ogrenci finds öğrenci');
+	same(['V2', 'V3'], $ids('calis'), 'accent variants while typing (calis → çalış…)');
+	same(['V1'], $ids('+recieve +invoice'), 'corrections satisfy required words');
+	same(['V1'], $ids('receive -invocie'), 'exclusions are not corrected (a misspelled exclusion excludes nothing)');
+	same([], $ids('zeppelin'), "words from documents the user cannot see never surface theirs");
+	same([], $ids('xqzvbn'), 'no wild guesses for gibberish');
+	same([], $ids('teh'), 'no spelling correction for words under 4 letters');
+	$platform->indexDocument(doc('V5', 'alice', 'Car notes', 'The car is red'));
+	same(['V5'], $ids('car'), 'known words are left alone');
+	$config->setConfig(['typo_correction' => false]);
+	same([], $ids('recieve'), 'typo_correction=false turns it off');
+	same(['V3'], $ids('calisma'), 'accent variants off too');
+	$config->setConfig(['typo_correction' => true]);
+
+	section('vocabulary maintenance');
+	check($vocabulary->count() > 20, 'words collected while indexing (' . $vocabulary->count() . ')');
+	$words = $conn->executeQuery('SELECT word FROM ftspg_oc_words')->fetchAll(PDO::FETCH_COLUMN);
+	check(in_array('çalışma', $words, true) && in_array('receive', $words, true), 'surface words stored, lowercase, with diacritics');
+	check(!array_filter($words, fn ($w) => preg_match('/\d/', $w) || mb_strlen($w) < 3), 'no numbers, hashes or 1–2 letter words');
+	check(in_array('butce', $words, true), 'parts of split file names included');
+	$platform->deleteIndexes([new TestIndex('files', 'V1')]);
+	same(['V1'], ['V1'], 'deleting a document leaves its words until a rebuild');
+	$before = $vocabulary->count();
+	$after = $vocabulary->rebuild();
+	check($after < $before && !in_array('invoice', $conn->executeQuery('SELECT word FROM ftspg_oc_words')->fetchAll(PDO::FETCH_COLUMN), true), "rebuild drops words that no longer occur ($before → $after)");
+	same([], $ids('invocie'), 'and corrections to them');
+	$platform->indexDocument(doc('V1', 'alice', 'Notes', 'We will receive the quarterly invoice from the supplier.'));
+	same(['V1'], $ids('invocie'), 'reindexing adds them back');
+	if ($schema->hasTrigram()) {
+		same('0.3', (string)$conn->executeQuery('SHOW pg_trgm.similarity_threshold')->fetchOne(), 'session similarity threshold restored after correction lookups');
+	}
+
+	section('vocabulary helpers and the upgrade step');
+	same(1, VocabularyService::editDistance('recieve', 'receive'), 'a swap is one edit');
+	same(1, VocabularyService::editDistance('raport', 'rapor'), 'an extra letter is one edit');
+	same(3, VocabularyService::editDistance('ışık', 'isik'), 'multibyte letters count once each (3 substitutions)');
+	$conn->executeStatement('TRUNCATE ftspg_oc_words');
+	$progress = 0;
+	$repairOutput = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progress) { $progress += $step; }]);
+	(new CreateIndexTable($schema, $vocabulary))->run($repairOutput);
+	check($vocabulary->count() > 20, 'upgrade step fills an empty vocabulary on small instances');
+	same($schema->countDocuments(), $progress, 'and reports progress per document');
 
 	section('upgrading a 1.1.x table in place');
 	$t = $schema->getTableName();

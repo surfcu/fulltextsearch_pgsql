@@ -62,6 +62,24 @@ Uygulama, dil `turkish` olduğunda hem dizinlenen metinde hem de aramada `I → 
 | İstanbul | `istanbul`, `İSTANBUL` | ✓ |
 | ÇALIŞMALARIMIZ | `çalışma` | ✓ |
 
+### Türkçe karakterler olmadan arama ve yazım hataları
+
+Dizindeki tüm kelimelerden bir kelime listesi tutulur. Bu sayede:
+
+| Aranan | Bulunan |
+|---|---|
+| `calisma` | çalışma (ve tersi: `çalışma` aramasıyla *calisma* yazılmış metinler de bulunur) |
+| `sozlesme` | sözleşme, sözleşmesi |
+| `ogrenci` | öğrenci |
+| `calis` | çalış… (yazarken de çalışır) |
+| `rpaor` | rapor (yer değiştirmiş harfler, `pg_trgm` gerekir) |
+
+Yazdığınız kelime yine de aranır; düzeltmeler yalnızca sonuçları genişletir. Bu özellik `typo_correction` ayarıyla kapatılabilir. 1.3.0'dan önce oluşturulmuş büyük dizinlerde kelime listesini bir kez oluşturun:
+
+```bash
+occ fulltextsearch_pgsql:vocabulary --rebuild
+```
+
 ### Eski kodlamalı dosyalar
 
 Windows-1254 (Türkçe) kodlamasıyla kaydedilmiş eski metin dosyaları otomatik olarak UTF-8'e çevrilir; `ö`, `ç`, `ş`, `ğ`, `ı` gibi harfler bozulmadan aranabilir.

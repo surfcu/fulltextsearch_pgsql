@@ -18,6 +18,7 @@ class ConfigService {
 
 	public const LANGUAGE = 'language';
 	public const USE_TRIGRAM = 'use_trigram';
+	public const TYPO_CORRECTION = 'typo_correction';
 	public const MAX_RESULTS = 'max_results';
 	public const MAX_CONTENT_SIZE = 'max_content_size';
 	public const PDFTOTEXT_PATH = 'pdftotext_path';
@@ -25,6 +26,8 @@ class ConfigService {
 	public const DEFAULTS = [
 		self::LANGUAGE => 'english',
 		self::USE_TRIGRAM => true,
+		// Accent variants and spelling corrections from the index vocabulary.
+		self::TYPO_CORRECTION => true,
 		self::MAX_RESULTS => 100,
 		// Bytes of extracted text kept per document. PostgreSQL refuses tsvectors over 1 MB.
 		self::MAX_CONTENT_SIZE => 512000,
@@ -42,6 +45,7 @@ class ConfigService {
 		return [
 			self::LANGUAGE => $this->getLanguage(),
 			self::USE_TRIGRAM => $this->useTrigram(),
+			self::TYPO_CORRECTION => $this->useTypoCorrection(),
 			self::MAX_RESULTS => $this->getMaxResults(),
 			self::MAX_CONTENT_SIZE => $this->getMaxContentSize(),
 			self::PDFTOTEXT_PATH => $this->getPdfToTextPath(),
@@ -74,12 +78,15 @@ class ConfigService {
 			$this->appConfig->setValueString(Application::APP_ID, self::LANGUAGE, $language);
 		}
 
-		if (array_key_exists(self::USE_TRIGRAM, $config)) {
-			$value = filter_var($config[self::USE_TRIGRAM], FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE);
-			if ($value === null) {
-				throw new InvalidArgumentException(self::USE_TRIGRAM . ' must be true or false');
+		foreach ([self::USE_TRIGRAM, self::TYPO_CORRECTION] as $key) {
+			if (!array_key_exists($key, $config)) {
+				continue;
 			}
-			$this->appConfig->setValueBool(Application::APP_ID, self::USE_TRIGRAM, $value);
+			$value = filter_var($config[$key], FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE);
+			if ($value === null) {
+				throw new InvalidArgumentException($key . ' must be true or false');
+			}
+			$this->appConfig->setValueBool(Application::APP_ID, $key, $value);
 		}
 
 		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, 1000000]] as $key => [$min, $max]) {
@@ -111,6 +118,10 @@ class ConfigService {
 
 	public function useTrigram(): bool {
 		return $this->appConfig->getValueBool(Application::APP_ID, self::USE_TRIGRAM, self::DEFAULTS[self::USE_TRIGRAM]);
+	}
+
+	public function useTypoCorrection(): bool {
+		return $this->appConfig->getValueBool(Application::APP_ID, self::TYPO_CORRECTION, self::DEFAULTS[self::TYPO_CORRECTION]);
 	}
 
 	public function getMaxResults(): int {

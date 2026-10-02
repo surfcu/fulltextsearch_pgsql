@@ -133,6 +133,21 @@ With `pg_trgm` available, each plain search word of three or more characters can
 
 If page 1 has no results and `pg_trgm` is available, titles are searched with `word_similarity` (`<%`, GIN-indexed) for typo tolerance.
 
+## Typo correction
+
+A second table, `ftspg_<prefix>words`, holds every distinct word in the index: lowercase surface forms (the `simple` text search configuration, so no stemming), letters only, 3–40 characters. It has a `folded` generated column with accents removed (`çalışma` → `calisma`, via `translate()` with the same character lists as `Tools\Fold` in PHP), b-tree indexes in the `C` collation so `LIKE 'prefix%'` is indexed, and a trigram index on `folded` when `pg_trgm` exists.
+
+**Maintenance.** After each document is stored, one `INSERT … SELECT … ON CONFLICT DO NOTHING` adds its words, computed inside PostgreSQL and inserted in sorted order so concurrent indexers cannot deadlock. Words are never removed one by one; `occ fulltextsearch_pgsql:vocabulary --rebuild` recreates the table in batches, and `resetIndex('all')` empties it.
+
+**At search time**, for each plain positive word (exclusions and phrases are left alone):
+
+1. *Accent variants*: vocabulary words with the same folded form, or for 4+ letters the same folded prefix, that don't already start with what was typed. Shortest first, skipping words covered by a shorter variant, at most three.
+2. *Spelling corrections*, only when the word has no accent variants and no vocabulary word starts with it (so it matches nothing as typed) and it has 4+ letters: trigram similarity on `folded` (threshold 0.2, set for the lookup and reset after) shortlists 20 candidates within ±1–2 letters of length. An optimal-string-alignment edit distance, where swapping adjacent letters counts as one edit, keeps those within 1 edit (2 for 7+ letters). Only the closest ones are kept, at most two.
+
+Alternatives are ORed into the word's tsquery as prefix terms (`('rpaor':*) | ('rapor':*)`), so they count towards "all words" ranking and required `+words`, and the original word still matches.
+
+The vocabulary is instance-wide, including words from documents a user cannot open. Alternatives only widen a query that is still filtered by access control, and they are never shown, so results never include inaccessible documents.
+
 ## Turkish dotted and dotless I
 
 PostgreSQL lowercases with the database's `LC_CTYPE`. Unless that is `tr_TR`, `I` lowercases to `i`, which is wrong for Turkish (`ı`), so `ISPARTA` would index as `isparta` while users type `ısparta`, and uppercase text would miss its lowercase forms. For rows with the `turkish` configuration the generated column applies `translate(text, 'Iİ', 'ıi')` before `to_tsvector`, and `TsQueryBuilder` applies the same mapping to the query. Both sides agree regardless of the database locale.

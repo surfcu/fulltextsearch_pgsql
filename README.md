@@ -9,7 +9,8 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 - **File names are split into words.** `final`, `2025` or `final.pdf` all find *rapor_2025_final.pdf*; `img` finds *IMG20250412.jpg*. PostgreSQL would otherwise treat each file name as a single word.
 - **Substring matching in titles.** A word of three or more letters also matches anywhere inside a title: `butce` finds *YillikButceRaporu.xlsx*. These matches rank below normal word matches. Needs `pg_trgm`.
 - **Query syntax** (the Full Text Search framework's standard, same as the Elasticsearch platform): plain words are optional and any of them can match, `+word` is required, `-word` is excluded, `"exact phrase"` works with or without `+`/`-`. Documents containing every word are always listed before partial matches. Queries made only of exclusions or stopwords return nothing rather than everything.
-- **Typo tolerance.** When nothing matches, titles are searched by trigram similarity (`markting` finds *Marketing plan*). Needs the `pg_trgm` extension.
+- **Diacritics optional.** `calisma` finds *çalışma*, `sozlesme` finds *sözleşme*, and the other way round, from a vocabulary of every indexed word.
+- **Typo correction.** Misspelled words are corrected against the same vocabulary, including swapped letters: `recieve` finds *receive*, `rpaor` finds *rapor*. The original word is still searched too, so nothing that matched before is lost. Needs `pg_trgm`. If nothing matches at all, titles are also searched by similarity.
 - **Any language your PostgreSQL ships**, including Turkish, with correct dotted/dotless I handling (see below).
 - **Access control.** Users only see documents they own or that are shared with them, their groups, or their teams (circles).
 - **Text extraction** for plain text (UTF-8, UTF-16, legacy Windows-1254), OpenDocument and Office Open XML files (odt/ods/odp, docx/xlsx/pptx), and PDFs when `pdftotext` is installed.
@@ -57,12 +58,22 @@ occ fulltextsearch_pgsql:configure '{"language":"turkish","max_content_size":800
 | Setting | Default | Meaning |
 |---|---|---|
 | `language` | `english` | PostgreSQL text search configuration used for stemming and stopwords. Must be one listed by `--languages`. Use `simple` for no stemming (mixed-language content). |
-| `use_trigram` | `true` | Substring matching in titles, and typo-tolerant title matching when a search has no exact results. Ignored if `pg_trgm` is unavailable. |
+| `use_trigram` | `true` | Substring matching in titles, spelling correction, and similarity matching on titles when a search has no results. Ignored if `pg_trgm` is unavailable. |
+| `typo_correction` | `true` | Accent variants and spelling corrections from the vocabulary of indexed words. Accent variants work without `pg_trgm`. |
 | `max_results` | `100` | Upper limit for the page size a client may request. |
 | `max_content_size` | `512000` | Bytes of extracted text indexed per document. Larger documents are truncated. PostgreSQL rejects search vectors over 1 MB; if a document still exceeds that it is indexed by title and metadata only, with a warning. |
 | `pdftotext_path` | *(empty)* | Path to `pdftotext`. Empty means look it up on `PATH`. |
 
 The configure command validates values. `occ config:app:set` works too but does not.
+
+### Typo correction vocabulary
+
+Words are collected as documents are indexed. Indexes built before version 1.3.0 have no vocabulary yet: on upgrade it is filled automatically for up to 10,000 documents; for larger indexes, or to drop words from deleted documents, run:
+
+```bash
+occ fulltextsearch_pgsql:vocabulary            # show the number of words
+occ fulltextsearch_pgsql:vocabulary --rebuild  # rebuild from the index (about 1.5 ms per document)
+```
 
 **After changing `language`, rebuild the index** so existing documents are processed with it:
 
@@ -94,6 +105,8 @@ Which files are sent for indexing at all (size limits, external storage, etc.) i
 - One language per instance. Documents keep the language they were indexed with until they are reindexed.
 - No OCR, and no extraction for legacy `.doc`/`.xls`/`.ppt` binaries.
 - Excerpts are generated from at most `max_content_size` bytes of each document.
+- Corrections are applied silently: the Full Text Search interface has no place for a "did you mean …" hint.
+- Only words of three letters or more get accent variants, and four or more get spelling corrections. Spelling correction only kicks in for words that appear nowhere in the index.
 - Everything lives in your Nextcloud database, so index size counts toward its storage and backups (roughly 1–2× the extracted text).
 
 ## How it works
@@ -106,7 +119,7 @@ Coming from Elasticsearch? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
 **`occ fulltextsearch:test` fails.** Check `nextcloud.log`. The platform requires Nextcloud's own database to be PostgreSQL; it cannot use a separate PostgreSQL server.
 
-**No substring matching or typo tolerance.** `occ fulltextsearch_pgsql:configure` shows the setting; `occ fulltextsearch:check` shows `"pg_trgm": false` if the extension is missing. Create it as a superuser, then run `occ fulltextsearch:test`, which adds the trigram index.
+**No substring matching or spelling correction.** `occ fulltextsearch_pgsql:configure` shows the setting; `occ fulltextsearch:check` shows `"pg_trgm": false` if the extension is missing. Create it as a superuser, then run `occ fulltextsearch:test`, which adds the trigram index.
 
 **PDFs have no content.** Install `poppler-utils`, or set `pdftotext_path`. Scanned PDFs contain images, not text.
 

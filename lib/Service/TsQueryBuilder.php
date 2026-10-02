@@ -38,16 +38,33 @@ class TsQueryBuilder {
 	];
 
 	/**
+	 * The plain positive words of a search (not phrases, not exclusions), lowercased the way
+	 * build() matches alternatives to them. These are the words typo correction looks at.
+	 *
+	 * @return list<string>
+	 */
+	public function searchWords(string $search, string $language): array {
+		$words = [];
+		foreach ($this->tokenize($search, $language) as $m) {
+			$isPhrase = !isset($m[4]) || $m[4] === '';
+			if ($isPhrase || $m[3] === '-') {
+				continue;
+			}
+			$word = $this->trimTerm($m[4]);
+			if ($word !== '' && !in_array($word, ['OR', 'AND'], true)) {
+				$words[] = mb_strtolower($word, 'UTF-8');
+			}
+		}
+		return array_slice(array_values(array_unique($words)), 0, self::MAX_TERMS);
+	}
+
+	/**
 	 * @param bool $substring also match words inside titles (title_search LIKE '%word%')
+	 * @param array<string, list<string>> $alternatives lowercase word => words ORed in for it
 	 * @return ParsedQuery|null null when there is nothing positive to look for
 	 */
-	public function build(string $search, string $language, bool $substring = false): ?ParsedQuery {
-		$search = mb_scrub($search, 'UTF-8');
-		if ($language === 'turkish') {
-			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
-			$search = strtr($search, ['I' => 'ı', 'İ' => 'i']);
-		}
-		preg_match_all('/([+-]?)"([^"]*)"?|([+-]?)(\S+)/u', $search, $matches, PREG_SET_ORDER);
+	public function build(string $search, string $language, bool $substring = false, array $alternatives = []): ?ParsedQuery {
+		$matches = $this->tokenize($search, $language);
 
 		/** @var array<string, list<array{ts: array{0: string, 1: list<string>}, pred: array{0: string, 1: list<string>}}>> $terms */
 		$terms = ['optional' => [], 'required' => [], 'excluded' => []];
@@ -75,7 +92,8 @@ class TsQueryBuilder {
 			if ($isPhrase) {
 				$ts = ['phraseto_tsquery(CAST(? AS regconfig), ?)', [$language, $text]];
 			} else {
-				$ts = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $this->wordQuery($text, $kind !== 'excluded')]];
+				$alts = $kind === 'excluded' ? [] : ($alternatives[mb_strtolower($text, 'UTF-8')] ?? []);
+				$ts = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $this->wordQuery($text, $kind !== 'excluded', $alts)]];
 			}
 
 			$pred = ['d.tsv @@ ' . $ts[0], $ts[1]];
@@ -131,17 +149,32 @@ class TsQueryBuilder {
 	 * in sequence. The whole form still matches host names and e-mail addresses in content;
 	 * the parts match the split copy of titles.
 	 */
-	private function wordQuery(string $word, bool $prefix): string {
+	/** @param list<string> $alternatives typo corrections and accent variants, prefix-matched */
+	private function wordQuery(string $word, bool $prefix, array $alternatives = []): string {
 		$suffix = $prefix ? ':*' : '';
-		$whole = $this->literal($word) . $suffix;
+		$forms = [$this->literal($word) . $suffix];
 
 		$split = trim((string)preg_replace(array_keys(self::SPLIT_PATTERNS), array_values(self::SPLIT_PATTERNS), $word));
 		$parts = preg_split('/\s+/u', $split, -1, PREG_SPLIT_NO_EMPTY) ?: [];
-		if (count($parts) < 2) {
-			return $whole;
+		if (count($parts) >= 2) {
+			$forms[] = implode(' <-> ', array_map(fn (string $p): string => $this->literal($p) . $suffix, $parts));
 		}
-		$sequence = implode(' <-> ', array_map(fn (string $p): string => $this->literal($p) . $suffix, $parts));
-		return "($whole) | ($sequence)";
+		foreach ($alternatives as $alternative) {
+			$forms[] = $this->literal($alternative) . ':*';
+		}
+
+		return count($forms) === 1 ? $forms[0] : '(' . implode(') | (', $forms) . ')';
+	}
+
+	/** @return list<array<int, string>> regex matches: [1] phrase operator, [2] phrase, [3] word operator, [4] word */
+	private function tokenize(string $search, string $language): array {
+		$search = mb_scrub($search, 'UTF-8');
+		if ($language === 'turkish') {
+			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
+			$search = strtr($search, ['I' => 'ı', 'İ' => 'i']);
+		}
+		preg_match_all('/([+-]?)"([^"]*)"?|([+-]?)(\S+)/u', $search, $matches, PREG_SET_ORDER);
+		return $matches;
 	}
 
 	/**

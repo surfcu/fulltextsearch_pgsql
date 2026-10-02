@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OCA\FullTextSearch_PgSql\Service;
 
+use OCA\FullTextSearch_PgSql\Tools\Fold;
 use OCP\IConfig;
 use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
@@ -44,6 +45,14 @@ class SchemaService {
 			throw new RuntimeException('Unsupported characters in dbtableprefix');
 		}
 		return 'ftspg_' . $prefix . 'index';
+	}
+
+	/**
+	 * Vocabulary of every word in the index, for typo correction ("ftspg_oc_words").
+	 * Outside Nextcloud's prefix for the same reason as the index table.
+	 */
+	public function getWordsTableName(): string {
+		return substr($this->getTableName(), 0, -strlen('index')) . 'words';
 	}
 
 	/** True when the table exists and its generated columns match this version of the app. */
@@ -115,6 +124,26 @@ class SchemaService {
 			// Serves substring matching (LIKE '%…%') and typo-tolerant matching (<%).
 			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_title_search_trgm_idx ON $t USING GIN (title_search gin_trgm_ops)");
 		}
+
+		$this->ensureWordsTable();
+	}
+
+	/**
+	 * One row per distinct lowercase word. "C" collation makes LIKE 'prefix%' use the
+	 * b-tree indexes; "folded" is the word without accents (see Tools\Fold).
+	 */
+	private function ensureWordsTable(): void {
+		$w = $this->getWordsTableName();
+		$this->db->executeStatement(sprintf(<<<'SQL'
+			CREATE TABLE IF NOT EXISTS %1$s (
+				word   text COLLATE "C" PRIMARY KEY,
+				folded text COLLATE "C" GENERATED ALWAYS AS (translate(word, '%2$s', '%3$s')) STORED
+			)
+			SQL, $w, Fold::FROM, Fold::TO));
+		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$w}_folded_idx ON $w (folded)");
+		if ($this->hasTrigram()) {
+			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$w}_folded_trgm_idx ON $w USING GIN (folded gin_trgm_ops)");
+		}
 	}
 
 	/**
@@ -153,7 +182,7 @@ class SchemaService {
 	 * "I" would become "i" instead of "ı" and uppercase Turkish words would never match.
 	 * Map I->ı and İ->i first for Turkish rows; TsQueryBuilder does the same to search terms.
 	 */
-	private function normalized(string $column): string {
+	public function normalized(string $column): string {
 		return "CASE WHEN config = 'turkish'::regconfig THEN translate($column, 'Iİ', 'ıi') ELSE $column END";
 	}
 
@@ -163,7 +192,7 @@ class SchemaService {
 	 * punctuation and at letter/digit boundaries makes each part searchable, while the
 	 * unsplit title stays indexed too. TsQueryBuilder::SPLIT_PATTERN mirrors this.
 	 */
-	private function splitWords(string $expression): string {
+	public function splitWords(string $expression): string {
 		return "regexp_replace(regexp_replace(regexp_replace($expression, "
 			. "'([[:alpha:]])([[:digit:]])', '\\1 \\2', 'g'), "
 			. "'([[:digit:]])([[:alpha:]])', '\\1 \\2', 'g'), "
@@ -172,11 +201,19 @@ class SchemaService {
 
 	public function dropSchema(): void {
 		$this->db->executeStatement('DROP TABLE IF EXISTS ' . $this->getTableName());
+		$this->db->executeStatement('DROP TABLE IF EXISTS ' . $this->getWordsTableName());
 	}
 
-	/** Remove every indexed document, keeping the table. */
+	/** Remove every indexed document and the vocabulary, keeping the tables. */
 	public function truncate(): void {
-		$this->db->executeStatement('TRUNCATE ' . $this->getTableName());
+		$this->db->executeStatement('TRUNCATE ' . $this->getTableName() . ', ' . $this->getWordsTableName());
+	}
+
+	public function countDocuments(): int {
+		$result = $this->db->executeQuery('SELECT count(*) FROM ' . $this->getTableName());
+		$count = (int)$result->fetchOne();
+		$result->closeCursor();
+		return $count;
 	}
 
 	public function hasTrigram(): bool {

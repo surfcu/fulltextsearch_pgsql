@@ -25,6 +25,7 @@ class SearchService {
 		private SchemaService $schemaService,
 		private ConfigService $configService,
 		private TsQueryBuilder $queryBuilder,
+		private VocabularyService $vocabulary,
 	) {
 	}
 
@@ -34,7 +35,15 @@ class SearchService {
 		$providerId = $result->getProvider()->getId();
 
 		$viewerTokens = AccessTokens::forViewer($access);
-		$query = $this->queryBuilder->build($request->getSearch(), $this->configService->getLanguage(), $this->fuzzyAvailable());
+		$language = $this->configService->getLanguage();
+		$alternatives = [];
+		if ($this->configService->useTypoCorrection()) {
+			$alternatives = $this->vocabulary->alternatives(
+				$this->queryBuilder->searchWords($request->getSearch(), $language),
+				$this->fuzzyAvailable()
+			);
+		}
+		$query = $this->queryBuilder->build($request->getSearch(), $language, $this->fuzzyAvailable(), $alternatives);
 		if ($viewerTokens === [] || $query === null) {
 			$result->setTotal(0);
 			return;
