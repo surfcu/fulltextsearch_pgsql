@@ -64,8 +64,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
       - name: Run live tests
         working-directory: server
-        run: apps/fulltextsearch_pgsql/tests/live/run.sh
-      - name: Nextcloud log
-        if: always()
+        run: |
+          set -o pipefail
+          apps/fulltextsearch_pgsql/tests/live/run.sh 2>&1 | tee "$RUNNER_TEMP/live.log"
+      - name: Report failure details
+        if: failure()
         working-directory: server
-        run: tail -n 100 data/nextcloud.log 2>/dev/null || true
+        # Annotations show up on the pull request and in the API, without opening the logs.
+        run: |
+          annotate() {
+            python3 -c 'import sys; t=sys.stdin.read()[-30000:]; print("::error title=" + sys.argv[1] + "::" + t.replace("%","%25").replace("\r","").replace("\n","%0A"))' "$1"
+          }
+          tail -n 150 "$RUNNER_TEMP/live.log" 2>/dev/null | annotate "Live test output"
+          tail -n 40 data/nextcloud.log 2>/dev/null | annotate "nextcloud.log"
