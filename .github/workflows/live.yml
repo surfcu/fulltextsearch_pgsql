@@ -79,7 +79,8 @@ jobs:
         # Annotations show up on the pull request and in the API, without opening the logs.
         run: |
           annotate() {
-            python3 -c 'import sys; t=sys.stdin.read()[-30000:]; print("::error title=" + sys.argv[1] + "::" + t.replace("%","%25").replace("\r","").replace("\n","%0A"))' "$1"
+            python3 -c 'import sys; t=sys.stdin.read()[-8000:]; print("::error title=" + sys.argv[1] + "::" + t.replace("%","%25").replace("\r","").replace("\n","%0A"))' "$1"
           }
-          grep -av '^#[0-9]' "$RUNNER_TEMP/live.log" 2>/dev/null | tail -n 150 | annotate "Live test output"
+          grep -aE '^(== |ok |FAIL|   [0-9]+ result|.*(Exception|Error|error|Fatal))' "$RUNNER_TEMP/live.log" | grep -av '^#[0-9]' | head -n 80 | annotate "Live test summary"
+          grep -av '^#[0-9]' "$RUNNER_TEMP/live.log" 2>/dev/null | tail -n 40 | annotate "Live test output (last lines)"
           tail -n 40 data/nextcloud.log 2>/dev/null | annotate "nextcloud.log"
