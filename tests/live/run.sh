@@ -55,7 +55,13 @@ occ files:scan admin
 OC_PASS='Correct-Horse-Battery-Staple-42' occ user:add --password-from-env --display-name=Bob bob
 
 step "Index"
-occ fulltextsearch:index --no-readline
+# The indexer redraws a full-screen status panel; keep it out of the log.
+if ! occ fulltextsearch:index --no-readline > /tmp/ftspg-index.log 2>&1; then
+	echo "FAIL  occ fulltextsearch:index"
+	tr -d '\033' < /tmp/ftspg-index.log | tail -n 40
+	exit 1
+fi
+grep -aE 'Result:|Error:|Status:' /tmp/ftspg-index.log | tail -n 3
 occ fulltextsearch_pgsql:vocabulary
 
 # expect USER QUERY FILE-OR-EMPTY

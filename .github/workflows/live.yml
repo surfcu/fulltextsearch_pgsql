@@ -81,5 +81,5 @@ jobs:
           annotate() {
             python3 -c 'import sys; t=sys.stdin.read()[-30000:]; print("::error title=" + sys.argv[1] + "::" + t.replace("%","%25").replace("\r","").replace("\n","%0A"))' "$1"
           }
-          tail -n 150 "$RUNNER_TEMP/live.log" 2>/dev/null | annotate "Live test output"
+          grep -av '^#[0-9]' "$RUNNER_TEMP/live.log" 2>/dev/null | tail -n 150 | annotate "Live test output"
           tail -n 40 data/nextcloud.log 2>/dev/null | annotate "nextcloud.log"
