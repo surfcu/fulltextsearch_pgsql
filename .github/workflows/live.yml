@@ -1,0 +1,71 @@
+name: Live Nextcloud
+
+# Installs a real Nextcloud on PostgreSQL with Full Text Search and the Files provider,
+# runs `occ fulltextsearch:test` and indexes and searches real files (tests/live/run.sh).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: Nextcloud ${{ matrix.nextcloud }} / PHP ${{ matrix.php }} / PG ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { nextcloud: '30', server: stable30, fulltextsearch: stable30, files: stable30, php: '8.2', postgres: '13' }
+          - { nextcloud: '34', server: stable34, fulltextsearch: stable34, files: stable34, php: '8.3', postgres: '16' }
+          - { nextcloud: '35', server: stable35, fulltextsearch: master,   files: stable35, php: '8.4', postgres: '17' }
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Checkout Nextcloud server
+        uses: actions/checkout@v5
+        with:
+          repository: nextcloud/server
+          ref: ${{ matrix.server }}
+          submodules: true
+          path: server
+      - name: Checkout this app
+        uses: actions/checkout@v5
+        with:
+          path: server/apps/fulltextsearch_pgsql
+      - name: Checkout Full Text Search
+        uses: actions/checkout@v5
+        with:
+          repository: nextcloud/fulltextsearch
+          ref: ${{ matrix.fulltextsearch }}
+          path: server/apps/fulltextsearch
+      - name: Checkout Full Text Search - Files
+        uses: actions/checkout@v5
+        with:
+          repository: nextcloud/files_fulltextsearch
+          ref: ${{ matrix.files }}
+          path: server/apps/files_fulltextsearch
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: ctype, curl, dom, fileinfo, gd, intl, mbstring, openssl, pdo_pgsql, pgsql, posix, simplexml, xmlreader, xmlwriter, zip, zlib
+          coverage: none
+      - name: Install pdftotext
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Run live tests
+        working-directory: server
+        run: apps/fulltextsearch_pgsql/tests/live/run.sh
+      - name: Nextcloud log
+        if: always()
+        working-directory: server
+        run: tail -n 100 data/nextcloud.log 2>/dev/null || true
