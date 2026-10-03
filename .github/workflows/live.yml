@@ -14,15 +14,19 @@ permissions:
 
 jobs:
   live:
-    name: Nextcloud ${{ matrix.nextcloud }} / PHP ${{ matrix.php }} / PG ${{ matrix.postgres }}
+    name: Nextcloud ${{ matrix.nextcloud }} / PHP ${{ matrix.php }} / PG ${{ matrix.postgres }} / pg_trgm ${{ matrix.trgm == '1' && 'on' || 'off' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { nextcloud: '30', server: stable30, fulltextsearch: stable30, files: stable30, php: '8.2', postgres: '13' }
-          - { nextcloud: '34', server: stable34, fulltextsearch: stable34, files: stable34, php: '8.3', postgres: '16' }
-          - { nextcloud: '35', server: stable35, fulltextsearch: master,   files: stable35, php: '8.4', postgres: '17' }
+          # Database owned by the Nextcloud user, as in Nextcloud's install guide: the app
+          # must create pg_trgm itself.
+          - { nextcloud: '34', server: stable34, fulltextsearch: stable34, files: stable34, php: '8.3', postgres: '16', db: owner, trgm: '1' }
+          - { nextcloud: '35', server: stable35, fulltextsearch: master,   files: stable35, php: '8.4', postgres: '17', db: owner, trgm: '1' }
+          # Installer creates its own user on a database it does not own: no pg_trgm, the
+          # trigram features must switch off cleanly.
+          - { nextcloud: '30', server: stable30, fulltextsearch: stable30, files: stable30, php: '8.2', postgres: '13', db: superuser, trgm: '0' }
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -68,8 +72,22 @@ jobs:
           done
       - name: Install pdftotext
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Create the Nextcloud database user
+        if: matrix.db == 'owner'
+        env:
+          PGHOST: 127.0.0.1
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: |
+          psql -c "CREATE USER nextcloud WITH PASSWORD 'nextcloud' CREATEDB"
+          psql -c "ALTER DATABASE nextcloud OWNER TO nextcloud"
+          psql -d nextcloud -c "GRANT ALL ON SCHEMA public TO nextcloud"
       - name: Run live tests
         working-directory: server
+        env:
+          DB_USER: ${{ matrix.db == 'owner' && 'nextcloud' || 'postgres' }}
+          DB_PASS: ${{ matrix.db == 'owner' && 'nextcloud' || 'postgres' }}
+          EXPECT_TRGM: ${{ matrix.trgm }}
         run: |
           set -o pipefail
           apps/fulltextsearch_pgsql/tests/live/run.sh 2>&1 | tee "$RUNNER_TEMP/live.log"

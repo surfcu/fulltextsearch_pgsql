@@ -4,17 +4,24 @@
 # then indexes real files and searches them through occ.
 #
 # Run from the Nextcloud server directory, with this app in apps/fulltextsearch_pgsql and
-# nextcloud/fulltextsearch + nextcloud/files_fulltextsearch in apps/. Needs PostgreSQL at
-# $PGHOST (default 127.0.0.1) with user/password postgres/postgres.
+# nextcloud/fulltextsearch + nextcloud/files_fulltextsearch in apps/.
+#
+# Environment:
+#   PGHOST       PostgreSQL host (default 127.0.0.1); superuser postgres/postgres for checks
+#   DB_USER      user Nextcloud connects as (default postgres; installer creates its own user)
+#   DB_PASS      its password (default postgres)
+#   EXPECT_TRGM  1 = pg_trgm must end up available, 0 = must not; unset = either
 set -euo pipefail
+
+export PGHOST="${PGHOST:-127.0.0.1}" PGUSER=postgres PGPASSWORD=postgres
 
 occ() { php occ "$@"; }
 step() { printf '\n== %s\n' "$*"; }
 failures=0
 
 step "Install Nextcloud on PostgreSQL"
-occ maintenance:install --database=pgsql --database-host="${PGHOST:-127.0.0.1}" \
-	--database-name=nextcloud --database-user=postgres --database-pass=postgres \
+occ maintenance:install --database=pgsql --database-host="$PGHOST" \
+	--database-name=nextcloud --database-user="${DB_USER:-postgres}" --database-pass="${DB_PASS:-postgres}" \
 	--admin-user=admin --admin-pass=admin
 occ config:system:set debug --value=true --type=boolean
 
@@ -28,7 +35,15 @@ step "Framework test: occ fulltextsearch:test"
 occ fulltextsearch:test
 
 step "Platform status: occ fulltextsearch:check"
-occ fulltextsearch:check
+check_out=$(occ fulltextsearch:check)
+echo "$check_out"
+trgm=0
+grep -q '"pg_trgm": true' <<< "$check_out" && trgm=1
+echo "pg_trgm available: $trgm (expected: ${EXPECT_TRGM:-either})"
+if [ -n "${EXPECT_TRGM:-}" ] && [ "$EXPECT_TRGM" != "$trgm" ]; then
+	echo "FAIL  pg_trgm availability"
+	failures=$((failures + 1))
+fi
 
 step "Create files"
 files=data/admin/files
@@ -65,16 +80,22 @@ grep -aE 'Result:|Error:|Status:' /tmp/ftspg-index.log | tail -n 3
 occ fulltextsearch_pgsql:vocabulary
 
 # expect USER QUERY FILE-OR-EMPTY
+# Newer Full Text Search versions print JSON with titles; older ones (Nextcloud 30) print
+# " - <file id> score:…", so file ids are mapped back to names from the file cache.
 expect() {
-	local user=$1 query=$2 want=$3 out
+	local user=$1 query=$2 want=$3 out ids
 	out=$(occ fulltextsearch:search "$user" "$query" --output=json)
-	if python3 - "$want" "$out" <<'PY'
-import json, sys
-want, raw = sys.argv[1], sys.argv[2]
-docs = [d for docs in json.loads(raw).values() for d in docs]
-text = json.dumps(docs, ensure_ascii=False)
-ok = (want in text) if want else (docs == [])
-print(f"   {len(docs)} result(s): " + ", ".join(str(d.get("title")) for d in docs))
+	ids=$(psql -d nextcloud -tAc "SELECT fileid || '=' || name FROM oc_filecache WHERE path LIKE 'files/%'")
+	if python3 - "$want" "$out" "$ids" <<'PY'
+import json, re, sys
+want, raw, ids = sys.argv[1], sys.argv[2], sys.argv[3]
+names = dict(line.split("=", 1) for line in ids.splitlines() if "=" in line)
+try:
+    titles = [str(d.get("title")) for docs in json.loads(raw).values() for d in docs]
+except ValueError:
+    titles = [names.get(i, "#" + i) for i in re.findall(r"^ - (\S+) score", raw, re.M)]
+print(f"   {len(titles)} result(s): " + ", ".join(titles))
+ok = any(want in t for t in titles) if want else titles == []
 sys.exit(0 if ok else 1)
 PY
 	then
@@ -86,16 +107,26 @@ PY
 	fi
 }
 
+# Checks for features that need pg_trgm: run when it is available, else expect no result.
+expect_trgm() {
+	if [ "$trgm" = 1 ]; then
+		expect "$@"
+	else
+		echo "      (pg_trgm unavailable: '$2' must find nothing)"
+		expect "$1" "$2" ''
+	fi
+}
+
 step "Search real files"
 expect admin 'çalışma'      'Toplantı Notları.txt'   # Turkish stemming
 expect admin 'calisma'      'Toplantı Notları.txt'   # without diacritics
 expect admin 'ısparta'      'Toplantı Notları.txt'   # dotless I from uppercase text
 expect admin 'toplantı'     'Toplantı Notları.txt'   # file name
 expect admin 'hippopotamus' 'rapor_2025_final.docx'  # docx content
-expect admin 'hipopotamus'  'rapor_2025_final.docx'  # typo correction
+expect_trgm admin 'hipopotamus' 'rapor_2025_final.docx'  # typo correction
 expect admin 'final'        'rapor_2025_final.docx'  # file name part
 expect admin 'quokka'       'invoice.pdf'            # PDF via pdftotext
-expect admin 'butce'        'YillikButceRaporu.txt'  # substring in a title
+expect_trgm admin 'butce'     'YillikButceRaporu.txt'  # substring in a title
 expect bob   'hippopotamus' ''                       # not shared with bob
 
 step "Upgrade path: repair step is idempotent"
