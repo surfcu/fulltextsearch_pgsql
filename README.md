@@ -26,6 +26,14 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 
 ## Installation
 
+From the App Store (once the first release is published there): **Apps → Search → Full Text Search - PostgreSQL**, or
+
+```bash
+sudo -u www-data php /var/www/nextcloud/occ app:install fulltextsearch_pgsql
+```
+
+From source:
+
 ```bash
 cd /var/www/nextcloud/apps
 git clone https://github.com/surfcu/fulltextsearch_pgsql.git
@@ -33,6 +41,8 @@ sudo -u www-data php /var/www/nextcloud/occ app:enable fulltextsearch_pgsql
 ```
 
 No `composer install` is needed: the app has no runtime dependencies.
+
+For typo correction and title substrings, the Nextcloud database user should own the database, as in [Nextcloud's PostgreSQL setup](https://docs.nextcloud.com/server/latest/admin_manual/configuration_database/linux_database_configuration.html). The app can then enable `pg_trgm` itself on PostgreSQL 13+.
 
 Then choose it as the platform and build the index:
 
@@ -133,7 +143,11 @@ composer psalm            # static analysis against the real Nextcloud interface
 FTSPG_TEST_DSN="pgsql:host=localhost;dbname=fts_test;user=postgres;password=postgres" composer test
 ```
 
-The integration tests run against a real, disposable PostgreSQL database. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, and the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13 and 17. To check against a specific Nextcloud release, install its API stubs first: `composer require --dev nextcloud/ocp:dev-stable35`.
+The integration tests run against a real, disposable PostgreSQL database. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, and the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13 and 17.
+
+`tests/live/run.sh` goes further: CI installs real Nextcloud 30, 34 and 35 servers on PostgreSQL with Full Text Search and the Files provider, runs the framework's own `occ fulltextsearch:test`, then indexes and searches real text, Office and PDF files. It covers both a database the Nextcloud user owns (`pg_trgm` enabled by the app) and one it doesn't (trigram features off).
+
+Releases are built and published to the Nextcloud App Store from GitHub; see [docs/RELEASING.md](docs/RELEASING.md). To check against a specific Nextcloud release, install its API stubs first: `composer require --dev nextcloud/ocp:dev-stable35`.
 
 ## License
 

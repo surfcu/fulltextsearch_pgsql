@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - spelling corrections for words that appear nowhere in the index, including swapped letters (`recieve` → `receive`). Uses `pg_trgm` to shortlist and an edit distance to decide.
   Alternatives are ORed in, so the typed word is still searched. Controlled by the new `typo_correction` setting.
 - `occ fulltextsearch_pgsql:vocabulary [--rebuild]`. On upgrade the vocabulary is filled automatically for indexes of up to 10,000 documents; larger ones are told to run the command.
+- App icon, documentation links, and `make appstore` / `make sign` to build and sign the App Store archive. Publishing a GitHub release runs all tests and uploads the release to the App Store (see `docs/RELEASING.md`).
+- CI runs the app inside real Nextcloud 30, 34 and 35 servers on PostgreSQL: the framework's `occ fulltextsearch:test`, plus indexing and searching real text, Office and PDF files.
+
+### Changed
+- `info.xml` uses the SPDX licence identifier `AGPL-3.0-or-later`, as the App Store now requires.
 
 ## [1.2.0] - 2026-10-03
 

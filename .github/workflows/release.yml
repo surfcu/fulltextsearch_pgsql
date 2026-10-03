@@ -1,0 +1,81 @@
+name: Release
+
+# Publishing a GitHub release (tag v1.2.3 or 1.2.3, matching appinfo/info.xml) runs all
+# tests, attaches the app archive to the release and uploads it to the Nextcloud App Store.
+#
+# Needs two repository secrets (Settings → Secrets and variables → Actions):
+#   APP_PRIVATE_KEY  contents of fulltextsearch_pgsql.key (the key your App Store certificate was issued for)
+#   APPSTORE_TOKEN   API token from https://apps.nextcloud.com/account/token
+# Without them the archive is still attached to the release; the App Store step is skipped.
+# A release marked "pre-release" is uploaded to the App Store as a nightly.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+  live:
+    uses: ./.github/workflows/live.yml
+
+  publish:
+    needs: [checks, live]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      APP_ID: fulltextsearch_pgsql
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the version
+        run: |
+          version="${TAG#v}"
+          info_version=$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' appinfo/info.xml)
+          if [ "$version" != "$info_version" ]; then
+            echo "::error::Release tag $TAG does not match appinfo/info.xml version $info_version"
+            exit 1
+          fi
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no entry for $version"; exit 1; }
+
+      - name: Build the archive
+        run: make appstore
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "build/artifacts/appstore/$APP_ID.tar.gz" --clobber
+
+      - name: Upload to the Nextcloud App Store
+        env:
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          APPSTORE_TOKEN: ${{ secrets.APPSTORE_TOKEN }}
+          NIGHTLY: ${{ github.event.release.prerelease }}
+        run: |
+          if [ -z "$APP_PRIVATE_KEY" ] || [ -z "$APPSTORE_TOKEN" ]; then
+            echo "::warning::APP_PRIVATE_KEY or APPSTORE_TOKEN is not set; skipped the App Store upload."
+            exit 0
+          fi
+          archive="build/artifacts/appstore/$APP_ID.tar.gz"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${APP_ID}.tar.gz"
+
+          # The App Store downloads the archive from the release; make sure it serves the same bytes.
+          curl -sSfL --retry 10 --retry-delay 6 --retry-all-errors "$url" -o "$RUNNER_TEMP/published.tar.gz"
+          cmp "$archive" "$RUNNER_TEMP/published.tar.gz"
+
+          key="$RUNNER_TEMP/$APP_ID.key"
+          (umask 077; printf '%s\n' "$APP_PRIVATE_KEY" > "$key")
+          signature=$(openssl dgst -sha512 -sign "$key" "$archive" | openssl base64 -A)
+          rm -f "$key"
+
+          body=$(jq -n --arg download "$url" --arg signature "$signature" --argjson nightly "$NIGHTLY" \
+            '{download: $download, signature: $signature, nightly: $nightly}')
+          curl -sS --fail-with-body -X POST https://apps.nextcloud.com/api/v1/apps/releases \
+            -H "Authorization: Token $APPSTORE_TOKEN" -H "Content-Type: application/json" -d "$body"
+          echo
+          echo "Uploaded $TAG to the Nextcloud App Store (nightly: $NIGHTLY)."
