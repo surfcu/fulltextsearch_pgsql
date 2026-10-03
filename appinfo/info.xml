@@ -16,10 +16,15 @@
 
 Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
     <version>1.3.0</version>
-    <licence>agpl</licence>
+    <licence>AGPL-3.0-or-later</licence>
     <author>surfcu</author>
     <namespace>FullTextSearch_PgSql</namespace>
+    <documentation>
+        <admin>https://github.com/surfcu/fulltextsearch_pgsql#readme</admin>
+        <developer>https://github.com/surfcu/fulltextsearch_pgsql/blob/main/docs/ARCHITECTURE.md</developer>
+    </documentation>
     <category>search</category>
+    <website>https://github.com/surfcu/fulltextsearch_pgsql</website>
     <bugs>https://github.com/surfcu/fulltextsearch_pgsql/issues</bugs>
     <repository type="git">https://github.com/surfcu/fulltextsearch_pgsql</repository>
 
