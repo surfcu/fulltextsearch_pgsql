@@ -129,6 +129,43 @@ expect admin 'quokka'       'invoice.pdf'            # PDF via pdftotext
 expect_trgm admin 'butce'     'YillikButceRaporu.txt'  # substring in a title
 expect bob   'hippopotamus' ''                       # not shared with bob
 
+step "PDF fallback: bundled parser instead of pdftotext"
+occ fulltextsearch_pgsql:configure '{"pdf_extractor":"pdfparser"}' >/dev/null
+check_out=$(occ fulltextsearch:check)
+if grep -q '"pdf_tool": "pdfparser"' <<< "$check_out"; then
+	echo "ok    fulltextsearch:check reports pdf_tool pdfparser"
+else
+	echo "FAIL  fulltextsearch:check does not report pdf_tool pdfparser"
+	failures=$((failures + 1))
+fi
+python3 - "$files" <<'PY'
+import sys, os
+# A well-formed PDF (with an xref table): pdfparser, unlike pdftotext, needs one.
+stream = b"BT /F1 18 Tf 20 40 Td (Okapi Capybara) Tj ET"
+objects = [b"<</Type/Catalog/Pages 2 0 R>>", b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+           b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>",
+           b"<</Length %d>>\nstream\n%s\nendstream" % (len(stream), stream),
+           b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica/Encoding/WinAnsiEncoding>>"]
+pdf, offsets = b"%PDF-1.4\n", []
+for i, o in enumerate(objects):
+    offsets.append(len(pdf))
+    pdf += b"%d 0 obj\n%s\nendobj\n" % (i + 1, o)
+xref = len(pdf)
+pdf += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+pdf += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+pdf += b"trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+with open(os.path.join(sys.argv[1], "brosur.pdf"), "wb") as f:
+    f.write(pdf)
+PY
+occ files:scan admin >/dev/null
+if ! occ fulltextsearch:index --no-readline > /tmp/ftspg-index2.log 2>&1; then
+	echo "FAIL  occ fulltextsearch:index (pdfparser)"
+	tr -d '\033' < /tmp/ftspg-index2.log | tail -n 40
+	exit 1
+fi
+expect admin 'capybara'     'brosur.pdf'             # PDF via the bundled parser
+occ fulltextsearch_pgsql:configure '{"pdf_extractor":"auto"}' >/dev/null
+
 step "Upgrade path: repair step is idempotent"
 occ maintenance:repair >/dev/null
 expect admin 'hippopotamus' 'rapor_2025_final.docx'

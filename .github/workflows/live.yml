@@ -70,6 +70,8 @@ jobs:
           for app in fulltextsearch files_fulltextsearch; do
             composer install --no-dev --no-interaction --no-progress --no-scripts --working-dir=server/apps/$app
           done
+      - name: Bundle this app's PDF parser (composer install runs scripts/scope-pdfparser.php)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=server/apps/fulltextsearch_pgsql
       - name: Install pdftotext
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
       - name: Create the Nextcloud database user

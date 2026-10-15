@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace OCA\FullTextSearch_PgSql\Service;
 
 use OCA\FullTextSearch_PgSql\Model\ExtractedContent;
+use OCA\FullTextSearch_PgSql\Vendor\Smalot\PdfParser\Config as PdfParserConfig;
+use OCA\FullTextSearch_PgSql\Vendor\Smalot\PdfParser\Parser as PdfParser;
+use Throwable;
 use OCP\FullTextSearch\Model\IIndexDocument;
 use ZipArchive;
 
@@ -15,7 +18,8 @@ use ZipArchive;
  * platform to extract text (Elasticsearch does it with its attachment pipeline). Here:
  *  - plain text files are decoded directly,
  *  - OpenDocument and Office Open XML files are unzipped and their XML text is read,
- *  - PDFs go through `pdftotext` (poppler-utils) when it is installed,
+ *  - PDFs go through `pdftotext` (poppler-utils) when it is installed, and through the
+ *    bundled smalot/pdfparser otherwise (slower and hungrier, but pure PHP),
  *  - anything else is indexed without content and reported as a warning.
  */
 class ContentExtractor {
@@ -29,6 +33,14 @@ class ContentExtractor {
 	];
 
 	private const PDF_TIMEOUT_SECONDS = 60;
+
+	/**
+	 * The bundled parser holds the whole file and its decoded objects in PHP memory. Above
+	 * this size it is not tried at all; below it, it is still skipped when the free memory
+	 * under memory_limit is less than PDF_PARSER_MEMORY_FACTOR times the file size.
+	 */
+	private const PDF_PARSER_MAX_BYTES = 64 * 1024 * 1024;
+	private const PDF_PARSER_MEMORY_FACTOR = 12;
 
 	public function __construct(
 		private ConfigService $configService,
@@ -93,15 +105,63 @@ class ContentExtractor {
 		return $text;
 	}
 
+	/**
+	 * Which tool PDFs currently go through, for the admin panel and the index log:
+	 * 'pdftotext', 'pdfparser', or null when neither can run.
+	 */
+	public function pdfTool(): ?string {
+		$mode = $this->configService->getPdfExtractor();
+		if ($mode !== 'pdfparser' && $this->findPdfToText() !== null) {
+			return 'pdftotext';
+		}
+		if ($mode !== 'pdftotext' && $this->pdfParserAvailable()) {
+			return 'pdfparser';
+		}
+		return null;
+	}
+
+	public function pdfParserAvailable(): bool {
+		return class_exists(PdfParser::class) && function_exists('gzuncompress');
+	}
+
+	public function findPdfToTextPath(): ?string {
+		return $this->findPdfToText();
+	}
+
 	private function extractPdf(string $raw): ExtractedContent {
-		$binary = $this->findPdfToText();
-		if ($binary === null) {
-			return new ExtractedContent('', 'PDF indexed without content: install poppler-utils (pdftotext) to index PDF text');
+		$mode = $this->configService->getPdfExtractor();
+
+		$failure = null;
+		if ($mode !== 'pdfparser') {
+			$binary = $this->findPdfToText();
+			if ($binary !== null) {
+				[$result, $ran] = $this->extractPdfWithPdfToText($binary, $raw);
+				if ($ran || $mode === 'pdftotext') {
+					return $result;
+				}
+				$failure = $result->warning;
+			} elseif ($mode === 'pdftotext') {
+				return new ExtractedContent('', 'PDF indexed without content: pdftotext is selected but not found; install poppler-utils or set pdf_extractor to auto');
+			}
 		}
 
+		$result = $this->extractPdfWithParser($raw);
+		if ($failure !== null) {
+			// pdftotext is installed but broken: say so, whatever the parser managed.
+			return new ExtractedContent($result->text, $failure . ', read with the built-in parser instead'
+				. ($result->warning !== null ? ' (' . $result->warning . ')' : ''));
+		}
+		return $result;
+	}
+
+	/**
+	 * @return array{0: ExtractedContent, 1: bool} the result, and whether pdftotext actually ran
+	 *                                            (false: worth trying the bundled parser)
+	 */
+	private function extractPdfWithPdfToText(string $binary, string $raw): array {
 		$tmp = tempnam(sys_get_temp_dir(), 'ftspg');
 		if ($tmp === false || file_put_contents($tmp, $raw) === false) {
-			return new ExtractedContent('', 'PDF indexed without content: could not write temporary file');
+			return [new ExtractedContent('', 'could not write a temporary file for pdftotext'), false];
 		}
 
 		try {
@@ -111,10 +171,11 @@ class ContentExtractor {
 				$pipes
 			);
 			if (!is_resource($process)) {
-				return new ExtractedContent('', 'PDF indexed without content: could not run pdftotext');
+				return [new ExtractedContent('', 'could not run pdftotext'), false];
 			}
 
 			stream_set_blocking($pipes[1], false);
+			stream_set_blocking($pipes[2], false);
 			$output = '';
 			$limit = $this->configService->getMaxContentSize() * 2 + 1;
 			$deadline = time() + self::PDF_TIMEOUT_SECONDS;
@@ -128,20 +189,100 @@ class ContentExtractor {
 			}
 			$timedOut = !feof($pipes[1]) && time() >= $deadline;
 			fclose($pipes[1]);
+			$errors = (string)stream_get_contents($pipes[2]);
 			fclose($pipes[2]);
 			if ($timedOut) {
 				proc_terminate($process);
 			}
-			proc_close($process);
+			$exitCode = proc_close($process);
+
+			if (!$timedOut && $exitCode !== 0 && trim($output) === '') {
+				$reason = trim(strtok($errors, "\n") ?: '');
+				return [new ExtractedContent('', 'pdftotext failed (exit code ' . $exitCode . ($reason !== '' ? ': ' . $reason : '') . ')'), false];
+			}
 
 			$text = $this->clean($output);
 			if ($text === '') {
-				return new ExtractedContent('', 'PDF contains no extractable text (scanned images?)');
+				return [new ExtractedContent('', 'PDF contains no extractable text (scanned images?)'), true];
 			}
-			return new ExtractedContent($text, $timedOut ? 'pdftotext timed out, content partially indexed' : null);
+			return [new ExtractedContent($text, $timedOut ? 'pdftotext timed out, content partially indexed' : null), true];
 		} finally {
 			@unlink($tmp);
 		}
+	}
+
+	private function extractPdfWithParser(string $raw): ExtractedContent {
+		if (!$this->pdfParserAvailable()) {
+			return new ExtractedContent('', 'PDF indexed without content: install poppler-utils (pdftotext) to index PDF text');
+		}
+
+		$size = strlen($raw);
+		if ($size > self::PDF_PARSER_MAX_BYTES) {
+			return new ExtractedContent('', sprintf(
+				'PDF indexed without content: %d MB is too large for the built-in parser; install poppler-utils (pdftotext) to index it',
+				intdiv($size, 1024 * 1024)
+			));
+		}
+		$free = $this->freeMemory();
+		if ($free !== null && $free < $size * self::PDF_PARSER_MEMORY_FACTOR) {
+			return new ExtractedContent('', sprintf(
+				'PDF indexed without content: not enough memory_limit for the built-in parser (%d MB file, %d MB free); install poppler-utils (pdftotext) or raise memory_limit',
+				max(1, intdiv($size, 1024 * 1024)),
+				intdiv($free, 1024 * 1024)
+			));
+		}
+
+		$config = new PdfParserConfig();
+		// Images are never indexed; keeping their bytes only costs memory.
+		$config->setRetainImageContent(false);
+		// Caps what a single compressed stream may inflate to (zip-bomb style PDFs).
+		$config->setDecodeMemoryLimit(self::PDF_PARSER_MAX_BYTES);
+
+		// Malformed files make the parser raise PHP warnings and notices on its way to an
+		// exception or a partial result. They say nothing an administrator can act on and
+		// would flood nextcloud.log on every indexing run, so they are dropped here; the
+		// outcome is still reported through the returned warning.
+		$vendorDir = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'Vendor' . DIRECTORY_SEPARATOR;
+		set_error_handler(static fn (int $level, string $message, string $file): bool => str_starts_with($file, $vendorDir));
+		try {
+			$document = (new PdfParser([], $config))->parseContent($raw);
+			// Page by page, so a long document stops once enough text has been read.
+			$limit = $this->configService->getMaxContentSize() * 2 + 1;
+			$text = '';
+			foreach ($document->getPages() as $page) {
+				$text .= $page->getText() . "\n";
+				if (strlen($text) >= $limit) {
+					break;
+				}
+			}
+		} catch (Throwable $e) {
+			return new ExtractedContent('', 'PDF indexed without content: the built-in parser could not read it (' . $e->getMessage() . ')');
+		} finally {
+			restore_error_handler();
+		}
+
+		$text = $this->clean($text);
+		if ($text === '') {
+			return new ExtractedContent('', 'PDF contains no extractable text (scanned images?)');
+		}
+		return new ExtractedContent($text);
+	}
+
+	/** Bytes left under memory_limit, or null when there is no limit. */
+	private function freeMemory(): ?int {
+		$limit = trim((string)ini_get('memory_limit'));
+		if ($limit === '' || $limit === '-1') {
+			return null;
+		}
+		$bytes = (int)$limit;
+		switch (strtolower(substr($limit, -1))) {
+			case 'g': $bytes *= 1024;
+				// no break
+			case 'm': $bytes *= 1024;
+				// no break
+			case 'k': $bytes *= 1024;
+		}
+		return max(0, $bytes - memory_get_usage(true));
 	}
 
 	private function extractZipXml(string $raw): ExtractedContent {

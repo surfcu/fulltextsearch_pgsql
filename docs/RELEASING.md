@@ -46,7 +46,7 @@ The [Release workflow](../.github/workflows/release.yml) then:
 
 - runs the full test suite, including the live Nextcloud tests,
 - checks the tag matches `info.xml` and the changelog,
-- builds `fulltextsearch_pgsql.tar.gz` (`make appstore`) and attaches it to the GitHub release,
+- builds `fulltextsearch_pgsql.tar.gz` (`make appstore`, which runs `composer install --no-dev` if needed and regenerates the bundled PDF parser in `lib/Vendor`) and attaches it to the GitHub release,
 - signs it and uploads it to the App Store.
 
 If a step fails, nothing reaches the App Store. Fix the problem, then delete and recreate the release.
