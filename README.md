@@ -184,10 +184,11 @@ Coming from Elasticsearch? See [docs/MIGRATION.md](docs/MIGRATION.md).
 ```bash
 composer install          # nextcloud/ocp stubs and Psalm; also builds lib/Vendor (see below)
 composer psalm            # static analysis against the real Nextcloud interfaces
+composer cs:check         # Nextcloud coding standard (composer cs:fix applies it)
 FTSPG_TEST_DSN="pgsql:host=localhost;dbname=fts_test;user=postgres;password=postgres" composer test
 ```
 
-The integration tests run against a real, disposable PostgreSQL database with a UTF-8 locale (Turkish lowercasing depends on it). With `poppler-utils` and `catdoc` installed they also extract real PDF and Office 97–2003 files; without them, they check the warnings instead. The Office 97–2003 samples in `tests/fixtures` come from Apache Tika (Apache-2.0) and are not part of the app archive. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, and the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13 and 17.
+The integration tests run against a real, disposable PostgreSQL database with a UTF-8 locale (Turkish lowercasing depends on it). With `poppler-utils` and `catdoc` installed they also extract real PDF and Office 97–2003 files; without them, they check the warnings instead. The Office 97–2003 samples in `tests/fixtures` come from Apache Tika (Apache-2.0) and are not part of the app archive. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, checks the coding standard, and the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13 and 17.
 
 `tests/live/run.sh` goes further: CI installs real Nextcloud 30, 34 and 35 servers on PostgreSQL with Full Text Search and the Files provider, runs the framework's own `occ fulltextsearch:test`, then indexes and searches real files: text, Office documents (including a word split across formatting runs and a Word 97–2003 file), and PDFs through both `pdftotext` and the bundled parser. It also indexes English and Turkish documents side by side with two languages configured, checks that nothing from the app reaches `nextcloud.log` as a warning or error, and covers both a database the Nextcloud user owns (`pg_trgm` enabled by the app) and one it doesn't (trigram features off).
 

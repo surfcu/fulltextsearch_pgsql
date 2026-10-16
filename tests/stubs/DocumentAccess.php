@@ -1,4 +1,5 @@
 <?php
+
 // Copy of Nextcloud server lib/private/FullTextSearch/Model/DocumentAccess.php (AGPL-3.0-or-later),
 // used only for static analysis and tests. At runtime Nextcloud provides the real class.
 

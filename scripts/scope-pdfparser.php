@@ -67,7 +67,7 @@ $composer = json_decode((string)file_get_contents($source . '/composer.json'), t
 $version = $composer['version'] ?? trim((string)@shell_exec('git -C ' . escapeshellarg($source) . ' describe --tags 2>/dev/null'));
 file_put_contents(
 	$root . '/lib/Vendor/Smalot/README.md',
-	"smalot/pdfparser " . ($version !== '' ? $version . ' ' : '') . "(LGPL-3.0, see LICENSE.txt), namespaced under\n"
+	'smalot/pdfparser ' . ($version !== '' ? $version . ' ' : '') . "(LGPL-3.0, see LICENSE.txt), namespaced under\n"
 	. "`OCA\\FullTextSearch_PgSql\\Vendor` by scripts/scope-pdfparser.php. Generated: do not edit.\n"
 	. "Upstream: https://github.com/smalot/pdfparser\n"
 );

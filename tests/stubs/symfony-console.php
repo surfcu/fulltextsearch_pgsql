@@ -1,4 +1,5 @@
 <?php
+
 // Minimal Symfony Console stubs for static analysis. Nextcloud ships the real classes.
 
 namespace Symfony\Component\Console\Input {
@@ -29,12 +30,24 @@ namespace Symfony\Component\Console\Command {
 		public const SUCCESS = 0;
 		public const FAILURE = 1;
 		public const INVALID = 2;
-		public function __construct(?string $name = null) {}
-		public function setName(string $name): static { return $this; }
-		public function setDescription(string $description): static { return $this; }
-		public function addArgument(string $name, ?int $mode = null, string $description = '', mixed $default = null): static { return $this; }
-		public function addOption(string $name, string|array|null $shortcut = null, ?int $mode = null, string $description = '', mixed $default = null): static { return $this; }
-		protected function configure(): void {}
-		protected function execute(\Symfony\Component\Console\Input\InputInterface $input, \Symfony\Component\Console\Output\OutputInterface $output): int { return 0; }
+		public function __construct(?string $name = null) {
+		}
+		public function setName(string $name): static {
+			return $this;
+		}
+		public function setDescription(string $description): static {
+			return $this;
+		}
+		public function addArgument(string $name, ?int $mode = null, string $description = '', mixed $default = null): static {
+			return $this;
+		}
+		public function addOption(string $name, string|array|null $shortcut = null, ?int $mode = null, string $description = '', mixed $default = null): static {
+			return $this;
+		}
+		protected function configure(): void {
+		}
+		protected function execute(\Symfony\Component\Console\Input\InputInterface $input, \Symfony\Component\Console\Output\OutputInterface $output): int {
+			return 0;
+		}
 	}
 }

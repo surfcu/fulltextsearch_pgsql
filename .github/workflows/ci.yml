@@ -54,6 +54,10 @@ jobs:
       - name: Psalm
         if: matrix.psalm
         run: composer psalm
+      - name: Coding standard (nextcloud/coding-standard)
+        # Same result on every matrix entry, so checked once.
+        if: matrix.nextcloud == '35' && matrix.php == '8.3'
+        run: composer cs:check
       - name: Integration tests
         env:
           FTSPG_TEST_DSN: 'pgsql:host=127.0.0.1;port=5432;dbname=fts_test;user=postgres;password=postgres'
