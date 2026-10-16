@@ -15,7 +15,9 @@ release_files := appinfo lib templates js css img docs LICENSE README.md CHANGEL
 
 # Rebuilds lib/Vendor from vendor/smalot/pdfparser, installing it first if needed.
 scope:
-	@test -d vendor/smalot/pdfparser || composer install --no-dev --no-interaction --no-progress --no-scripts
+	@# --ignore-platform-req=php: dev tools (Psalm) are resolved but not installed, so their
+	@# PHP limit must not block a runtime-only install on a newer PHP.
+	@test -d vendor/smalot/pdfparser || composer install --no-dev --ignore-platform-req=php --no-interaction --no-progress --no-scripts
 	php scripts/scope-pdfparser.php
 
 appstore: clean scope

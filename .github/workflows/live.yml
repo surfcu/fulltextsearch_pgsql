@@ -71,7 +71,9 @@ jobs:
             composer install --no-dev --no-interaction --no-progress --no-scripts --working-dir=server/apps/$app
           done
       - name: Bundle this app's PDF parser (composer install runs scripts/scope-pdfparser.php)
-        run: composer install --no-dev --no-interaction --no-progress --working-dir=server/apps/fulltextsearch_pgsql
+        # No lock file, so Composer resolves the dev tools too even with --no-dev; Psalm's PHP
+        # limit would then fail the install on newer PHP although nothing of it gets installed.
+        run: composer install --no-dev --ignore-platform-req=php --no-interaction --no-progress --working-dir=server/apps/fulltextsearch_pgsql
       - name: Install pdftotext
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
       - name: Create the Nextcloud database user
