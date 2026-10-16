@@ -129,8 +129,12 @@ function search(PostgreSQLPlatform $platform, string $viewer, string $q, array $
 	$result = double(ISearchResult::class, [
 		'getRequest' => $request,
 		'getProvider' => $provider,
-		'addDocument' => function (IIndexDocument $d) use (&$docs) { $docs[] = $d; },
-		'setTotal' => function (int $t) use (&$total) { $total = $t; },
+		'addDocument' => function (IIndexDocument $d) use (&$docs) {
+			$docs[] = $d;
+		},
+		'setTotal' => function (int $t) use (&$total) {
+			$total = $t;
+		},
 	]);
 	$access = new DocumentAccess();
 	$access->setViewerId($viewer);
@@ -221,7 +225,7 @@ try {
 	same(['Q3'], search($platform, 'alice', 'e-mail')['ids'], 'hyphenated word');
 	same([], search($platform, 'alice', '-budget')['ids'], 'only exclusions returns nothing instead of everything');
 	same([], search($platform, 'alice', 'the of and')['ids'], 'stopwords only returns nothing');
-	foreach (["'); DROP TABLE ftspg_oc_index; --", "a & | ! :* <-> (", '"', '\\', "\0", "\xff\xfe broken utf8"] as $nasty) {
+	foreach (["'); DROP TABLE ftspg_oc_index; --", 'a & | ! :* <-> (', '"', '\\', "\0", "\xff\xfe broken utf8"] as $nasty) {
 		search($platform, 'alice', $nasty);
 	}
 	check($schema->tableExists(), 'hostile queries do not error or inject');
@@ -654,7 +658,7 @@ try {
 	same(['V2', 'V3'], $ids('calis'), 'accent variants while typing (calis → çalış…)');
 	same(['V1'], $ids('+recieve +invoice'), 'corrections satisfy required words');
 	same(['V1'], $ids('receive -invocie'), 'exclusions are not corrected (a misspelled exclusion excludes nothing)');
-	same([], $ids('zeppelin'), "words from documents the user cannot see never surface theirs");
+	same([], $ids('zeppelin'), 'words from documents the user cannot see never surface theirs');
 	same([], $ids('xqzvbn'), 'no wild guesses for gibberish');
 	same([], $ids('teh'), 'no spelling correction for words under 4 letters');
 	$platform->indexDocument(doc('V5', 'alice', 'Car notes', 'The car is red'));
@@ -688,7 +692,9 @@ try {
 	same(3, VocabularyService::editDistance('ışık', 'isik'), 'multibyte letters count once each (3 substitutions)');
 	$conn->executeStatement('TRUNCATE ftspg_oc_words');
 	$progress = 0;
-	$repairOutput = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progress) { $progress += $step; }]);
+	$repairOutput = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progress) {
+		$progress += $step;
+	}]);
 	(new CreateIndexTable($schema, $vocabulary))->run($repairOutput);
 	check($vocabulary->count() > 20, 'upgrade step fills an empty vocabulary on small instances');
 	same($schema->countDocuments(), $progress, 'and reports progress per document');
@@ -730,7 +736,7 @@ try {
 	$platform->indexDocument(doc('M2', 'alice', 'Yıllık rapor', 'Bu yılki kitapları ve dergileri kütüphaneye verdik, çünkü öğrenciler için çok önemli ve gerekli.'));
 	$platform->indexDocument(doc('M3', 'alice', 'Rapor 2025', ''));
 	$platform->indexDocument(doc('M4', 'alice', 'Bericht', 'Die Berichte wurden veröffentlicht und der Vorstand hat sie genehmigt, aber nicht alle.'));
-	$configOf = static fn (string $id): string => (string)$conn->executeQuery("SELECT config::text FROM ftspg_oc_index WHERE document_id = ?", [$id])->fetchOne();
+	$configOf = static fn (string $id): string => (string)$conn->executeQuery('SELECT config::text FROM ftspg_oc_index WHERE document_id = ?', [$id])->fetchOne();
 	same('english', $configOf('M1'), 'English text detected as english');
 	same('turkish', $configOf('M2'), 'Turkish text detected as turkish');
 	same('turkish', $configOf('M3'), 'no text to tell from: fallback language');

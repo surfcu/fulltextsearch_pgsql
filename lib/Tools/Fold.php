@@ -11,8 +11,11 @@ namespace OCA\FullTextSearch_PgSql\Tools;
  */
 final class Fold {
 
-	public const FROM = 'çğıöşüâîûéèêëáàäãåāóòôõōøőúùūñýÿíìïīčšžřďťňęąłżźćń';
-	public const TO   = 'cgiosuaiueeeeaaaaaaooooooouuunyyiiiicszrdtnealzzcn';
+	// Each letter of FROM folds to the letter below it in TO.
+	public const FROM
+		= 'çğıöşüâîûéèêëáàäãåāóòôõōøőúùūñýÿíìïīčšžřďťňęąłżźćń';
+	public const TO
+		= 'cgiosuaiueeeeaaaaaaooooooouuunyyiiiicszrdtnealzzcn';
 
 	public static function fold(string $word): string {
 		return strtr($word, self::map());

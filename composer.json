@@ -17,6 +17,7 @@
         "symfony/polyfill-mbstring": "*"
     },
     "require-dev": {
+        "nextcloud/coding-standard": "^1.5",
         "nextcloud/ocp": "dev-stable30",
         "vimeo/psalm": "^5.26"
     },
@@ -34,6 +35,8 @@
             "@scope-pdfparser"
         ],
         "psalm": "psalm --no-cache --threads=1",
+        "cs:check": "php-cs-fixer fix --dry-run --diff",
+        "cs:fix": "php-cs-fixer fix",
         "test": "php tests/run.php"
     },
     "config": {

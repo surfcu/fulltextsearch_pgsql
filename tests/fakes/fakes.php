@@ -17,7 +17,9 @@ use ReflectionNamedType;
 use ReflectionUnionType;
 
 final class PdoResult implements IResult {
-	public function __construct(private PDOStatement $stmt) {
+	public function __construct(
+		private PDOStatement $stmt,
+	) {
 	}
 	public function closeCursor(): bool {
 		return $this->stmt->closeCursor();
@@ -38,7 +40,10 @@ final class PdoConnection implements IDBConnection {
 	/** @var list<string> */
 	public array $statements = [];
 
-	public function __construct(public PDO $pdo, private string $prefix = 'oc_') {
+	public function __construct(
+		public PDO $pdo,
+		private string $prefix = 'oc_',
+	) {
 		$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 	}
 	public function executeQuery(string $sql, array $params = [], $types = []): IResult {
@@ -90,7 +95,9 @@ final class ArrayAppConfig implements IAppConfig {
 }
 
 final class ArrayConfig implements IConfig {
-	public function __construct(private array $system = []) {
+	public function __construct(
+		private array $system = [],
+	) {
 	}
 	public function getSystemValueString(string $key, string $default = ''): string {
 		return (string)($this->system[$key] ?? $default);
@@ -99,14 +106,30 @@ final class ArrayConfig implements IConfig {
 
 final class MemoryLogger implements LoggerInterface {
 	public array $records = [];
-	public function emergency(string|\Stringable $message, array $context = []): void { $this->log('emergency', $message, $context); }
-	public function alert(string|\Stringable $message, array $context = []): void { $this->log('alert', $message, $context); }
-	public function critical(string|\Stringable $message, array $context = []): void { $this->log('critical', $message, $context); }
-	public function error(string|\Stringable $message, array $context = []): void { $this->log('error', $message, $context); }
-	public function warning(string|\Stringable $message, array $context = []): void { $this->log('warning', $message, $context); }
-	public function notice(string|\Stringable $message, array $context = []): void { $this->log('notice', $message, $context); }
-	public function info(string|\Stringable $message, array $context = []): void { $this->log('info', $message, $context); }
-	public function debug(string|\Stringable $message, array $context = []): void { $this->log('debug', $message, $context); }
+	public function emergency(string|\Stringable $message, array $context = []): void {
+		$this->log('emergency', $message, $context);
+	}
+	public function alert(string|\Stringable $message, array $context = []): void {
+		$this->log('alert', $message, $context);
+	}
+	public function critical(string|\Stringable $message, array $context = []): void {
+		$this->log('critical', $message, $context);
+	}
+	public function error(string|\Stringable $message, array $context = []): void {
+		$this->log('error', $message, $context);
+	}
+	public function warning(string|\Stringable $message, array $context = []): void {
+		$this->log('warning', $message, $context);
+	}
+	public function notice(string|\Stringable $message, array $context = []): void {
+		$this->log('notice', $message, $context);
+	}
+	public function info(string|\Stringable $message, array $context = []): void {
+		$this->log('info', $message, $context);
+	}
+	public function debug(string|\Stringable $message, array $context = []): void {
+		$this->log('debug', $message, $context);
+	}
 	public function log($level, string|\Stringable $message, array $context = []): void {
 		$this->records[] = [$level, (string)$message];
 	}
@@ -121,38 +144,91 @@ final class TestIndex implements IIndex {
 	private string $source = '';
 	private string $ownerId = '';
 
-	public function __construct(private string $providerId, private string $documentId, int $status = IIndex::INDEX_FULL) {
+	public function __construct(
+		private string $providerId,
+		private string $documentId,
+		int $status = IIndex::INDEX_FULL,
+	) {
 		$this->status = $status;
 	}
-	public function getProviderId(): string { return $this->providerId; }
-	public function getDocumentId(): string { return $this->documentId; }
-	public function getCollection(): string { return ''; }
-	public function setSource(string $source): IIndex { $this->source = $source; return $this; }
-	public function getSource(): string { return $this->source; }
-	public function setOwnerId(string $ownerId): IIndex { $this->ownerId = $ownerId; return $this; }
-	public function getOwnerId(): string { return $this->ownerId; }
+	public function getProviderId(): string {
+		return $this->providerId;
+	}
+	public function getDocumentId(): string {
+		return $this->documentId;
+	}
+	public function getCollection(): string {
+		return '';
+	}
+	public function setSource(string $source): IIndex {
+		$this->source = $source;
+		return $this;
+	}
+	public function getSource(): string {
+		return $this->source;
+	}
+	public function setOwnerId(string $ownerId): IIndex {
+		$this->ownerId = $ownerId;
+		return $this;
+	}
+	public function getOwnerId(): string {
+		return $this->ownerId;
+	}
 	public function setStatus(int $status, bool $reset = false): IIndex {
 		$this->status = $reset ? $status : ($this->status | $status);
 		return $this;
 	}
-	public function getStatus(): int { return $this->status; }
-	public function isStatus(int $status): bool { return (bool)($status & $this->status); }
-	public function unsetStatus(int $status): IIndex { $this->status &= ~$status; return $this; }
-	public function addOption(string $option, string $value): IIndex { $this->options[$option] = $value; return $this; }
-	public function addOptionInt(string $option, int $value): IIndex { $this->options[$option] = $value; return $this; }
-	public function getOption(string $option, string $default = ''): string { return (string)($this->options[$option] ?? $default); }
-	public function getOptionInt(string $option, int $default = 0): int { return (int)($this->options[$option] ?? $default); }
-	public function getOptions(): array { return $this->options; }
+	public function getStatus(): int {
+		return $this->status;
+	}
+	public function isStatus(int $status): bool {
+		return (bool)($status & $this->status);
+	}
+	public function unsetStatus(int $status): IIndex {
+		$this->status &= ~$status;
+		return $this;
+	}
+	public function addOption(string $option, string $value): IIndex {
+		$this->options[$option] = $value;
+		return $this;
+	}
+	public function addOptionInt(string $option, int $value): IIndex {
+		$this->options[$option] = $value;
+		return $this;
+	}
+	public function getOption(string $option, string $default = ''): string {
+		return (string)($this->options[$option] ?? $default);
+	}
+	public function getOptionInt(string $option, int $default = 0): int {
+		return (int)($this->options[$option] ?? $default);
+	}
+	public function getOptions(): array {
+		return $this->options;
+	}
 	public function addError(string $message, string $exception = '', int $sev = self::ERROR_SEV_3): IIndex {
 		$this->errors[] = $message;
 		return $this;
 	}
-	public function getErrorCount(): int { return count($this->errors); }
-	public function getErrors(): array { return $this->errors; }
-	public function resetErrors(): IIndex { $this->errors = []; return $this; }
-	public function setLastIndex(int $lastIndex = -1): IIndex { $this->lastIndex = $lastIndex === -1 ? time() : $lastIndex; return $this; }
-	public function getLastIndex(): int { return $this->lastIndex; }
-	public function jsonSerialize(): array { return []; }
+	public function getErrorCount(): int {
+		return count($this->errors);
+	}
+	public function getErrors(): array {
+		return $this->errors;
+	}
+	public function resetErrors(): IIndex {
+		$this->errors = [];
+		return $this;
+	}
+	public function setLastIndex(int $lastIndex = -1): IIndex {
+		$this->lastIndex = $lastIndex === -1 ? time() : $lastIndex;
+		return $this;
+	}
+	public function getLastIndex(): int {
+		return $this->lastIndex;
+	}
+	public function jsonSerialize(): array {
+		return [];
+	}
 }
 
 /**

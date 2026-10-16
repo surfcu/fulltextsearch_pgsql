@@ -1,4 +1,5 @@
 <?php
+
 // Minimal PSR-3 stub for static analysis. Nextcloud ships psr/log.
 
 namespace Psr\Log;

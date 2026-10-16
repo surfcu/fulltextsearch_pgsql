@@ -7,8 +7,8 @@ namespace OCA\FullTextSearch_PgSql\Service;
 use OCA\FullTextSearch_PgSql\Model\ExtractedContent;
 use OCA\FullTextSearch_PgSql\Vendor\Smalot\PdfParser\Config as PdfParserConfig;
 use OCA\FullTextSearch_PgSql\Vendor\Smalot\PdfParser\Parser as PdfParser;
-use Throwable;
 use OCP\FullTextSearch\Model\IIndexDocument;
+use Throwable;
 use ZipArchive;
 
 /**
@@ -173,7 +173,7 @@ class ContentExtractor {
 
 	/**
 	 * @return array{0: ExtractedContent, 1: bool} the result, and whether pdftotext actually ran
-	 *                                            (false: worth trying the bundled parser)
+	 *                                             (false: worth trying the bundled parser)
 	 */
 	private function extractPdfWithPdfToText(string $binary, string $raw): array {
 		[$output, $failure, $timedOut] = $this->runTool('pdftotext', [$binary, '-q', '-enc', 'UTF-8', '{file}', '-'], $raw, self::PDF_TIMEOUT_SECONDS);
@@ -266,7 +266,7 @@ class ContentExtractor {
 	 *
 	 * @param list<string> $command
 	 * @return array{0: string, 1: ?string, 2: bool} output, failure message (the tool did not
-	 *                                              run, or failed with no output), timed out
+	 *                                               run, or failed with no output), timed out
 	 */
 	private function runTool(string $label, array $command, string $raw, int $timeout): array {
 		$tmp = tempnam(sys_get_temp_dir(), 'ftspg');
