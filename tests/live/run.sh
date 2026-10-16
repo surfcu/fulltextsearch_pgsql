@@ -166,6 +166,36 @@ fi
 expect admin 'capybara'     'brosur.pdf'             # PDF via the bundled parser
 occ fulltextsearch_pgsql:configure '{"pdf_extractor":"auto"}' >/dev/null
 
+step "Several languages, Office 97–2003 and real-world docx"
+occ fulltextsearch_pgsql:configure '{"language":"turkish,english"}' >/dev/null
+cp apps/fulltextsearch_pgsql/tests/fixtures/testWORD.doc "$files/eski.doc"
+python3 - "$files" <<'PY'
+import sys, os, zipfile
+d = sys.argv[1]
+with open(os.path.join(d, "studies.txt"), "w", encoding="utf-8") as f:
+    f.write("The studies were published by the board and they are available to all of the staff in the archive.\n")
+w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+with zipfile.ZipFile(os.path.join(d, "mudurluk.docx"), "w") as z:
+    z.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+    # One word in two runs, as Word writes it after a spelling check or a partial edit.
+    z.writestr("word/document.xml", f'<w:document {w}><w:body><w:p><w:r><w:t xml:space="preserve">Bu yıl </w:t></w:r>'
+               '<w:r><w:t>Okul</w:t></w:r><w:proofErr w:type="spellStart"/><w:r><w:rPr><w:b/></w:rPr><w:t>müdürlüğü</w:t></w:r>'
+               '<w:r><w:t xml:space="preserve"> ve öğretmenler için çok önemli bir karar verdi.</w:t></w:r></w:p></w:body></w:document>')
+PY
+occ files:scan admin >/dev/null
+if ! occ fulltextsearch:index --no-readline > /tmp/ftspg-index3.log 2>&1; then
+	echo "FAIL  occ fulltextsearch:index (languages)"
+	tr -d '\033' < /tmp/ftspg-index3.log | tail -n 40
+	exit 1
+fi
+langs=$(psql -d nextcloud -tAc "SELECT document_id || '=' || config FROM ftspg_oc_index ORDER BY 1" | tr '\n' ' ')
+echo "      languages: $langs"
+expect admin 'study'          'studies.txt'          # English stemming, detected per document
+expect admin 'çalışma'        'Toplantı Notları.txt' # Turkish documents still found
+expect admin 'subtitle'       'eski.doc'             # Word 97–2003 via catdoc
+expect admin 'okulmüdürlüğü'  'mudurluk.docx'        # a word split across runs
+occ fulltextsearch_pgsql:configure '{"language":"turkish"}' >/dev/null
+
 step "Upgrade path: repair step is idempotent"
 occ maintenance:repair >/dev/null
 expect admin 'hippopotamus' 'rapor_2025_final.docx'

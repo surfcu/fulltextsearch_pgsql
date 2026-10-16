@@ -209,6 +209,17 @@ class SchemaService {
 		$this->db->executeStatement('TRUNCATE ' . $this->getTableName() . ', ' . $this->getWordsTableName());
 	}
 
+	/** @return array<string, int> language (regconfig) => documents indexed in it */
+	public function countDocumentsByLanguage(): array {
+		$result = $this->db->executeQuery('SELECT config::text AS language, count(*) AS documents FROM ' . $this->getTableName() . ' GROUP BY config ORDER BY count(*) DESC');
+		$counts = [];
+		foreach ($result->fetchAll() as $row) {
+			$counts[(string)$row['language']] = (int)$row['documents'];
+		}
+		$result->closeCursor();
+		return $counts;
+	}
+
 	public function countDocuments(): int {
 		$result = $this->db->executeQuery('SELECT count(*) FROM ' . $this->getTableName());
 		$count = (int)$result->fetchOne();

@@ -35,25 +35,39 @@ class SearchService {
 		$providerId = $result->getProvider()->getId();
 
 		$viewerTokens = AccessTokens::forViewer($access);
-		$language = $this->configService->getLanguage();
+		$languages = $this->configService->getLanguages();
+		$search = $request->getSearch();
+
 		$alternatives = [];
 		if ($this->configService->useTypoCorrection()) {
-			$alternatives = $this->vocabulary->alternatives(
-				$this->queryBuilder->searchWords($request->getSearch(), $language),
-				$this->fuzzyAvailable()
-			);
+			// Words as each language tokenizes them (Turkish lowercases I to ı), looked up once.
+			$words = [];
+			foreach ($languages as $language) {
+				array_push($words, ...$this->queryBuilder->searchWords($search, $language));
+			}
+			$alternatives = $this->vocabulary->alternatives(array_values(array_unique($words)), $this->fuzzyAvailable());
 		}
-		$query = $this->queryBuilder->build($request->getSearch(), $language, $this->fuzzyAvailable(), $alternatives);
-		if ($viewerTokens === [] || $query === null) {
+
+		/** @var array<string, ParsedQuery> $queries */
+		$queries = [];
+		foreach ($languages as $language) {
+			$query = $this->queryBuilder->build($search, $language, $this->fuzzyAvailable(), $alternatives);
+			if ($query === null) {
+				break;
+			}
+			$queries[$language] = $query;
+		}
+		if ($viewerTokens === [] || count($queries) !== count($languages)) {
 			$result->setTotal(0);
 			return;
 		}
+		$query = $queries[$languages[0]];
 
 		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
 		$page = max(1, $request->getPage());
 		[$filterSql, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
 
-		$rows = $this->fullTextSearch($query, $filterSql, $filterParams, $size, ($page - 1) * $size);
+		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $size, ($page - 1) * $size);
 		if ($rows === [] && $page === 1 && $this->fuzzyAvailable() && $query->plainText !== '') {
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
 			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size);
@@ -151,26 +165,70 @@ class SearchService {
 	}
 
 	/**
+	 * One branch per configured language, each restricted to the documents indexed in it,
+	 * so a document is matched, ranked and excerpted with its own language's stemming.
+	 * Documents indexed in a language no longer configured go with the fallback (first)
+	 * language, as they did before multi-language support. Every branch keeps
+	 * `d.tsv @@ …`, so PostgreSQL still answers each one from the GIN index.
+	 *
+	 * @param non-empty-array<string, ParsedQuery> $queries language => compiled query, fallback first
 	 * @param list<string> $filterParams
 	 * @return list<array<string, mixed>>
 	 */
-	private function fullTextSearch(ParsedQuery $query, string $filterSql, array $filterParams, int $limit, int $offset): array {
+	private function fullTextSearch(array $queries, string $filterSql, array $filterParams, int $limit, int $offset): array {
 		$t = $this->schemaService->getTableName();
+		$languages = array_keys($queries);
+		$others = array_slice($languages, 1);
+
+		// Which rows a branch applies to: one condition per language, in $languages order.
+		$conditions = [];
+		foreach ($languages as $i => $language) {
+			$conditions[] = $i === 0
+				? ($others === [] ? ['TRUE', []] : ['d.config <> ALL (CAST(? AS regconfig[]))', ['{' . implode(',', $others) . '}']])
+				: ['d.config = CAST(? AS regconfig)', [$language]];
+		}
+
+		$rankColumns = [];
+		$rankParams = [];
+		$match = [];
+		$matchParams = [];
+		$all = [];
+		$allParams = [];
+		$rankCase = [];
+		$rankCaseParams = [];
+		foreach (array_values($queries) as $i => $query) {
+			[$condition, $conditionParams] = $conditions[$i];
+			$rankColumns[] = "{$query->rankSql} AS r$i";
+			array_push($rankParams, ...$query->rankParams);
+			$match[] = "($condition AND {$query->sql})";
+			array_push($matchParams, ...$conditionParams, ...$query->params);
+			$all[] = "($condition AND {$query->allSql})";
+			array_push($allParams, ...$conditionParams, ...$query->allParams);
+			if ($i > 0) {
+				$rankCase[] = "WHEN $condition THEN q.r$i";
+				array_push($rankCaseParams, ...$conditionParams);
+			}
+		}
+		$rankQuery = $rankCase === [] ? 'q.r0' : 'CASE ' . implode(' ', $rankCase) . ' ELSE q.r0 END';
+		$matchSql = count($match) === 1 ? $match[0] : '(' . implode(' OR ', $match) . ')';
+		$allSql = count($all) === 1 ? $all[0] : '(' . implode(' OR ', $all) . ')';
+		$rankColumnsSql = implode(', ', $rankColumns);
+
 		// The inner query filters, ranks and pages; ts_headline (expensive) only runs on the page.
 		// Documents containing every search term come first, then partial (OR) matches.
 		$sql = <<<SQL
-			WITH q AS (SELECT {$query->rankSql} AS rank_query)
+			WITH q AS (SELECT $rankColumnsSql)
 			SELECT m.document_id, m.title, m.source, m.hash, m.modified_time, m.rank, m.total,
 				   ts_headline(m.config, m.body, m.rank_query, ?) AS excerpt
 			FROM (
 				SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config,
 					   CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END AS body,
-					   q.rank_query,
-					   ({$query->allSql}) AS all_match,
-					   ts_rank_cd(d.tsv, q.rank_query, 32) AS rank,
+					   $rankQuery AS rank_query,
+					   $allSql AS all_match,
+					   ts_rank_cd(d.tsv, $rankQuery, 32) AS rank,
 					   count(*) OVER () AS total
 				FROM $t d, q
-				WHERE {$query->sql} AND $filterSql
+				WHERE $matchSql AND $filterSql
 				ORDER BY all_match DESC, rank DESC, d.modified_time DESC, d.id
 				LIMIT ? OFFSET ?
 			) m
@@ -178,7 +236,8 @@ class SearchService {
 			SQL;
 
 		$params = array_merge(
-			$query->rankParams, [self::HEADLINE_OPTIONS], $query->allParams, $query->params,
+			$rankParams, [self::HEADLINE_OPTIONS],
+			$rankCaseParams, $allParams, $rankCaseParams, $matchParams,
 			$filterParams, [(string)$limit, (string)$offset]
 		);
 		$result = $this->db->executeQuery($sql, $params);

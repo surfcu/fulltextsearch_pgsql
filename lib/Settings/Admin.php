@@ -38,15 +38,20 @@ class Admin implements ISettings {
 			$languages = [];
 		}
 		$config = $this->configService->getConfig();
-		if (!in_array($config[ConfigService::LANGUAGE], $languages, true)) {
-			// Keep the stored value selectable even if the server stopped offering it.
-			$languages[] = $config[ConfigService::LANGUAGE];
+		$selected = $this->configService->getLanguages();
+		foreach ($selected as $language) {
+			if (!in_array($language, $languages, true)) {
+				// Keep a stored value selectable even if the server stopped offering it.
+				$languages[] = $language;
+			}
 		}
 
 		return new TemplateResponse(Application::APP_ID, 'settings-admin', [
 			'config' => $config,
 			'defaults' => ConfigService::DEFAULTS,
 			'languages' => $languages,
+			'selectedLanguages' => $selected,
+			'maxLanguages' => ConfigService::MAX_LANGUAGES,
 			'pdfExtractors' => ConfigService::PDF_EXTRACTORS,
 			'status' => $this->statusService->getStatus(),
 			'saveUrl' => $this->urlGenerator->linkToRoute(Application::APP_ID . '.settings.save'),

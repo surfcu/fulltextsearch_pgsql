@@ -2,6 +2,7 @@
 /**
  * @var \OCP\IL10N $l
  * @var array{config: array<string, mixed>, defaults: array<string, mixed>, languages: list<string>,
+ *            selectedLanguages: non-empty-list<string>, maxLanguages: int,
  *            pdfExtractors: list<string>, status: array<string, mixed>, saveUrl: string} $_
  */
 $config = $_['config'];
@@ -18,18 +19,36 @@ $config = $_['config'];
 	<ul class="ftspg-status" aria-live="polite"></ul>
 
 	<form class="ftspg-form">
-		<h3><?php p($l->t('Language')); ?></h3>
+		<h3><?php p($l->t('Languages')); ?></h3>
+		<?php $primary = $_['selectedLanguages'][0]; ?>
 		<p class="ftspg-field">
-			<label for="ftspg-language"><?php p($l->t('Text search language')); ?></label>
-			<select id="ftspg-language" name="language">
+			<label for="ftspg-language"><?php p($l->t('Main language')); ?></label>
+			<select id="ftspg-language" data-role="primary-language">
 				<?php foreach ($_['languages'] as $language): ?>
-					<option value="<?php p($language); ?>"<?php if ($language === $config['language']): ?> selected<?php endif; ?>><?php p($language); ?></option>
+					<option value="<?php p($language); ?>"<?php if ($language === $primary): ?> selected<?php endif; ?>><?php p($language); ?></option>
 				<?php endforeach; ?>
 			</select>
 		</p>
 		<p class="settings-hint">
-			<?php p($l->t('Controls stemming and stop words. Documents keep the language they were indexed with: after a change, rebuild the index.')); ?>
+			<?php p($l->t('Used for stemming and stop words, and for documents whose language cannot be told, such as files with no text.')); ?>
 		</p>
+		<fieldset class="ftspg-languages" data-max="<?php p((string)($_['maxLanguages'] - 1)); ?>">
+			<legend><?php p($l->t('Also detect')); ?></legend>
+			<p class="settings-hint">
+				<?php p($l->t('Each document is indexed in the language it is written in, among the main language and these, and searches look in all of them. Pick only the languages your documents use: each one adds a little work to indexing and searching (at most %s).', [(string)($_['maxLanguages'] - 1)])); ?>
+			</p>
+			<div class="ftspg-language-grid">
+				<?php foreach ($_['languages'] as $language): ?>
+					<span class="ftspg-language-option">
+						<input type="checkbox" class="checkbox" id="ftspg-lang-<?php p($language); ?>" data-role="extra-language" value="<?php p($language); ?>"
+							<?php if (in_array($language, array_slice($_['selectedLanguages'], 1), true)): ?> checked<?php endif; ?>
+							<?php if ($language === $primary): ?> disabled<?php endif; ?>>
+						<label for="ftspg-lang-<?php p($language); ?>"><?php p($language); ?></label>
+					</span>
+				<?php endforeach; ?>
+			</div>
+			<input type="hidden" name="language" value="<?php p(implode(',', $_['selectedLanguages'])); ?>">
+		</fieldset>
 
 		<h3><?php p($l->t('Matching')); ?></h3>
 		<p class="ftspg-field">
@@ -84,7 +103,7 @@ foreach ($_['pdfExtractors'] as $extractor): ?>
 			<span class="ftspg-message" role="status"></span>
 		</p>
 		<p class="ftspg-reindex" hidden>
-			<?php p($l->t('The language changed. Rebuild the index so existing documents use it:')); ?>
+			<?php p($l->t('The languages changed. Rebuild the index so existing documents are indexed in theirs:')); ?>
 			<code>occ fulltextsearch:reset &amp;&amp; occ fulltextsearch:index</code>
 		</p>
 	</form>

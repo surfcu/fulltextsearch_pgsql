@@ -72,8 +72,8 @@ jobs:
           done
       - name: Bundle this app's PDF parser (composer install runs scripts/scope-pdfparser.php)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=server/apps/fulltextsearch_pgsql
-      - name: Install pdftotext
-        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Install pdftotext and catdoc
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils catdoc
       - name: Create the Nextcloud database user
         if: matrix.db == 'owner'
         env:

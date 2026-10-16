@@ -12,8 +12,9 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 - **Diacritics optional.** `calisma` finds *çalışma*, `sozlesme` finds *sözleşme*, and the other way round, from a vocabulary of every indexed word.
 - **Typo correction.** Misspelled words are corrected against the same vocabulary, including swapped letters: `recieve` finds *receive*, `rpaor` finds *rapor*. The original word is still searched too, so nothing that matched before is lost. Needs `pg_trgm`. If nothing matches at all, titles are also searched by similarity.
 - **Any language your PostgreSQL ships**, including Turkish, with correct dotted/dotless I handling (see below).
+- **Several languages at once.** With `turkish,english`, each document is indexed with the stemming of the language it is written in, detected from its stop words, and every search looks in all configured languages.
 - **Access control.** Users only see documents they own or that are shared with them, their groups, or their teams (circles).
-- **Text extraction** for plain text (UTF-8, UTF-16, legacy Windows-1254), OpenDocument and Office Open XML files (odt/ods/odp, docx/xlsx/pptx), and PDFs: with `pdftotext` when it is installed, with a bundled pure-PHP parser otherwise.
+- **Text extraction** for plain text (UTF-8, UTF-16, legacy Windows-1254), OpenDocument and Office Open XML files (odt/ods/odp, docx/xlsx/pptx and their macro-enabled and template variants), Office 97–2003 files (doc/xls/ppt) when `catdoc` is installed, and PDFs: with `pdftotext` when it is installed, with a bundled pure-PHP parser otherwise.
 - **Partial updates.** When only metadata changes (a new share, a rename), the stored text is kept instead of being re-extracted.
 
 ## Requirements
@@ -21,6 +22,7 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 - Nextcloud 29–35 running on **PostgreSQL 12 or newer**
 - The **Full Text Search** app plus at least one content provider, e.g. **Full Text Search - Files**
 - The PHP version your Nextcloud release requires (8.1+ for Nextcloud 29, 8.3+ for 35), with `zip` for office documents
+- Optional: `catdoc` for Office 97–2003 files (`apt install catdoc`; it provides `catdoc`, `xls2csv` and `catppt`). Without it, `.doc`, `.xls` and `.ppt` files are indexed by name only.
 - Recommended: `poppler-utils` for faster, more robust PDF text (`apt install poppler-utils`). Without it, a bundled parser ([smalot/pdfparser](https://github.com/smalot/pdfparser)) reads PDFs in PHP.
 - Optional: the `pg_trgm` extension for typo tolerance. Since PostgreSQL 13 it is a trusted extension and the app creates it automatically when the Nextcloud database user owns the database. Otherwise a superuser can run `CREATE EXTENSION pg_trgm;` in the Nextcloud database.
 
@@ -65,11 +67,12 @@ Administrators can change every setting in **Administration settings → Full te
 occ fulltextsearch_pgsql:configure                 # show current settings
 occ fulltextsearch_pgsql:configure --languages     # languages this PostgreSQL server supports
 occ fulltextsearch_pgsql:configure '{"language":"turkish","max_content_size":800000}'
+occ fulltextsearch_pgsql:configure '{"language":"turkish,english"}'   # several languages, first is the fallback
 ```
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `language` | `english` | PostgreSQL text search configuration used for stemming and stopwords. Must be one listed by `--languages`. Use `simple` for no stemming (mixed-language content). |
+| `language` | `english` | PostgreSQL text search configuration used for stemming and stopwords, or several separated by commas (at most 5), e.g. `turkish,english`. Each must be listed by `--languages`. With several, each document is indexed in the one it is written in and searches look in all of them; the first is used for documents whose language cannot be told. Use `simple` for no stemming at all. |
 | `use_trigram` | `true` | Substring matching in titles, spelling correction, and similarity matching on titles when a search has no results. Ignored if `pg_trgm` is unavailable. |
 | `typo_correction` | `true` | Accent variants and spelling corrections from the vocabulary of indexed words. Accent variants work without `pg_trgm`. |
 | `max_results` | `100` | Upper limit for the page size a client may request. |
@@ -88,6 +91,12 @@ occ fulltextsearch_pgsql:vocabulary            # show the number of words
 occ fulltextsearch_pgsql:vocabulary --rebuild  # rebuild from the index (about 1.5 ms per document)
 ```
 
+### Several languages
+
+With more than one language, each document's language is detected when its content is indexed: the app samples the first 2,000 characters and counts, for each configured language, the words PostgreSQL's dictionary for that language treats as stop words (*ve*, *için*, *the*, *which*, *und*…). The language with clearly the most is used; titles, file names and short texts with no stop words get the first language. When only a document's metadata changes (a new share), its language is kept.
+
+Searches run once per configured language, each against the documents indexed in it, in a single query. Pick only the languages your documents are written in: each adds a few milliseconds to indexing a document and a branch to every search.
+
 **After changing `language`, rebuild the index** so existing documents are processed with it:
 
 ```bash
@@ -105,8 +114,9 @@ A Turkish-language guide is in [docs/TURKISH.md](docs/TURKISH.md).
 | Content | How |
 |---|---|
 | Text files (txt, md, csv, code, …) | Decoded directly; UTF-8, UTF-16 with BOM, or Windows-1254 |
-| OpenDocument (odt, ods, odp) | `content.xml` |
-| Office Open XML (docx, xlsx, pptx) | Document body, headers/footers/notes, shared strings, slides and notes |
+| OpenDocument (odt, ods, odp) | `content.xml`: text, tables, notes, comments; deleted tracked changes left out |
+| Office Open XML (docx, xlsx, pptx) | Word: body, headers and footers, footnotes, comments, text boxes. Excel: cell text and numbers, formula results, sheet names, comments, text boxes. PowerPoint: slides, speaker notes, comments. SmartArt in all three. Deleted tracked changes, field codes and formulas are left out; a word split across formatting runs stays one word. At most 32 MB of each part is read. |
+| Office 97–2003 (doc, xls, ppt) | `catdoc`, `xls2csv` or `catppt` if installed. Recent PowerPoint versions save `.ppt` files `catppt` cannot always read. Password-protected files are indexed by name only. |
 | PDF | `pdftotext` if installed (60 s timeout per file), otherwise the bundled parser (files up to 64 MB, and only when `memory_limit` leaves about 12× the file size free) |
 | Scanned PDFs, images, other binaries | Title, tags and comments only; logged as a warning |
 
@@ -115,8 +125,8 @@ Which files are sent for indexing at all (size limits, external storage, etc.) i
 ## Limitations
 
 - Ranking is good but simpler than Elasticsearch's BM25; there are no synonyms or per-field boosting knobs.
-- One language per instance. Documents keep the language they were indexed with until they are reindexed.
-- No OCR, and no extraction for legacy `.doc`/`.xls`/`.ppt` binaries.
+- Each document is indexed in one language. A document mixing two languages gets the one with more stop words in its first 2,000 characters; words in the other are still found, without that language's stemming. Documents keep the language they were indexed with until they are reindexed.
+- No OCR. Office 97–2003 files need `catdoc`.
 - Excerpts are generated from at most `max_content_size` bytes of each document.
 - Corrections are applied silently: the Full Text Search interface has no place for a "did you mean …" hint.
 - Only words of three letters or more get accent variants, and four or more get spelling corrections. Spelling correction only kicks in for words that appear nowhere in the index.

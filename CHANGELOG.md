@@ -12,10 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pdf_extractor` setting: `auto` (default), `pdftotext` or `pdfparser`.
 - Admin panel in Administration settings → Full text search: every setting, plus the status of PostgreSQL, `pg_trgm`, `pdftotext`, the bundled parser and the index size. Saving warns when a language change needs a rebuild.
 - `occ fulltextsearch:check` shows `pdf_tool`, the tool PDFs currently go through.
+- Several languages: `language` takes a list such as `turkish,english` (at most 5). Each document is indexed with the stemming of the language it is written in, detected from its stop words with PostgreSQL's own dictionaries; documents with too little text get the first language. Searches look in every configured language in one query and still use the GIN index. The admin panel has a main language and the extra languages to detect, and shows documents per language. Rebuild the index after changing the languages.
+- Office 97–2003 files (`.doc`, `.xls`, `.ppt`) are indexed when the `catdoc` package is installed. Password-protected Office files are recognised and indexed by name, with a warning.
+- Office files: Excel numbers, formula results, inline strings, sheet names, comments and text boxes; Word comments and text boxes; SmartArt in Word, Excel and PowerPoint.
 
 ### Changed
 - Saving settings validates every value before storing any, so an invalid value no longer leaves the others half-applied.
 - A `pdftotext` that exits with an error and no output is reported as a failure instead of "no extractable text".
+
+### Fixed
+- Words that Word, Excel, PowerPoint or LibreOffice store in several formatting runs (after a spelling check, a partial edit or partial bold) were indexed as separate fragments, so `hippopotamus` missed a document where it had been stored as `hippo` + `potamus`. Office XML is now read node by node and only paragraph, cell and line ends separate words. Re-index office documents to benefit: `occ fulltextsearch:reset && occ fulltextsearch:index`.
+- XML entities in office documents were indexed undecoded (`R&amp;D`), and text in angle brackets extracted from office files and PDFs was mistaken for HTML and removed.
+- Deleted tracked changes, Word field codes, spreadsheet formulas and comment authors are no longer indexed. PowerPoint slides are read in presentation order with their notes after them.
+- UTF-8 text with a few damaged bytes is no longer re-read as Windows-1254, which garbled every non-ASCII character in it.
 
 ## [1.3.0] - 2026-10-03
 

@@ -19,6 +19,19 @@ occ fulltextsearch:test
 occ fulltextsearch:index
 ```
 
+## Birden fazla dil
+
+Belgeleriniz hem Türkçe hem İngilizce ise iki dili birden ayarlayın; ilk yazılan ana dildir:
+
+```bash
+occ fulltextsearch_pgsql:configure '{"language":"turkish,english"}'
+occ fulltextsearch:reset && occ fulltextsearch:index
+```
+
+Her belge, içeriğindeki *ve*, *için*, *the*, *which* gibi sık kelimelere bakılarak kendi dilinde dizinlenir ve her arama iki dilde birden yapılır. Metni olmayan ya da çok kısa belgeler (yalnızca dosya adı) ana dilde dizinlenir. Aynı ayar **Yönetim ayarları → Tam metin arama** sayfasından da yapılabilir.
+
+Eski Office dosyaları (`.doc`, `.xls`, `.ppt`) için sunucuya `catdoc` paketini kurun: `apt install catdoc`.
+
 PDF içeriklerinin de aranabilmesi için `poppler-utils` paketini kurun:
 
 ```bash

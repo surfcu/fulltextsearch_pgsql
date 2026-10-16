@@ -42,6 +42,8 @@ The framework calls the platform through `OCP\FullTextSearch\IFullTextSearchPlat
 | `Service\SearchService` | Search and `getDocument`. |
 | `Service\AccessTokens` | Encodes document access and the viewer's identity as comparable tokens. |
 | `Service\ConfigService` | Validated settings stored in app config. |
+| `Service\LanguageDetector` | Picks a document's language among the configured ones by counting each language's stop words with `ts_debug`. |
+| `Service\OfficeExtractor` | Reads ODF and OOXML parts with `XMLReader`, breaking words only at paragraph, cell and line ends. |
 | `Command\Configure` | `occ fulltextsearch_pgsql:configure`. |
 | `Migration\CreateIndexTable`, `DropIndexTable` | Repair steps run on install/upgrade and uninstall. |
 
@@ -91,7 +93,13 @@ So the table is created with raw SQL by a repair step and named `ftspg_` + prefi
 
 ### Why a generated column
 
-The search vector is always consistent with the stored text, a single `INSERT … ON CONFLICT DO UPDATE` writes a document atomically, and weights come for free. Storing `config` per row keeps old rows valid if the language setting changes, until they are reindexed.
+The search vector is always consistent with the stored text, a single `INSERT … ON CONFLICT DO UPDATE` writes a document atomically, and weights come for free. Storing `config` per row keeps old rows valid if the language setting changes, until they are reindexed, and lets each document carry its own language when several are configured.
+
+### Several languages
+
+`IndexService` asks `LanguageDetector` for the language whenever content is indexed, and leaves `config` unchanged on metadata-only updates. The detector runs one statement: `ts_debug(cfg, sample)` for each configured `cfg` over the first 2,000 characters, counting word tokens whose dictionary returned no lexeme (stop words). The winner needs at least 2 and 1.5× the runner-up; otherwise the first language is used.
+
+`SearchService` compiles the query once per language with `TsQueryBuilder` and ORs the branches, each guarded by the rows' language: `d.config = 'english' AND d.tsv @@ to_tsquery('english', …)`; the first language's branch takes `d.config <> ALL (other languages)`, which includes rows indexed in a language no longer configured. Rank queries are computed once in the `q` CTE and picked per row with a `CASE` on `d.config`, which also feeds `ts_headline`. Each branch is a GIN-indexable `@@`, so PostgreSQL combines them with a BitmapOr. With one language the SQL is the same as before.
 
 ## Indexing
 

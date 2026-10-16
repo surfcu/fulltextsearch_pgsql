@@ -19,6 +19,7 @@ use OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform;
 use OCA\FullTextSearch_PgSql\Service\ConfigService;
 use OCA\FullTextSearch_PgSql\Service\ContentExtractor;
 use OCA\FullTextSearch_PgSql\Service\IndexService;
+use OCA\FullTextSearch_PgSql\Service\LanguageDetector;
 use OCA\FullTextSearch_PgSql\Service\SchemaService;
 use OCA\FullTextSearch_PgSql\Service\SearchService;
 use OCA\FullTextSearch_PgSql\Service\TsQueryBuilder;
@@ -75,7 +76,8 @@ $schema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 'oc_']), 
 $config = new ConfigService($appConfig, $schema);
 $extractor = new ContentExtractor($config);
 $vocabulary = new VocabularyService($conn, $schema);
-$indexService = new IndexService($conn, $schema, $config, $extractor, $vocabulary, $logger);
+$detector = new LanguageDetector($conn, $config, $logger);
+$indexService = new IndexService($conn, $schema, $config, $extractor, $vocabulary, $logger, $detector);
 $searchService = new SearchService($conn, $schema, $config, new TsQueryBuilder(), $vocabulary);
 $platform = new PostgreSQLPlatform($config, $schema, $indexService, $searchService, $logger, $extractor);
 
@@ -274,7 +276,8 @@ try {
 	};
 	$docx = $makeZip([
 		'[Content_Types].xml' => '<Types/>',
-		'word/document.xml' => '<w:document><w:body><w:p><w:r><w:t>Quarterly</w:t></w:r><w:r><w:t>hippopotamus</w:t></w:r></w:p><w:p><w:t>census</w:t></w:p></w:body></w:document>',
+		// As Word writes it: the space between runs is inside a run, never implied by the boundary.
+		'word/document.xml' => '<w:document><w:body><w:p><w:r><w:t xml:space="preserve">Quarterly </w:t></w:r><w:r><w:t>hippopotamus</w:t></w:r></w:p><w:p><w:t>census</w:t></w:p></w:body></w:document>',
 	]);
 	$platform->indexDocument(doc('T3', 'alice', 'report.docx', $b64($docx), ['encoded' => IIndexDocument::ENCODED_BASE64]));
 	same(['T3'], search($platform, 'alice', 'hippopotamus')['ids'], 'docx text extracted');
@@ -287,6 +290,73 @@ try {
 	$pptx = $makeZip(['ppt/slides/slide1.xml' => '<p:sld><a:t>Armadillo</a:t></p:sld>', 'ppt/slides/slide2.xml' => '<p:sld><a:t>Pangolin</a:t></p:sld>']);
 	$platform->indexDocument(doc('T5', 'alice', 'deck.pptx', $b64($pptx), ['encoded' => IIndexDocument::ENCODED_BASE64]));
 	same(['T5'], search($platform, 'alice', 'pangolin')['ids'], 'pptx slides extracted');
+
+	section('office documents as Word, Excel, PowerPoint and LibreOffice write them');
+	$w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+	$a = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"';
+	$s = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"';
+	$o = 'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/"';
+	$office = function (string $id, string $name, array $files) use ($platform, $makeZip, $b64): void {
+		$platform->indexDocument(doc($id, 'alice', $name, $b64($makeZip($files)), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	};
+	$office('O1', 'runs.docx', ['word/document.xml' => "<w:document $w><w:body><w:p><w:r><w:t>Okul</w:t></w:r><w:proofErr w:type=\"spellStart\"/><w:r><w:rPr><w:b/></w:rPr><w:t>müdürlüğü</w:t></w:r>"
+		. '<w:r><w:tab/><w:t>R&amp;D &lt;taslak&gt;</w:t></w:r></w:p>'
+		. '<w:p><w:del><w:r><w:delText>silinmişkelime</w:delText></w:r></w:del><w:r><w:instrText> HYPERLINK "http://x" </w:instrText></w:r><w:r><w:t>kalan</w:t></w:r></w:p></w:body></w:document>',
+		'word/comments.xml' => "<w:comments $w><w:comment w:author=\"Ayşe\"><w:p><w:r><w:t>Gözden geçirildi zeplin</w:t></w:r></w:p></w:comment></w:comments>"]);
+	same(['O1'], search($platform, 'alice', 'okulmüdürlüğü')['ids'], 'docx: a word split across runs is one word');
+	same([], search($platform, 'alice', 'müdürlüğü')['ids'], 'docx: no break inserted between runs');
+	same(['O1'], search($platform, 'alice', 'zeplin')['ids'], 'docx: comments indexed');
+	same([], search($platform, 'alice', 'silinmişkelime')['ids'], 'docx: deleted tracked changes left out');
+	same([], search($platform, 'alice', 'hyperlink')['ids'], 'docx: field codes left out');
+	$stored = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'O1'")->fetchOne();
+	check(str_contains($stored, 'R&D <taslak>'), "docx: entities decoded, angle brackets kept as text ($stored)");
+
+	$office('O2', 'butce.xlsx', [
+		'xl/workbook.xml' => "<workbook $s><sheets><sheet name=\"Gelirler 2025\" sheetId=\"1\"/></sheets></workbook>",
+		'xl/sharedStrings.xml' => "<sst $s><si><t>Fatura</t></si><si><r><t>Bütçe</t></r><r><rPr><b/></rPr><t>lendirme</t></r><rPh><t>ignored-phonetic</t></rPh></si></sst>",
+		'xl/worksheets/sheet1.xml' => "<worksheet $s><sheetData><row><c t=\"s\"><v>0</v></c><c><v>4711</v></c><c><f>SUM(A1:A9)</f><v>98765</v></c>"
+			. '<c t="inlineStr"><is><t>Satır içi kunduz</t></is></c><c t="b"><v>1</v></c></row></sheetData></worksheet>',
+		'xl/comments1.xml' => "<comments $s><authors><author>Mehmet</author></authors><commentList><comment ref=\"A1\"><text><t>Kontrol edildi</t></text></comment></commentList></comments>",
+	]);
+	same(['O2'], search($platform, 'alice', 'gelirler')['ids'], 'xlsx: sheet names indexed');
+	same(['O2'], search($platform, 'alice', 'bütçelendirme')['ids'], 'xlsx: rich text runs are one word');
+	same(['O2'], search($platform, 'alice', '4711')['ids'], 'xlsx: numbers in cells indexed');
+	same(['O2'], search($platform, 'alice', '98765')['ids'], 'xlsx: formula results indexed');
+	same([], search($platform, 'alice', 'sum')['ids'], 'xlsx: formulas left out');
+	same(['O2'], search($platform, 'alice', 'kunduz')['ids'], 'xlsx: inline strings indexed');
+	same(['O2'], search($platform, 'alice', 'kontrol')['ids'], 'xlsx: comments indexed');
+	same([], search($platform, 'alice', 'mehmet')['ids'], 'xlsx: comment authors left out');
+	same([], search($platform, 'alice', 'ignored-phonetic')['ids'], 'xlsx: phonetic guides left out');
+
+	$office('O3', 'sunum.pptx', [
+		'ppt/slides/slide10.xml' => "<p:sld $a><a:p><a:r><a:t>Onuncu</a:t></a:r></a:p></p:sld>",
+		'ppt/slides/slide2.xml' => "<p:sld $a><a:p><a:r><a:t>Kaplum</a:t></a:r><a:r><a:rPr b=\"1\"/><a:t>bağa</a:t></a:r></a:p></p:sld>",
+		'ppt/notesSlides/notesSlide2.xml' => "<p:notes $a><a:p><a:r><a:t>Konuşmacı notu albatros</a:t></a:r></a:p></p:notes>",
+	]);
+	same(['O3'], search($platform, 'alice', 'kaplumbağa')['ids'], 'pptx: a word split across runs is one word');
+	same(['O3'], search($platform, 'alice', 'albatros')['ids'], 'pptx: speaker notes indexed');
+	$content = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'O3'")->fetchOne();
+	check(strpos($content, 'Kaplumbağa') < strpos($content, 'Onuncu'), 'pptx: slides in presentation order (2 before 10)');
+
+	$office('O4', 'not.odt', ['mimetype' => 'application/vnd.oasis.opendocument.text', 'content.xml' => "<office:document-content $o><office:body><office:text>"
+		. '<text:p>Gergedan<text:span>lar</text:span><text:s/>görüldü</text:p>'
+		. '<text:tracked-changes><text:changed-region><text:deletion><text:p>eskimetin</text:p></text:deletion></text:changed-region></text:tracked-changes>'
+		. '<text:p><office:annotation><dc:creator>Zeynep</dc:creator><dc:date>2025-01-01</dc:date><text:p>Yorum pelikan</text:p></office:annotation>son</text:p>'
+		. '</office:text></office:body></office:document-content>']);
+	same(['O4'], search($platform, 'alice', 'gergedanlar')['ids'], 'odt: a word split by a span is one word');
+	same(['O4'], search($platform, 'alice', 'görüldü')['ids'], 'odt: <text:s/> separates words');
+	same(['O4'], search($platform, 'alice', 'pelikan')['ids'], 'odt: annotations indexed');
+	same([], search($platform, 'alice', 'eskimetin')['ids'], 'odt: deleted tracked changes left out');
+	same([], search($platform, 'alice', 'zeynep')['ids'], 'odt: annotation author left out');
+
+	$office('O5', 'macro.docm', ['word/document.xml' => "<w:document $w><w:body><w:p><w:r><w:t>Makro okapi</w:t></w:r></w:p></w:body></w:document>", 'word/vbaProject.bin' => 'binary']);
+	same(['O5'], search($platform, 'alice', 'okapi')['ids'], 'docm: macro-enabled files indexed like docx');
+
+	$runnerLog = [];
+	// A part cut off mid-element (damaged file, or one over the 32 MB read limit).
+	$office('O6', 'kesik.docx', ['word/document.xml' => "<w:document $w><w:body><w:p><w:r><w:t>Kesik metin yarasa</w:t></w:r></w:p>"
+		. str_repeat('<w:p><w:r><w:t>dolgu paragrafı</w:t></w:r></w:p>', 200) . '<w:p><w:r><w:t>devam']);
+	same(['O6'], search($platform, 'alice', 'yarasa')['ids'], 'truncated XML: text before the break is kept');
 
 	$platform->indexDocument(doc('T6', 'alice', 'photo.jpg', $b64("\xFF\xD8\xFF\xE0\0\x10JFIF\0\x01binary\0\0\x9a"), ['encoded' => IIndexDocument::ENCODED_BASE64]));
 	same('warning', $runnerLog['T6'][0] ?? '', 'binary file: indexed with a warning');
@@ -376,6 +446,37 @@ try {
 	} catch (\InvalidArgumentException $e) {
 		check(str_contains($e->getMessage(), 'auto, pdftotext, pdfparser'), 'unknown pdf_extractor rejected');
 	}
+
+	section('Office 97–2003 files (catdoc, xls2csv, catppt)');
+	$fixture = static fn (string $name): string => (string)file_get_contents(__DIR__ . '/fixtures/' . $name);
+	same('doc', $extractor->legacyOfficeKind($fixture('testWORD.doc')), 'doc recognised by its WordDocument stream');
+	same('xls', $extractor->legacyOfficeKind($fixture('testEXCEL.xls')), 'xls recognised by its Workbook stream');
+	same('ppt', $extractor->legacyOfficeKind($fixture('testPPT.ppt')), 'ppt recognised by its PowerPoint Document stream');
+	$hasCatdoc = $extractor->findCatdoc() !== null;
+	foreach ([['L1', 'testWORD.doc', 'subtitle'], ['L2', 'testEXCEL.xls', 'squares'], ['L3', 'testPPT.ppt', 'presentation']] as [$id, $file, $word]) {
+		$runnerLog = [];
+		$platform->indexDocument(doc($id, 'alice', 'legacy ' . $id, $b64($fixture($file)), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+		if ($hasCatdoc) {
+			same([$id], search($platform, 'alice', $word)['ids'], "$file: text extracted");
+		} else {
+			check(str_contains($runnerLog[$id][1] ?? '', 'install catdoc'), "$file without catdoc: warning names the package");
+		}
+	}
+	if ($hasCatdoc) {
+		$content = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'L2'")->fetchOne();
+		check(str_contains($content, 'Number Square') && !str_contains($content, '"'), 'xls: CSV quoting removed, values kept');
+	}
+	$ole = "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1" . str_repeat("\0", 504);
+	$runnerLog = [];
+	$platform->indexDocument(doc('L4', 'alice', 'locked.docx', $b64($ole . mb_convert_encoding('EncryptedPackage', 'UTF-16LE', 'ASCII')), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	check(str_contains($runnerLog['L4'][1] ?? '', 'password-protected'), 'password-protected Office file: warning says so');
+	$runnerLog = [];
+	$platform->indexDocument(doc('L5', 'alice', 'mail.msg', $b64($ole . mb_convert_encoding('__substg1.0_0037001F', 'UTF-16LE', 'ASCII')), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	check(str_contains($runnerLog['L5'][1] ?? '', 'unsupported format'), 'other compound files: indexed without content');
+
+	$platform->indexDocument(doc('T9', 'alice', 'notes.txt', $b64("Yıllık çalışma raporu: gelir, gider, bütçe \xFF\xFE damaged ğüşiöç"), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	$content = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'T9'")->fetchOne();
+	check(str_contains($content, 'çalışma raporu') && str_contains($content, 'ğüşiöç'), "UTF-8 text with a damaged byte stays UTF-8 ($content)");
 
 	$platform->indexDocument(doc('T8', 'alice', "nul\0title", "nul\0byte and \xC3\x28 invalid utf8 walrus"));
 	same(['T8'], search($platform, 'alice', 'walrus')['ids'], 'NUL bytes and invalid UTF-8 do not break indexing');
@@ -609,6 +710,53 @@ try {
 	check(in_array("{$t}_title_search_trgm_idx", $indexes, true) && !in_array("{$t}_title_trgm_idx", $indexes, true), 'old trigram index replaced');
 	$platform->initializeIndex();
 	check(true, 'upgrade is idempotent');
+
+	section('several languages: detected per document, all searched');
+	same(true, $config->setConfig(['language' => 'Turkish, english, turkish']), 'language list accepted (trimmed, lowercased, deduplicated); change reported');
+	same(['turkish', 'english'], $config->getLanguages(), 'fallback first, order kept');
+	same('turkish,english', $config->getConfig()['language'], 'stored as a comma-separated list');
+	same(false, $config->setConfig(['language' => ['turkish', 'english']]), 'an array is accepted too; same list is no change');
+	foreach (['klingon' => 'Unsupported language "klingon"', '' => 'at least one', 'english,german,french,spanish,italian,dutch' => 'at most 5'] as $bad => $why) {
+		try {
+			$config->setConfig(['language' => $bad]);
+			check(false, "rejected: '$bad'");
+		} catch (\InvalidArgumentException $e) {
+			check(str_contains($e->getMessage(), $why), "rejected: '$bad' ($why)");
+		}
+	}
+	same(['turkish', 'english'], $config->getLanguages(), 'a rejected list leaves the setting unchanged');
+
+	$platform->indexDocument(doc('M1', 'alice', 'Annual review', 'The studies were published by the board and they are available to all of the staff in the archive.'));
+	$platform->indexDocument(doc('M2', 'alice', 'Yıllık rapor', 'Bu yılki kitapları ve dergileri kütüphaneye verdik, çünkü öğrenciler için çok önemli ve gerekli.'));
+	$platform->indexDocument(doc('M3', 'alice', 'Rapor 2025', ''));
+	$platform->indexDocument(doc('M4', 'alice', 'Bericht', 'Die Berichte wurden veröffentlicht und der Vorstand hat sie genehmigt, aber nicht alle.'));
+	$configOf = static fn (string $id): string => (string)$conn->executeQuery("SELECT config::text FROM ftspg_oc_index WHERE document_id = ?", [$id])->fetchOne();
+	same('english', $configOf('M1'), 'English text detected as english');
+	same('turkish', $configOf('M2'), 'Turkish text detected as turkish');
+	same('turkish', $configOf('M3'), 'no text to tell from: fallback language');
+	same('turkish', $configOf('M4'), 'a language not configured (German): fallback language');
+	same(['M1'], search($platform, 'alice', 'study')['ids'], 'English stemming for the English document (study finds studies)');
+	same(['M2'], search($platform, 'alice', 'kitaplarımız')['ids'], 'Turkish stemming for the Turkish document (kitaplarımız finds kitapları)');
+	same(['M2'], search($platform, 'alice', 'DERGİLERİ')['ids'], 'Turkish casing still applies to Turkish documents (İ is i)');
+	same(['M1'], search($platform, 'alice', '+studies +archive')['ids'], 'required terms in the English branch');
+	same([], search($platform, 'alice', 'studies -archive')['ids'], 'exclusions in the English branch');
+	same(['M2'], search($platform, 'alice', '"kütüphaneye verdik"')['ids'], 'phrases in the Turkish branch');
+
+	// Only metadata changed (a share): the content is not sent again, the language stays.
+	$platform->indexDocument(doc('M1', 'alice', 'Annual review', '', ['users' => ['bob']], 'files', IIndex::INDEX_META));
+	same('english', $configOf('M1'), 'metadata-only update keeps the detected language');
+	same(['M1'], search($platform, 'bob', 'study')['ids'], 'and the document is still found with its stemming');
+
+	$conn->executeStatement('SET enable_seqscan = off');
+	$plan = implode("\n", array_column($conn->executeQuery(
+		"EXPLAIN SELECT id FROM ftspg_oc_index d WHERE ((d.config <> ALL ('{english}'::regconfig[]) AND d.tsv @@ to_tsquery('turkish', 'kitap:*'))"
+		. " OR (d.config = 'english'::regconfig AND d.tsv @@ to_tsquery('english', 'study:*'))) AND d.access && '{u:alice}'::text[]"
+	)->fetchAll(), 'QUERY PLAN'));
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') || str_contains($plan, 'ftspg_oc_index_access_idx'), 'two-language search still uses the GIN index');
+	$conn->executeStatement('SET enable_seqscan = on');
+
+	$platform->deleteIndexes(array_map(static fn (string $id) => new TestIndex('files', $id), ['M1', 'M2', 'M3', 'M4']));
+	$config->setConfig(['language' => 'turkish']);
 
 	section('query plan uses the indexes');
 	$conn->executeStatement('SET enable_seqscan = off');

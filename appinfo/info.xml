@@ -10,9 +10,9 @@
 - Prefix matching while typing, "exact phrases", -exclusions and OR
 - Typo correction and search without diacritics ("calisma" finds "çalışma")
 - Substring matching in titles and file names split into words
-- Every text search language your PostgreSQL server ships, including Turkish
+- Every text search language your PostgreSQL server ships, including Turkish, and several at once: each document is indexed in its own language
 - Respects ownership and shares to users, groups and teams
-- Text extraction for plain text, OpenDocument and Office files, and PDFs (pdftotext when installed, a built-in parser otherwise)
+- Text extraction for plain text, OpenDocument and Office files (including Office 97–2003 with catdoc), and PDFs (pdftotext when installed, a built-in parser otherwise)
 - Settings and status in Administration settings → Full text search, or with occ
 
 Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
