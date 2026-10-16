@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- PDFs are read without `pdftotext`: a bundled copy of smalot/pdfparser (LGPL-3.0, pure PHP) takes over when `pdftotext` is not installed or fails to run. It is namespaced under the app so it cannot clash with another app's copy. Files over 64 MB, or too big for the free `memory_limit`, are still indexed by name only, with a warning that says why.
+- `pdf_extractor` setting: `auto` (default), `pdftotext` or `pdfparser`.
+- Admin panel in Administration settings → Full text search: every setting, plus the status of PostgreSQL, `pg_trgm`, `pdftotext`, the bundled parser and the index size. Saving warns when a language change needs a rebuild.
+- `occ fulltextsearch:check` shows `pdf_tool`, the tool PDFs currently go through.
+
+### Changed
+- Saving settings validates every value before storing any, so an invalid value no longer leaves the others half-applied.
+- A `pdftotext` that exits with an error and no output is reported as a failure instead of "no extractable text".
+
 ## [1.3.0] - 2026-10-03
 
 ### Added

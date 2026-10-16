@@ -22,6 +22,10 @@ class ConfigService {
 	public const MAX_RESULTS = 'max_results';
 	public const MAX_CONTENT_SIZE = 'max_content_size';
 	public const PDFTOTEXT_PATH = 'pdftotext_path';
+	public const PDF_EXTRACTOR = 'pdf_extractor';
+
+	/** auto: pdftotext when installed, else the bundled parser. */
+	public const PDF_EXTRACTORS = ['auto', 'pdftotext', 'pdfparser'];
 
 	public const DEFAULTS = [
 		self::LANGUAGE => 'english',
@@ -33,6 +37,7 @@ class ConfigService {
 		self::MAX_CONTENT_SIZE => 512000,
 		// Empty means "look for pdftotext on PATH".
 		self::PDFTOTEXT_PATH => '',
+		self::PDF_EXTRACTOR => 'auto',
 	];
 
 	public function __construct(
@@ -49,11 +54,13 @@ class ConfigService {
 			self::MAX_RESULTS => $this->getMaxResults(),
 			self::MAX_CONTENT_SIZE => $this->getMaxContentSize(),
 			self::PDFTOTEXT_PATH => $this->getPdfToTextPath(),
+			self::PDF_EXTRACTOR => $this->getPdfExtractor(),
 		];
 	}
 
 	/**
-	 * Validate and store settings. Unknown keys are rejected.
+	 * Validate and store settings. Unknown keys are rejected. Every value is checked before
+	 * any is written, so an invalid one leaves all settings unchanged.
 	 *
 	 * @return bool true when the language changed (existing documents need reindexing)
 	 * @throws InvalidArgumentException
@@ -64,7 +71,10 @@ class ConfigService {
 			throw new InvalidArgumentException('Unknown setting(s): ' . implode(', ', $unknown));
 		}
 
+		/** @var list<callable(): void> $writes */
+		$writes = [];
 		$languageChanged = false;
+
 		if (array_key_exists(self::LANGUAGE, $config)) {
 			$language = (string)$config[self::LANGUAGE];
 			$available = $this->schemaService->getTextSearchConfigs();
@@ -75,7 +85,7 @@ class ConfigService {
 				);
 			}
 			$languageChanged = $language !== $this->getLanguage();
-			$this->appConfig->setValueString(Application::APP_ID, self::LANGUAGE, $language);
+			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::LANGUAGE, $language);
 		}
 
 		foreach ([self::USE_TRIGRAM, self::TYPO_CORRECTION] as $key) {
@@ -86,7 +96,7 @@ class ConfigService {
 			if ($value === null) {
 				throw new InvalidArgumentException($key . ' must be true or false');
 			}
-			$this->appConfig->setValueBool(Application::APP_ID, $key, $value);
+			$writes[] = fn () => $this->appConfig->setValueBool(Application::APP_ID, $key, $value);
 		}
 
 		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, 1000000]] as $key => [$min, $max]) {
@@ -97,17 +107,28 @@ class ConfigService {
 			if ($value === false) {
 				throw new InvalidArgumentException("$key must be an integer between $min and $max");
 			}
-			$this->appConfig->setValueInt(Application::APP_ID, $key, $value);
+			$writes[] = fn () => $this->appConfig->setValueInt(Application::APP_ID, $key, $value);
 		}
 
 		if (array_key_exists(self::PDFTOTEXT_PATH, $config)) {
-			$path = (string)$config[self::PDFTOTEXT_PATH];
+			$path = trim((string)$config[self::PDFTOTEXT_PATH]);
 			if ($path !== '' && !is_executable($path)) {
 				throw new InvalidArgumentException('pdftotext_path is not an executable file: ' . $path);
 			}
-			$this->appConfig->setValueString(Application::APP_ID, self::PDFTOTEXT_PATH, $path);
+			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::PDFTOTEXT_PATH, $path);
 		}
 
+		if (array_key_exists(self::PDF_EXTRACTOR, $config)) {
+			$extractor = (string)$config[self::PDF_EXTRACTOR];
+			if (!in_array($extractor, self::PDF_EXTRACTORS, true)) {
+				throw new InvalidArgumentException(self::PDF_EXTRACTOR . ' must be one of: ' . implode(', ', self::PDF_EXTRACTORS));
+			}
+			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::PDF_EXTRACTOR, $extractor);
+		}
+
+		foreach ($writes as $write) {
+			$write();
+		}
 		return $languageChanged;
 	}
 
@@ -134,5 +155,10 @@ class ConfigService {
 
 	public function getPdfToTextPath(): string {
 		return $this->appConfig->getValueString(Application::APP_ID, self::PDFTOTEXT_PATH, self::DEFAULTS[self::PDFTOTEXT_PATH]);
+	}
+
+	public function getPdfExtractor(): string {
+		$value = $this->appConfig->getValueString(Application::APP_ID, self::PDF_EXTRACTOR, self::DEFAULTS[self::PDF_EXTRACTOR]);
+		return in_array($value, self::PDF_EXTRACTORS, true) ? $value : self::DEFAULTS[self::PDF_EXTRACTOR];
 	}
 }

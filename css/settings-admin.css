@@ -1,0 +1,96 @@
+#ftspg-settings h3 {
+	margin-top: 24px;
+	font-weight: bold;
+}
+
+#ftspg-settings .ftspg-field {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px 12px;
+	margin: 8px 0;
+}
+
+#ftspg-settings .ftspg-field > label:first-child {
+	min-width: 240px;
+}
+
+#ftspg-settings select,
+#ftspg-settings input[type="text"] {
+	min-width: 300px;
+	max-width: 100%;
+}
+
+#ftspg-settings input[type="number"] {
+	width: 140px;
+}
+
+#ftspg-settings .settings-hint {
+	max-width: 720px;
+}
+
+#ftspg-settings .ftspg-status {
+	display: grid;
+	grid-template-columns: max-content 1fr;
+	gap: 4px 16px;
+	margin: 8px 0 0;
+}
+
+#ftspg-settings .ftspg-status li {
+	display: contents;
+}
+
+#ftspg-settings .ftspg-status-label {
+	color: var(--color-text-maxcontrast);
+}
+
+#ftspg-settings .ftspg-status li.ftspg-warn span:last-child {
+	color: var(--color-warning-text, var(--color-warning));
+}
+
+#ftspg-settings .ftspg-actions {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin-top: 24px;
+}
+
+#ftspg-settings .ftspg-message.ftspg-success {
+	color: var(--color-success-text, var(--color-success));
+}
+
+#ftspg-settings .ftspg-message.ftspg-error {
+	color: var(--color-error-text, var(--color-error));
+}
+
+#ftspg-settings .ftspg-reindex {
+	margin-top: 12px;
+	padding: 8px 12px;
+	border-left: 4px solid var(--color-warning);
+	background: var(--color-background-hover);
+	max-width: 720px;
+}
+
+#ftspg-settings .ftspg-reindex code {
+	display: block;
+	margin-top: 4px;
+	user-select: all;
+}
+
+@media (max-width: 600px) {
+	#ftspg-settings .ftspg-field > label:first-child,
+	#ftspg-settings select,
+	#ftspg-settings input[type="text"] {
+		min-width: 0;
+		width: 100%;
+	}
+
+	#ftspg-settings .ftspg-status {
+		grid-template-columns: 1fr;
+		gap: 0;
+	}
+
+	#ftspg-settings .ftspg-status-label {
+		margin-top: 8px;
+	}
+}

@@ -77,7 +77,7 @@ $extractor = new ContentExtractor($config);
 $vocabulary = new VocabularyService($conn, $schema);
 $indexService = new IndexService($conn, $schema, $config, $extractor, $vocabulary, $logger);
 $searchService = new SearchService($conn, $schema, $config, new TsQueryBuilder(), $vocabulary);
-$platform = new PostgreSQLPlatform($config, $schema, $indexService, $searchService, $logger);
+$platform = new PostgreSQLPlatform($config, $schema, $indexService, $searchService, $logger, $extractor);
 
 $runnerLog = [];
 $platform->setRunner(double(IRunner::class, [
@@ -299,6 +299,82 @@ try {
 		same(['T7'], search($platform, 'alice', 'quokka')['ids'], 'PDF text extracted with pdftotext');
 	} else {
 		check(str_contains($runnerLog['T7'][1] ?? '', 'pdftotext'), 'PDF without pdftotext: warning names the missing tool');
+	}
+
+	section('PDF fallback: bundled parser');
+	// A well-formed one-page PDF (with an xref table, which pdfparser needs) showing $text.
+	$makePdf = static function (string $text): string {
+		$stream = "BT /F1 18 Tf 20 40 Td ($text) Tj ET";
+		$objects = [
+			'<</Type/Catalog/Pages 2 0 R>>',
+			'<</Type/Pages/Kids[3 0 R]/Count 1>>',
+			'<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>',
+			'<</Length ' . strlen($stream) . ">>\nstream\n$stream\nendstream",
+			'<</Type/Font/Subtype/Type1/BaseFont/Helvetica/Encoding/WinAnsiEncoding>>',
+		];
+		$pdf = "%PDF-1.4\n";
+		$offsets = [];
+		foreach ($objects as $i => $object) {
+			$offsets[] = strlen($pdf);
+			$pdf .= ($i + 1) . " 0 obj\n$object\nendobj\n";
+		}
+		$xref = strlen($pdf);
+		$pdf .= "xref\n0 " . (count($objects) + 1) . "\n0000000000 65535 f \n";
+		foreach ($offsets as $offset) {
+			$pdf .= sprintf("%010d 00000 n \n", $offset);
+		}
+		return $pdf . 'trailer<</Size ' . (count($objects) + 1) . "/Root 1 0 R>>\nstartxref\n$xref\n%%EOF\n";
+	};
+	check($extractor->pdfParserAvailable(), 'bundled parser is present (scripts/scope-pdfparser.php has run)');
+	check(!class_exists('Smalot\PdfParser\Parser', false), 'the unprefixed Smalot namespace is never loaded');
+
+	$config->setConfig(['pdf_extractor' => 'pdfparser']);
+	same('pdfparser', $extractor->pdfTool(), 'pdf_extractor=pdfparser: parser reported as the tool');
+	$runnerLog = [];
+	$platform->indexDocument(doc('P1', 'alice', 'okapi.pdf', $b64($makePdf('Okapi Wombat')), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['P1'], search($platform, 'alice', 'wombat')['ids'], 'PDF text extracted with the bundled parser');
+	same('ok', $runnerLog['P1'][0] ?? null, 'bundled parser: no warning on success');
+
+	$runnerLog = [];
+	$platform->indexDocument(doc('P2', 'alice', 'broken.pdf', $b64("%PDF-1.4\ngarbage with no xref"), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	check(str_contains($runnerLog['P2'][1] ?? '', 'built-in parser could not read it'), 'unreadable PDF: warning, not an exception');
+	same(['P2'], search($platform, 'alice', 'broken')['ids'], 'unreadable PDF still findable by title');
+
+	// A damaged xref makes the parser raise PHP warnings before it gives up. They must not
+	// reach the log (the "PHP warnings and deprecations" section below fails if they do).
+	$runnerLog = [];
+	$platform->indexDocument(doc('P2b', 'alice', 'damaged.pdf', $b64(str_replace("xref\n0 ", 'xref\n0 ', $makePdf('Damaged'))), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same('warning', $runnerLog['P2b'][0] ?? null, 'damaged xref: indexed with a warning');
+
+	// A pdftotext that is installed but fails: auto falls back to the parser and says why.
+	$brokenTool = tempnam(sys_get_temp_dir(), 'ftspg-pdftotext');
+	file_put_contents($brokenTool, "#!/bin/sh\nexit 3\n");
+	chmod($brokenTool, 0755);
+	$config->setConfig(['pdf_extractor' => 'auto', 'pdftotext_path' => $brokenTool]);
+	$runnerLog = [];
+	$platform->indexDocument(doc('P3', 'alice', 'fallback.pdf', $b64($makePdf('Okapi Capybara')), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['P3'], search($platform, 'alice', 'capybara')['ids'], 'auto: failing pdftotext falls back to the parser');
+	check(str_contains($runnerLog['P3'][1] ?? '', 'pdftotext failed (exit code 3)'), 'auto: the pdftotext failure is reported');
+
+	// pdftotext forced but unusable: no silent fallback.
+	$config->setConfig(['pdf_extractor' => 'pdftotext']);
+	$runnerLog = [];
+	$platform->indexDocument(doc('P4', 'alice', 'forced.pdf', $b64($makePdf('Okapi Tapir')), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same([], search($platform, 'alice', 'tapir')['ids'], 'pdf_extractor=pdftotext: no fallback');
+	$appConfig->setValueString('fulltextsearch_pgsql', 'pdftotext_path', '/nonexistent/pdftotext');
+	same(null, $extractor->pdfTool(), 'pdf_extractor=pdftotext without pdftotext: no tool');
+	$runnerLog = [];
+	$platform->indexDocument(doc('P5', 'alice', 'missing.pdf', $b64($makePdf('Okapi')), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	check(str_contains($runnerLog['P5'][1] ?? '', 'pdftotext is selected but not found'), 'pdf_extractor=pdftotext without pdftotext: warning says so');
+	unlink($brokenTool);
+
+	$config->setConfig(['pdf_extractor' => 'auto', 'pdftotext_path' => '']);
+	same($hasPdfToText ? 'pdftotext' : 'pdfparser', $extractor->pdfTool(), 'auto: pdftotext preferred when installed');
+	try {
+		$config->setConfig(['pdf_extractor' => 'tika']);
+		check(false, 'unknown pdf_extractor rejected');
+	} catch (\InvalidArgumentException $e) {
+		check(str_contains($e->getMessage(), 'auto, pdftotext, pdfparser'), 'unknown pdf_extractor rejected');
 	}
 
 	$platform->indexDocument(doc('T8', 'alice', "nul\0title", "nul\0byte and \xC3\x28 invalid utf8 walrus"));

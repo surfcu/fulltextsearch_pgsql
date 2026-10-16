@@ -12,7 +12,8 @@
 - Substring matching in titles and file names split into words
 - Every text search language your PostgreSQL server ships, including Turkish
 - Respects ownership and shares to users, groups and teams
-- Text extraction for plain text, OpenDocument and Office files, and PDFs (with pdftotext)
+- Text extraction for plain text, OpenDocument and Office files, and PDFs (pdftotext when installed, a built-in parser otherwise)
+- Settings and status in Administration settings → Full text search, or with occ
 
 Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
     <version>1.3.0</version>
@@ -50,6 +51,10 @@ Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search a
         <command>OCA\FullTextSearch_PgSql\Command\Configure</command>
         <command>OCA\FullTextSearch_PgSql\Command\Vocabulary</command>
     </commands>
+
+    <settings>
+        <admin>OCA\FullTextSearch_PgSql\Settings\Admin</admin>
+    </settings>
 
     <fulltextsearch>
         <platform>OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform</platform>

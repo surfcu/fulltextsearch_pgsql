@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\FullTextSearch_PgSql\Platform;
 
 use OCA\FullTextSearch_PgSql\Service\ConfigService;
+use OCA\FullTextSearch_PgSql\Service\ContentExtractor;
 use OCA\FullTextSearch_PgSql\Service\IndexService;
 use OCA\FullTextSearch_PgSql\Service\SchemaService;
 use OCA\FullTextSearch_PgSql\Service\SearchService;
@@ -27,6 +28,7 @@ class PostgreSQLPlatform implements IFullTextSearchPlatform {
 		private IndexService $indexService,
 		private SearchService $searchService,
 		private LoggerInterface $logger,
+		private ContentExtractor $contentExtractor,
 	) {
 	}
 
@@ -42,6 +44,8 @@ class PostgreSQLPlatform implements IFullTextSearchPlatform {
 		$config = $this->configService->getConfig();
 		$config['table'] = $this->schemaService->getTableName();
 		$config['pg_trgm'] = $this->schemaService->isPostgres() && $this->schemaService->hasTrigram();
+		// What PDFs go through right now: pdftotext, pdfparser (bundled), or none.
+		$config['pdf_tool'] = $this->contentExtractor->pdfTool() ?? 'none';
 		return $config;
 	}
 

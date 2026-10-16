@@ -11,8 +11,12 @@
 >
     <projectFiles>
         <directory name="lib"/>
+        <ignoreFiles>
+            <directory name="lib/Vendor"/>
+        </ignoreFiles>
     </projectFiles>
     <extraFiles>
+        <directory name="lib/Vendor"/>
         <directory name="vendor/nextcloud/ocp"/>
     </extraFiles>
     <stubs>
@@ -22,6 +26,12 @@
         <file name="tests/stubs/psr-log.php"/>
     </stubs>
     <issueHandlers>
+        <!-- Raised inside OCP's own Controller::buildResponse in the Nextcloud 35 API, not in this app. -->
+        <InvalidTemplateParam>
+            <errorLevel type="suppress">
+                <directory name="vendor/nextcloud/ocp"/>
+            </errorLevel>
+        </InvalidTemplateParam>
         <UndefinedClass>
             <errorLevel type="suppress">
                 <referencedClass name="Doctrine\*"/>
