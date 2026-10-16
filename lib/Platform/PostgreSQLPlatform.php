@@ -46,6 +46,8 @@ class PostgreSQLPlatform implements IFullTextSearchPlatform {
 		$config['pg_trgm'] = $this->schemaService->isPostgres() && $this->schemaService->hasTrigram();
 		// What PDFs go through right now: pdftotext, pdfparser (bundled), or none.
 		$config['pdf_tool'] = $this->contentExtractor->pdfTool() ?? 'none';
+		// catdoc, xls2csv and catppt read Office 97–2003 files when installed.
+		$config['catdoc'] = $this->contentExtractor->findCatdoc() ?? 'none';
 		return $config;
 	}
 

@@ -74,8 +74,8 @@ jobs:
         # No lock file, so Composer resolves the dev tools too even with --no-dev; Psalm's PHP
         # limit would then fail the install on newer PHP although nothing of it gets installed.
         run: composer install --no-dev --ignore-platform-req=php --no-interaction --no-progress --working-dir=server/apps/fulltextsearch_pgsql
-      - name: Install pdftotext
-        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Install pdftotext and catdoc
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils catdoc
       - name: Create the Nextcloud database user
         if: matrix.db == 'owner'
         env:

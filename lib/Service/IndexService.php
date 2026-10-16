@@ -20,6 +20,7 @@ class IndexService {
 		private ContentExtractor $extractor,
 		private VocabularyService $vocabulary,
 		private LoggerInterface $logger,
+		private LanguageDetector $languageDetector,
 	) {
 	}
 
@@ -50,8 +51,13 @@ class IndexService {
 			}
 		}
 
+		// The language follows the content: when only metadata changed, the stored one stays.
+		$language = $updateContent
+			? $this->languageDetector->detect($content, implode(' ', $this->strings($document->getParts())), $document->getTitle())
+			: $this->configService->getLanguage();
+
 		try {
-			$this->upsert($document, $content, $updateContent, $updateParts);
+			$this->upsert($document, $content, $updateContent, $updateParts, $language);
 		} catch (Throwable $e) {
 			if ($content === '') {
 				throw $e;
@@ -62,7 +68,7 @@ class IndexService {
 				'document' => $document->getId(),
 				'exception' => $e,
 			]);
-			$this->upsert($document, '', true, $updateParts);
+			$this->upsert($document, '', true, $updateParts, $language);
 			$warnings[] = 'indexed without content: ' . $e->getMessage();
 		}
 
@@ -96,7 +102,7 @@ class IndexService {
 		);
 	}
 
-	private function upsert(IIndexDocument $document, string $content, bool $updateContent, bool $updateParts): void {
+	private function upsert(IIndexDocument $document, string $content, bool $updateContent, bool $updateParts, string $language): void {
 		$access = $document->getAccess();
 		$extractor = $this->extractor;
 
@@ -129,7 +135,7 @@ class IndexService {
 				hash = EXCLUDED.hash,
 				modified_time = EXCLUDED.modified_time,
 				indexed_at = EXCLUDED.indexed_at,
-				config = EXCLUDED.config,
+				config = CASE WHEN CAST(? AS boolean) THEN EXCLUDED.config ELSE d.config END,
 				title = EXCLUDED.title,
 				tags_text = EXCLUDED.tags_text,
 				info = EXCLUDED.info,
@@ -150,13 +156,14 @@ class IndexService {
 				$document->getHash(),
 				(string)$document->getModifiedTime(),
 				(string)time(),
-				$this->configService->getLanguage(),
+				$language,
 				$extractor->sanitize($document->getTitle()),
 				$extractor->clean(implode(' ', array_merge($tags, $metaTags))),
 				json_encode((object)$parts, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE),
 				implode(' ', $parts),
 				$content,
 				json_encode((object)$document->getInfoAll(), JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE),
+				$updateContent ? 'true' : 'false',
 				$updateParts ? 'true' : 'false',
 				$updateParts ? 'true' : 'false',
 				$updateContent ? 'true' : 'false',

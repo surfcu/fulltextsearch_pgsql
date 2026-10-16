@@ -17,10 +17,14 @@
 		const rows = [
 			[tr('Database'), status.postgres ? tr('PostgreSQL') : tr('Not PostgreSQL: this platform cannot work'), status.postgres],
 			[tr('Indexed documents'), status.documents === null ? unknown : String(status.documents), status.documents !== null],
+			[tr('Documents per language'), status.by_language && Object.keys(status.by_language).length
+				? Object.entries(status.by_language).map(([language, count]) => language + ' ' + count).join(' · ')
+				: tr('none yet'), true],
 			[tr('Vocabulary words'), status.words === null ? unknown : String(status.words), true],
 			[tr('pg_trgm extension'), status.pg_trgm ? tr('available') : tr('missing: no substring matching or spelling correction'), status.pg_trgm],
 			[tr('pdftotext'), status.pdftotext || tr('not found'), true],
 			[tr('Built-in PDF parser'), status.pdfparser ? tr('available') : tr('missing from this installation'), status.pdfparser],
+			[tr('catdoc (.doc, .xls, .ppt)'), status.catdoc || tr('not found: these files are indexed by name only'), status.catdoc !== null],
 			[tr('PDF files are read with'), {
 				pdftotext: 'pdftotext',
 				pdfparser: tr('the built-in parser'),
@@ -37,6 +41,31 @@
 			item.append(name, text)
 			return item
 		}))
+	}
+
+	/**
+	 * The "language" setting is the main language followed by the ticked extra languages.
+	 * The main language is never offered as an extra, and at most data-max extras can be on.
+	 */
+	function syncLanguages(form) {
+		const primary = form.querySelector('[data-role="primary-language"]')
+		const fieldset = form.querySelector('.ftspg-languages')
+		const hidden = form.querySelector('input[type="hidden"][name="language"]')
+		if (!primary || !fieldset || !hidden) {
+			return
+		}
+		const max = Number(fieldset.dataset.max) || 4
+		const boxes = [...fieldset.querySelectorAll('[data-role="extra-language"]')]
+		for (const box of boxes) {
+			if (box.value === primary.value) {
+				box.checked = false
+			}
+		}
+		const checked = boxes.filter((box) => box.checked)
+		for (const box of boxes) {
+			box.disabled = box.value === primary.value || (!box.checked && checked.length >= max)
+		}
+		hidden.value = [primary.value, ...checked.map((box) => box.value)].join(',')
 	}
 
 	function collect(form) {
@@ -66,6 +95,13 @@
 		const message = root.querySelector('.ftspg-message')
 		const reindex = root.querySelector('.ftspg-reindex')
 		const button = form.querySelector('button[type="submit"]')
+
+		syncLanguages(form)
+		form.addEventListener('change', (event) => {
+			if (event.target.matches('[data-role="primary-language"], [data-role="extra-language"]')) {
+				syncLanguages(form)
+			}
+		})
 
 		try {
 			renderStatus(statusList, JSON.parse(root.dataset.status))

@@ -27,7 +27,12 @@ class ConfigService {
 	/** auto: pdftotext when installed, else the bundled parser. */
 	public const PDF_EXTRACTORS = ['auto', 'pdftotext', 'pdfparser'];
 
+	/** Each extra language costs one ts_debug pass per indexed document and one query branch. */
+	public const MAX_LANGUAGES = 5;
+
 	public const DEFAULTS = [
+		// One language, or several separated by commas: the first is the fallback when a
+		// document's language cannot be told, the others are detected per document.
 		self::LANGUAGE => 'english',
 		self::USE_TRIGRAM => true,
 		// Accent variants and spelling corrections from the index vocabulary.
@@ -48,7 +53,7 @@ class ConfigService {
 
 	public function getConfig(): array {
 		return [
-			self::LANGUAGE => $this->getLanguage(),
+			self::LANGUAGE => implode(',', $this->getLanguages()),
 			self::USE_TRIGRAM => $this->useTrigram(),
 			self::TYPO_CORRECTION => $this->useTypoCorrection(),
 			self::MAX_RESULTS => $this->getMaxResults(),
@@ -76,16 +81,24 @@ class ConfigService {
 		$languageChanged = false;
 
 		if (array_key_exists(self::LANGUAGE, $config)) {
-			$language = (string)$config[self::LANGUAGE];
+			$languages = $this->parseLanguages($config[self::LANGUAGE]);
+			if ($languages === []) {
+				throw new InvalidArgumentException('language must name at least one language');
+			}
+			if (count($languages) > self::MAX_LANGUAGES) {
+				throw new InvalidArgumentException('language accepts at most ' . self::MAX_LANGUAGES . ' languages');
+			}
 			$available = $this->schemaService->getTextSearchConfigs();
-			if (!in_array($language, $available, true)) {
+			$unsupported = array_diff($languages, $available);
+			if ($unsupported !== []) {
 				throw new InvalidArgumentException(
-					'Unsupported language "' . $language . '". This PostgreSQL server supports: '
+					'Unsupported language "' . implode('", "', $unsupported) . '". This PostgreSQL server supports: '
 					. implode(', ', $available)
 				);
 			}
-			$languageChanged = $language !== $this->getLanguage();
-			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::LANGUAGE, $language);
+			$value = implode(',', $languages);
+			$languageChanged = $languages !== $this->getLanguages();
+			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::LANGUAGE, $value);
 		}
 
 		foreach ([self::USE_TRIGRAM, self::TYPO_CORRECTION] as $key) {
@@ -132,9 +145,40 @@ class ConfigService {
 		return $languageChanged;
 	}
 
-	/** PostgreSQL text search configuration (regconfig) used for new documents and queries. */
+	/**
+	 * The fallback language: the first configured PostgreSQL text search configuration.
+	 * Documents whose language cannot be told are indexed in it.
+	 */
 	public function getLanguage(): string {
-		return $this->appConfig->getValueString(Application::APP_ID, self::LANGUAGE, self::DEFAULTS[self::LANGUAGE]);
+		return $this->getLanguages()[0];
+	}
+
+	/**
+	 * Every configured language, fallback first. Search tries each of them.
+	 *
+	 * @return non-empty-list<string>
+	 */
+	public function getLanguages(): array {
+		$languages = $this->parseLanguages($this->appConfig->getValueString(Application::APP_ID, self::LANGUAGE, self::DEFAULTS[self::LANGUAGE]));
+		return $languages === [] ? [self::DEFAULTS[self::LANGUAGE]] : $languages;
+	}
+
+	/**
+	 * "turkish, english" or ["turkish", "english"] -> ['turkish', 'english']: trimmed,
+	 * lowercased, duplicates dropped, order kept.
+	 *
+	 * @return list<string>
+	 */
+	private function parseLanguages(mixed $value): array {
+		$items = is_array($value) ? $value : explode(',', (string)$value);
+		$languages = [];
+		foreach ($items as $item) {
+			$language = strtolower(trim((string)$item));
+			if ($language !== '' && !in_array($language, $languages, true)) {
+				$languages[] = $language;
+			}
+		}
+		return $languages;
 	}
 
 	public function useTrigram(): bool {

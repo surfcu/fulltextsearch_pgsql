@@ -17,22 +17,32 @@ use ZipArchive;
  * Providers such as files_fulltextsearch send the raw file base64-encoded and expect the
  * platform to extract text (Elasticsearch does it with its attachment pipeline). Here:
  *  - plain text files are decoded directly,
- *  - OpenDocument and Office Open XML files are unzipped and their XML text is read,
+ *  - OpenDocument and Office Open XML files go to OfficeExtractor,
  *  - PDFs go through `pdftotext` (poppler-utils) when it is installed, and through the
  *    bundled smalot/pdfparser otherwise (slower and hungrier, but pure PHP),
  *  - anything else is indexed without content and reported as a warning.
  */
 class ContentExtractor {
 
-	/** zip entry patterns holding the text of each format family */
-	private const ZIP_TEXT_ENTRIES = [
-		'#^content\.xml$#',                                      // OpenDocument (odt, ods, odp)
-		'#^word/(document|footnotes|endnotes|header\d*|footer\d*)\.xml$#', // docx
-		'#^xl/sharedStrings\.xml$#',                             // xlsx
-		'#^ppt/(slides/slide|notesSlides/notesSlide)\d+\.xml$#', // pptx
-	];
-
 	private const PDF_TIMEOUT_SECONDS = 60;
+	private const TOOL_TIMEOUT_SECONDS = 60;
+
+	/** Compound File (OLE2): Office 97–2003 documents, and password-protected Office files. */
+	private const OLE_SIGNATURE = "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
+
+	/**
+	 * Office 97–2003 formats, recognised by the name of their main stream in the compound
+	 * file's directory (stored as UTF-16LE). In order: a Word or PowerPoint file with an
+	 * embedded chart also contains a "Workbook" stream, so those are checked first.
+	 * Each is read with a tool from the catdoc package.
+	 *
+	 * @var array<string, array{streams: list<string>, tool: string, args: list<string>, label: string}>
+	 */
+	private const LEGACY_OFFICE = [
+		'doc' => ['streams' => ['WordDocument'], 'tool' => 'catdoc', 'args' => ['-d', 'utf-8', '-w'], 'label' => 'Word 97–2003 document'],
+		'ppt' => ['streams' => ['PowerPoint Document'], 'tool' => 'catppt', 'args' => ['-d', 'utf-8'], 'label' => 'PowerPoint 97–2003 presentation'],
+		'xls' => ['streams' => ['Workbook', 'Book'], 'tool' => 'xls2csv', 'args' => ['-d', 'utf-8'], 'label' => 'Excel 97–2003 workbook'],
+	];
 
 	/**
 	 * The bundled parser holds the whole file and its decoded objects in PHP memory. Above
@@ -44,6 +54,7 @@ class ContentExtractor {
 
 	public function __construct(
 		private ConfigService $configService,
+		private OfficeExtractor $officeExtractor = new OfficeExtractor(),
 	) {
 	}
 
@@ -72,6 +83,9 @@ class ContentExtractor {
 		if (str_starts_with($raw, "PK\x03\x04")) {
 			return $this->extractZipXml($raw);
 		}
+		if (str_starts_with($raw, self::OLE_SIGNATURE)) {
+			return $this->extractLegacyOffice($raw);
+		}
 		if ($this->looksLikeText($raw)) {
 			return new ExtractedContent($this->clean($this->toUtf8($raw)));
 		}
@@ -88,11 +102,14 @@ class ContentExtractor {
 
 	/**
 	 * Normalise text for PostgreSQL: valid UTF-8, no NUL bytes, no markup, bounded size.
+	 *
+	 * @param bool $stripMarkup remove HTML found in the text. Off for text that extraction
+	 *                          already made plain (office, PDF), where "<draft>" is content.
 	 */
-	public function clean(string $text): string {
+	public function clean(string $text, bool $stripMarkup = true): string {
 		$text = $this->toUtf8($text);
 		$text = str_replace("\0", ' ', $text);
-		if (preg_match('#</?[a-zA-Z][^>]*>#', $text)) {
+		if ($stripMarkup && preg_match('#</?[a-zA-Z][^>]*>#', $text)) {
 			$text = html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8');
 		}
 		$text = trim((string)preg_replace('/\s+/u', ' ', $text));
@@ -159,26 +176,117 @@ class ContentExtractor {
 	 *                                            (false: worth trying the bundled parser)
 	 */
 	private function extractPdfWithPdfToText(string $binary, string $raw): array {
+		[$output, $failure, $timedOut] = $this->runTool('pdftotext', [$binary, '-q', '-enc', 'UTF-8', '{file}', '-'], $raw, self::PDF_TIMEOUT_SECONDS);
+		if ($failure !== null) {
+			return [new ExtractedContent('', $failure), false];
+		}
+
+		$text = $this->clean($output, false);
+		if ($text === '') {
+			return [new ExtractedContent('', 'PDF contains no extractable text (scanned images?)'), true];
+		}
+		return [new ExtractedContent($text, $timedOut ? 'pdftotext timed out, content partially indexed' : null), true];
+	}
+
+	/**
+	 * Office 97–2003 files (.doc, .xls, .ppt) through catdoc, xls2csv or catppt, when the
+	 * catdoc package is installed. Other compound files (Outlook .msg, Visio, password-
+	 * protected Office files) are indexed without content.
+	 */
+	private function extractLegacyOffice(string $raw): ExtractedContent {
+		$kind = $this->legacyOfficeKind($raw);
+		if ($kind === null) {
+			if (str_contains($raw, $this->utf16('EncryptedPackage'))) {
+				return new ExtractedContent('', 'password-protected Office document, indexed without content');
+			}
+			return new ExtractedContent('', 'compound document in an unsupported format, indexed without content');
+		}
+
+		$format = self::LEGACY_OFFICE[$kind];
+		$binary = $this->findBinary($format['tool']);
+		if ($binary === null) {
+			return new ExtractedContent('', $format['label'] . ' indexed without content: install catdoc (it provides catdoc, xls2csv and catppt) to index .doc, .xls and .ppt files');
+		}
+
+		[$output, $failure, $timedOut] = $this->runTool($format['tool'], [$binary, ...$format['args'], '{file}'], $raw, self::TOOL_TIMEOUT_SECONDS);
+		if ($failure !== null) {
+			return new ExtractedContent('', $format['label'] . ' indexed without content: ' . $failure);
+		}
+		if ($kind === 'xls') {
+			$output = $this->csvToText($output);
+		}
+
+		$text = $this->clean($output, false);
+		if ($text === '') {
+			return new ExtractedContent('', $format['label'] . ' contains no extractable text');
+		}
+		return new ExtractedContent($text, $timedOut ? $format['tool'] . ' timed out, content partially indexed' : null);
+	}
+
+	/** 'doc', 'xls', 'ppt', or null for any other compound file. */
+	public function legacyOfficeKind(string $raw): ?string {
+		foreach (self::LEGACY_OFFICE as $kind => $format) {
+			foreach ($format['streams'] as $stream) {
+				if (str_contains($raw, $this->utf16($stream))) {
+					return $kind;
+				}
+			}
+		}
+		return null;
+	}
+
+	/** Where the catdoc tools are, or null when the package is not installed. */
+	public function findCatdoc(): ?string {
+		return $this->findBinary('catdoc');
+	}
+
+	/** xls2csv prints one CSV line per row and a form feed between sheets: keep the values. */
+	private function csvToText(string $csv): string {
+		$lines = [];
+		foreach (preg_split('/[\r\n\f]+/', $csv) ?: [] as $line) {
+			if ($line === '') {
+				continue;
+			}
+			$fields = array_filter(str_getcsv($line, ',', '"', ''), static fn (?string $f): bool => $f !== null && $f !== '');
+			if ($fields !== []) {
+				$lines[] = implode(' ', $fields);
+			}
+		}
+		return implode("\n", $lines);
+	}
+
+	private function utf16(string $ascii): string {
+		return (string)mb_convert_encoding($ascii, 'UTF-16LE', 'ASCII');
+	}
+
+	/**
+	 * Runs an extraction tool on a temporary copy of $raw, without a shell. '{file}' in
+	 * $command is replaced with the copy's path. Output is read until the tool ends, the
+	 * timeout passes, or enough text for max_content_size has arrived.
+	 *
+	 * @param list<string> $command
+	 * @return array{0: string, 1: ?string, 2: bool} output, failure message (the tool did not
+	 *                                              run, or failed with no output), timed out
+	 */
+	private function runTool(string $label, array $command, string $raw, int $timeout): array {
 		$tmp = tempnam(sys_get_temp_dir(), 'ftspg');
 		if ($tmp === false || file_put_contents($tmp, $raw) === false) {
-			return [new ExtractedContent('', 'could not write a temporary file for pdftotext'), false];
+			return ['', 'could not write a temporary file for ' . $label, false];
 		}
 
 		try {
-			$process = proc_open(
-				[$binary, '-q', '-enc', 'UTF-8', $tmp, '-'],
-				[1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
-				$pipes
-			);
+			$command = array_map(static fn (string $arg): string => $arg === '{file}' ? $tmp : $arg, $command);
+			$process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
 			if (!is_resource($process)) {
-				return [new ExtractedContent('', 'could not run pdftotext'), false];
+				return ['', 'could not run ' . $label, false];
 			}
 
+			// Non-blocking: a tool that hangs must not hang the indexing run.
 			stream_set_blocking($pipes[1], false);
 			stream_set_blocking($pipes[2], false);
 			$output = '';
 			$limit = $this->configService->getMaxContentSize() * 2 + 1;
-			$deadline = time() + self::PDF_TIMEOUT_SECONDS;
+			$deadline = time() + $timeout;
 			while (!feof($pipes[1]) && time() < $deadline && strlen($output) < $limit) {
 				$chunk = fread($pipes[1], 65536);
 				if ($chunk === false || $chunk === '') {
@@ -198,14 +306,11 @@ class ContentExtractor {
 
 			if (!$timedOut && $exitCode !== 0 && trim($output) === '') {
 				$reason = trim(strtok($errors, "\n") ?: '');
-				return [new ExtractedContent('', 'pdftotext failed (exit code ' . $exitCode . ($reason !== '' ? ': ' . $reason : '') . ')'), false];
+				return ['', $label . ' failed (exit code ' . $exitCode . ($reason !== '' ? ': ' . $reason : '') . ')', false];
 			}
-
-			$text = $this->clean($output);
-			if ($text === '') {
-				return [new ExtractedContent('', 'PDF contains no extractable text (scanned images?)'), true];
-			}
-			return [new ExtractedContent($text, $timedOut ? 'pdftotext timed out, content partially indexed' : null), true];
+			// Every tool is asked for UTF-8: drop the odd broken sequence rather than let
+			// toUtf8() mistake the whole output for a legacy 8-bit encoding.
+			return [mb_scrub($output, 'UTF-8'), null, $timedOut];
 		} finally {
 			@unlink($tmp);
 		}
@@ -261,7 +366,7 @@ class ContentExtractor {
 			restore_error_handler();
 		}
 
-		$text = $this->clean($text);
+		$text = $this->clean($text, false);
 		if ($text === '') {
 			return new ExtractedContent('', 'PDF contains no extractable text (scanned images?)');
 		}
@@ -300,40 +405,16 @@ class ContentExtractor {
 			if ($zip->open($tmp, ZipArchive::RDONLY) !== true) {
 				return new ExtractedContent('', 'unreadable zip/office file, indexed without content');
 			}
-
-			$names = [];
-			for ($i = 0; $i < $zip->numFiles; $i++) {
-				$name = (string)$zip->getNameIndex($i);
-				foreach (self::ZIP_TEXT_ENTRIES as $pattern) {
-					if (preg_match($pattern, $name)) {
-						$names[] = $name;
-						break;
-					}
-				}
+			try {
+				$extracted = $this->officeExtractor->extract($zip, $this->configService->getMaxContentSize() * 2 + 1);
+			} finally {
+				$zip->close();
 			}
-			// Slides in presentation order: slide2 before slide10.
-			natsort($names);
 
-			$budget = $this->configService->getMaxContentSize() * 4 + 1;
-			$parts = [];
-			foreach ($names as $name) {
-				$xml = $zip->getFromName($name, $budget);
-				if ($xml === false) {
-					continue;
-				}
-				$budget -= strlen($xml);
-				// Keep word boundaries between paragraphs/cells before stripping tags.
-				$parts[] = strip_tags(str_replace('<', ' <', $xml));
-				if ($budget <= 0) {
-					break;
-				}
-			}
-			$zip->close();
-
-			if ($names === []) {
+			if ($extracted === null) {
 				return new ExtractedContent('', 'zip archive is not a supported office document, indexed without content');
 			}
-			return new ExtractedContent($this->clean(implode(' ', $parts)));
+			return new ExtractedContent($this->clean($extracted->text, false), $extracted->warning);
 		} finally {
 			@unlink($tmp);
 		}
@@ -344,8 +425,20 @@ class ContentExtractor {
 		if ($configured !== '') {
 			return is_executable($configured) ? $configured : null;
 		}
-		foreach (explode(PATH_SEPARATOR, (string)getenv('PATH') ?: '/usr/local/bin:/usr/bin:/bin') as $dir) {
-			$candidate = rtrim($dir, '/') . '/pdftotext';
+		return $this->findBinary('pdftotext');
+	}
+
+	/**
+	 * An executable on PATH. PHP-FPM usually clears the environment, so the common
+	 * install directories are searched as well.
+	 */
+	private function findBinary(string $name): ?string {
+		$dirs = array_merge(
+			explode(PATH_SEPARATOR, (string)getenv('PATH')),
+			['/usr/local/bin', '/usr/bin', '/bin', '/opt/homebrew/bin']
+		);
+		foreach (array_unique(array_filter($dirs)) as $dir) {
+			$candidate = rtrim($dir, '/') . '/' . $name;
 			if (@is_executable($candidate)) {
 				return $candidate;
 			}
@@ -382,6 +475,15 @@ class ContentExtractor {
 		}
 		if (mb_check_encoding($text, 'UTF-8')) {
 			return $text;
+		}
+		// UTF-8 with a few damaged bytes (a cut-off file, or a tool's broken output for rare
+		// characters) stays UTF-8: re-reading it all as Windows-1254 would garble every
+		// non-ASCII character. Legacy 8-bit text has almost no valid multibyte sequences.
+		$scrubbed = mb_scrub($text, 'UTF-8');
+		$damaged = substr_count($scrubbed, '?') - substr_count($text, '?');
+		$multibyte = (int)preg_match_all('/[^\x00-\x7F]/u', $scrubbed);
+		if ($multibyte > 0 && $multibyte >= 2 * $damaged) {
+			return $scrubbed;
 		}
 		// Windows-1254 (Turkish) is a superset-compatible guess for most legacy Latin text.
 		$converted = @mb_convert_encoding($text, 'UTF-8', 'Windows-1254');

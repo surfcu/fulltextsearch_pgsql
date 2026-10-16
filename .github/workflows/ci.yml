@@ -40,8 +40,8 @@ jobs:
           php-version: ${{ matrix.php }}
           extensions: pdo_pgsql, zip, mbstring
           coverage: none
-      - name: Install pdftotext and xmllint
-        run: sudo apt-get update && sudo apt-get install -y poppler-utils libxml2-utils
+      - name: Install pdftotext, catdoc and xmllint
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils catdoc libxml2-utils
       - name: Select Nextcloud API version
         run: |
           composer require --dev --no-update "nextcloud/ocp:dev-stable${{ matrix.nextcloud }}"

@@ -29,6 +29,29 @@
 	max-width: 720px;
 }
 
+#ftspg-settings .ftspg-languages {
+	margin: 12px 0 0;
+	border: 0;
+	padding: 0;
+}
+
+#ftspg-settings .ftspg-languages legend {
+	font-weight: normal;
+	padding: 0;
+}
+
+#ftspg-settings .ftspg-language-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+	gap: 2px 12px;
+	max-width: 720px;
+	margin-top: 4px;
+}
+
+#ftspg-settings .ftspg-language-option input:disabled + label {
+	opacity: .5;
+}
+
 #ftspg-settings .ftspg-status {
 	display: grid;
 	grid-template-columns: max-content 1fr;
