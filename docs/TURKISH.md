@@ -11,6 +11,8 @@ Gereksinimler: Nextcloud 29–35, PostgreSQL 12 veya üstü (Nextcloud'un kendi 
 ```bash
 cd /var/www/nextcloud/apps
 git clone https://github.com/surfcu/fulltextsearch_pgsql.git
+cd fulltextsearch_pgsql && composer install --no-dev --ignore-platform-req=php && cd ..   # yerleşik PDF okuyucu için
+sudo apt install poppler-utils catdoc   # isteğe bağlı: daha hızlı PDF ve eski .doc/.xls/.ppt dosyaları
 sudo -u www-data php /var/www/nextcloud/occ app:enable fulltextsearch_pgsql
 
 occ fulltextsearch:configure '{"search_platform":"OCA\\FullTextSearch_PgSql\\Platform\\PostgreSQLPlatform"}'

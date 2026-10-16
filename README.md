@@ -39,10 +39,18 @@ From source:
 ```bash
 cd /var/www/nextcloud/apps
 git clone https://github.com/surfcu/fulltextsearch_pgsql.git
+cd fulltextsearch_pgsql
+composer install --no-dev --ignore-platform-req=php   # builds the bundled PDF parser in lib/Vendor
 sudo -u www-data php /var/www/nextcloud/occ app:enable fulltextsearch_pgsql
 ```
 
-No `composer install` is needed: the app has no runtime dependencies.
+`composer install` only matters for PDFs on servers without `pdftotext`: without it the app still works, and PDFs need `pdftotext`. App Store archives already include the parser. `--ignore-platform-req=php` keeps the dev tools' PHP limits from blocking the install; none of them are installed.
+
+For text from old Office files and faster PDFs, install the optional tools:
+
+```bash
+sudo apt install poppler-utils catdoc
+```
 
 For typo correction and title substrings, the Nextcloud database user should own the database, as in [Nextcloud's PostgreSQL setup](https://docs.nextcloud.com/server/latest/admin_manual/configuration_database/linux_database_configuration.html). The app can then enable `pg_trgm` itself on PostgreSQL 13+.
 
@@ -50,7 +58,7 @@ Then choose it as the platform and build the index:
 
 ```bash
 occ fulltextsearch:configure '{"search_platform":"OCA\\FullTextSearch_PgSql\\Platform\\PostgreSQLPlatform"}'
-occ fulltextsearch_pgsql:configure '{"language":"english"}'   # or turkish, german, simple, ...
+occ fulltextsearch_pgsql:configure '{"language":"english"}'   # or turkish, turkish,english, simple, ...
 occ fulltextsearch:test
 occ fulltextsearch:index
 ```
@@ -61,7 +69,11 @@ Keep the index current with the live indexer (`occ fulltextsearch:live`, e.g. as
 
 ## Configuration
 
-Administrators can change every setting in **Administration settings → Full text search**, under *PostgreSQL search platform*. The panel also shows whether `pg_trgm` and `pdftotext` are available, which tool reads PDFs, and how many documents are indexed. The same settings are available from the command line:
+Administrators can change every setting in **Administration settings → Full text search**, under *PostgreSQL search platform*. The panel also shows whether `pg_trgm`, `pdftotext` and `catdoc` are available, which tool reads PDFs, and how many documents are indexed in each language.
+
+<p align="center"><img src="screenshots/admin-settings.png" alt="The PostgreSQL search platform settings: status, languages, matching and content extraction" width="640"></p>
+
+The same settings are available from the command line:
 
 ```bash
 occ fulltextsearch_pgsql:configure                 # show current settings
@@ -102,6 +114,21 @@ Searches run once per configured language, each against the documents indexed in
 ```bash
 occ fulltextsearch:reset && occ fulltextsearch:index
 ```
+
+## Upgrading
+
+Nextcloud runs the app's repair step on upgrade; the index table and its documents are kept. Some improvements only apply to documents indexed after them:
+
+- **Office text extraction** (words split across formatting runs, spreadsheet numbers, comments, text boxes) and **Office 97–2003 files** — re-index office documents.
+- **Several languages** — documents keep the language they were indexed in until re-indexed.
+
+To re-index everything:
+
+```bash
+occ fulltextsearch:reset && occ fulltextsearch:index
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## Turkish
 
@@ -146,6 +173,10 @@ Coming from Elasticsearch? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
 **PDFs have no content.** The indexing warning says why. `occ fulltextsearch:check` shows `pdf_tool`, the tool PDFs currently go through. The bundled parser skips large files, files it cannot parse and encrypted ones; installing `poppler-utils` handles more of them. Scanned PDFs contain images, not text.
 
+**Office documents have no content.** The indexing warning says why. `.doc`, `.xls` and `.ppt` files need `catdoc` (`occ fulltextsearch:check` shows `"catdoc"`); password-protected files cannot be read. For `.docx`, `.xlsx` and `.pptx` indexed before this version, re-index (see [Upgrading](#upgrading)).
+
+**A document was indexed in the wrong language.** Detection needs a sentence or two of running text in one of the configured languages; titles, lists of names and numbers, and very short texts fall back to the first language. `SELECT document_id, config FROM ftspg_oc_index;` shows each document's language. Make sure the language is configured, then re-index.
+
 **Slow searches on very large instances.** Run `ANALYZE ftspg_oc_index;` after the initial index and make sure `shared_buffers` and `work_mem` are sized for your data. Very short prefixes (one or two letters) match many words and are inherently slower.
 
 ## Development
@@ -156,11 +187,11 @@ composer psalm            # static analysis against the real Nextcloud interface
 FTSPG_TEST_DSN="pgsql:host=localhost;dbname=fts_test;user=postgres;password=postgres" composer test
 ```
 
-The integration tests run against a real, disposable PostgreSQL database. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, and the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13 and 17.
+The integration tests run against a real, disposable PostgreSQL database with a UTF-8 locale (Turkish lowercasing depends on it). With `poppler-utils` and `catdoc` installed they also extract real PDF and Office 97–2003 files; without them, they check the warnings instead. The Office 97–2003 samples in `tests/fixtures` come from Apache Tika (Apache-2.0) and are not part of the app archive. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, and the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13 and 17.
 
-`tests/live/run.sh` goes further: CI installs real Nextcloud 30, 34 and 35 servers on PostgreSQL with Full Text Search and the Files provider, runs the framework's own `occ fulltextsearch:test`, then indexes and searches real text, Office and PDF files. It covers both a database the Nextcloud user owns (`pg_trgm` enabled by the app) and one it doesn't (trigram features off).
+`tests/live/run.sh` goes further: CI installs real Nextcloud 30, 34 and 35 servers on PostgreSQL with Full Text Search and the Files provider, runs the framework's own `occ fulltextsearch:test`, then indexes and searches real files: text, Office documents (including a word split across formatting runs and a Word 97–2003 file), and PDFs through both `pdftotext` and the bundled parser. It also indexes English and Turkish documents side by side with two languages configured, checks that nothing from the app reaches `nextcloud.log` as a warning or error, and covers both a database the Nextcloud user owns (`pg_trgm` enabled by the app) and one it doesn't (trigram features off).
 
-The bundled PDF parser lives in `lib/Vendor`, generated by `scripts/scope-pdfparser.php` from `vendor/smalot/pdfparser` with its namespace rewritten to `OCA\FullTextSearch_PgSql\Vendor\Smalot\PdfParser`. That keeps it separate from any other app's copy and lets Nextcloud autoload it from `lib/` without Composer at runtime. `composer install` and `make appstore` regenerate it; it is not committed. An installation from a git checkout without `composer install` still works, with no PDF fallback.
+The bundled PDF parser lives in `lib/Vendor`, generated by `scripts/scope-pdfparser.php` from `vendor/smalot/pdfparser` with its namespace rewritten to `OCA\FullTextSearch_PgSql\Vendor\Smalot\PdfParser`. That keeps it separate from any other app's copy and lets Nextcloud autoload it from `lib/` without Composer at runtime. `composer install` and `make appstore` regenerate it; it is not committed.
 
 Releases are built and published to the Nextcloud App Store from GitHub; see [docs/RELEASING.md](docs/RELEASING.md). To check against a specific Nextcloud release, install its API stubs first: `composer require --dev nextcloud/ocp:dev-stable35`.
 
