@@ -17,7 +17,7 @@
 - Settings and status in Administration settings → Full text search, or with occ
 
 Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
-    <version>1.4.0</version>
+    <version>1.4.1</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>surfcu</author>
     <namespace>FullTextSearch_PgSql</namespace>
