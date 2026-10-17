@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `pdftotext` that exits with an error and no output is reported as a failure instead of "no extractable text".
 
 ### Fixed
+- Searches could become several times slower once PostgreSQL had refreshed its statistics: it began testing the search vector of every document the user can see instead of using the full-text index (1.3 s instead of 0.3 s for a search matching 12,000 of 100,000 documents). Each search now chooses between the full-text index and its filters from the planner's estimates, and runs with planner settings that keep it on that path.
 - Turkish excerpts missed words written with a capital I or İ (`ISPARTA`, `İSTANBUL`), because `ts_headline` lowercased them with the database locale. They are now matched like the index matches them, and shown as written.
 - Words that Word, Excel, PowerPoint or LibreOffice store in several formatting runs (after a spelling check, a partial edit or partial bold) were indexed as separate fragments, so `hippopotamus` missed a document where it had been stored as `hippo` + `potamus`. Office XML is now read node by node and only paragraph, cell and line ends separate words. Re-index office documents to benefit: `occ fulltextsearch:reset && occ fulltextsearch:index`.
 - XML entities in office documents were indexed undecoded (`R&amp;D`), and text in angle brackets extracted from office files and PDFs was mistaken for HTML and removed.

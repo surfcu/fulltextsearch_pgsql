@@ -140,6 +140,17 @@ User text is always a bound parameter and quoted as a tsquery literal, so neithe
 
 The query pages inside a subquery and computes `count(*) OVER ()` for the total; `ts_headline` then runs only on the returned page. Excerpts are plain text (no markup), split into fragments.
 
+### Query planning
+
+The index table's heap is small: titles, arrays and pointers, with every body and search vector stored out of line (TOAST). PostgreSQL's cost model sees a cheap heap, charges almost nothing for evaluating `tsv @@ query` on a row (for a TOASTed vector it means fetching and decompressing it), and overestimates GIN scans. After `ANALYZE` it therefore preferred reading every row the user may see, sequentially or through the access index, and testing each vector: 1.3 s instead of 0.3 s for 12,000 matches among 90,000 visible documents on 100,000, 61 ms instead of 8 ms on 4,000.
+
+Each search now picks where it starts:
+
+- **From the full-text index** (the usual case). Every filter (provider, access, tags, `since`, regex/wildcard) is written as `(condition) IS TRUE`: the same rows, but no index can serve it, so the GIN index is the only way in. Filters then run on the small heap row, which is cheap.
+- **From the filters**, when the planner estimates they select fewer than a tenth as many rows as the words, as for a provider with a few documents or a user with few files: testing those few vectors beats visiting every document that contains a common word (160 ms instead of 640 ms for 40 documents against 90,000 with the word). The match condition is then written as `IS TRUE` instead.
+
+Both estimates are planning-only `EXPLAIN`s, about a millisecond each. The search's statements run in a transaction of their own with `SET LOCAL` settings that keep the planner from working around the chosen index: `enable_seqscan` off (a sequential scan stays possible as a last resort), `random_page_cost` at most 1.1 (the usual value for SSDs instead of 4 for spinning disks; a server configured lower keeps its value), and `jit` off (before PostgreSQL 18, a disabled plan type adds a huge constant to plan costs, enough to trigger JIT compilation). Inside a caller's transaction the previous values are restored afterwards. Tests replay the search's own statements with `EXPLAIN` to check which index each plan starts from.
+
 ### Excerpts
 
 `ts_headline` tokenizes all the text it is given: 70–90 ms for a 500 KB document, so a page of long results spent over a second on excerpts alone. Bodies over 10,000 bytes are excerpted from a 10,000-character window starting 500 characters before the first match. The first match is the earliest position, in the lowercased body, of any search word as typed or any lexeme of the row's tsquery (stems, accent variants, typo corrections, read from `querytree()`), preferring a word start; stems usually begin their surface forms. Without a match (a title-only hit) the window starts at the beginning, as `ts_headline` would show anyway. A long body is detoasted once into a subquery column, and `octet_length()` decides "long" from the stored size without decompressing; `OFFSET 0` keeps PostgreSQL from inlining those subqueries and repeating the work at each use. On 20 results of 550 KB, excerpts take 280 ms instead of 1.5 s.

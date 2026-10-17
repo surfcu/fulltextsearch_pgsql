@@ -20,6 +20,10 @@ class SearchService {
 	private const FRAGMENT_DELIMITER = '|||';
 	/** Searches with more positive terms than this are ranked as one query, without IDF weights. */
 	private const MAX_IDF_TERMS = 8;
+	/** random_page_cost for search statements, unless the server's is lower (see withSearchPlanning()). */
+	private const SEARCH_RANDOM_PAGE_COST = 1.1;
+	/** A search starts from the filters when they select this many times fewer rows than its words (see startFromFilters()). */
+	private const FILTERS_FIRST_RATIO = 10;
 	/** Below this share of the index, matched by the terms together, the matching scan is fenced (see idfRanking()). */
 	private const FENCE_FRACTION = 0.25;
 	/** Terms matching more documents than this get the planner's estimate instead of an exact count. */
@@ -49,6 +53,69 @@ class SearchService {
 	}
 
 	public function searchRequest(ISearchResult $result, IDocumentAccess $access): void {
+		$this->withSearchPlanning(fn () => $this->search($result, $access));
+	}
+
+	/**
+	 * Runs a search's statements in a transaction of their own, with planner settings that
+	 * keep PostgreSQL on the full-text GIN index (SET LOCAL, so nothing else on the connection
+	 * is affected).
+	 *
+	 * The index table's heap is small: titles, arrays and pointers, with every body and search
+	 * vector stored out of line (TOAST). PostgreSQL's cost model sees a cheap heap and charges
+	 * almost nothing for evaluating tsv @@ query on a row, though for a TOASTed vector that means
+	 * fetching and decompressing it, and it overestimates GIN scans. After ANALYZE it therefore
+	 * preferred reading every row the user can see, sequentially or through the access index,
+	 * and testing each vector: 1.3 s instead of 0.2–0.3 s for a search matching 12,000 of 100,000
+	 * documents, 61 ms instead of 8 ms on 4,000. startFromFilters() picks the index the search
+	 * starts from and hides the other; these settings keep the planner from avoiding it:
+	 *  - enable_seqscan off: a sequential scan stays possible, but only as a last resort;
+	 *  - random_page_cost at most SEARCH_RANDOM_PAGE_COST (1.1, the usual value for SSDs, rather
+	 *    than 4 for spinning disks), so index scans are priced closer to what they cost; a server
+	 *    configured lower keeps its value;
+	 *  - jit off: before PostgreSQL 18, a disabled plan type adds a huge constant to plan costs,
+	 *    enough to trigger JIT compilation, which costs more than any search.
+	 *
+	 * @param callable(): void $search
+	 */
+	private function withSearchPlanning(callable $search): void {
+		$ownTransaction = !$this->db->inTransaction();
+		if ($ownTransaction) {
+			$this->db->beginTransaction();
+		}
+		$result = $this->db->executeQuery(
+			"SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit'),
+			        set_config('enable_seqscan', 'off', true),
+			        set_config('random_page_cost', least(current_setting('random_page_cost')::float8, CAST(? AS float8))::text, true),
+			        set_config('jit', 'off', true)",
+			[(string)self::SEARCH_RANDOM_PAGE_COST]
+		);
+		$previous = $result->fetch(\PDO::FETCH_NUM);
+		$result->closeCursor();
+
+		$failed = true;
+		try {
+			$search();
+			$failed = false;
+		} finally {
+			if (!$ownTransaction) {
+				// Inside someone else's transaction: put the settings back for the rest of it. After
+				// an error that transaction is aborted, and its rollback discards them anyway.
+				if (!$failed && is_array($previous)) {
+					$this->db->executeQuery(
+						"SELECT set_config('enable_seqscan', ?, true), set_config('random_page_cost', ?, true), set_config('jit', ?, true)",
+						[(string)$previous[0], (string)$previous[1], (string)$previous[2]]
+					)->closeCursor();
+				}
+			} elseif ($failed) {
+				$this->db->rollBack();
+			} else {
+				$this->db->commit();
+			}
+		}
+	}
+
+	private function search(ISearchResult $result, IDocumentAccess $access): void {
 		$start = microtime(true);
 		$request = $result->getRequest();
 		$providerId = $result->getProvider()->getId();
@@ -86,17 +153,20 @@ class SearchService {
 			$result->setTotal(0);
 			return;
 		}
+		/** @var non-empty-array<string, ParsedQuery> $queries one per configured language, at least one */
 		$query = $queries[$languages[0]];
 
 		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
 		$page = max(1, $request->getPage());
-		[$filterSql, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
+		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
+		$filtersFirst = $this->startFromFilters($queries, $filterConditions, $filterParams);
+		$filterSql = self::renderFilters($filterConditions, !$filtersFirst);
 
 		$excerptWords = [];
 		foreach ($languages as $language) {
 			array_push($excerptWords, ...$this->queryBuilder->searchWords($search, $language));
 		}
-		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $size, ($page - 1) * $size, array_values(array_unique($excerptWords)));
+		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, ($page - 1) * $size, array_values(array_unique($excerptWords)));
 		$titlesSearched = $weights === null || str_contains($weights, 'A');
 		if ($rows === [] && $page === 1 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '') {
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
@@ -165,29 +235,29 @@ class SearchService {
 
 	/**
 	 * @param list<string> $viewerTokens
-	 * @return array{0: string, 1: list<string>}
+	 * @return array{0: list<string>, 1: list<string>} conditions (each usable by an index), their params
 	 */
 	private function filters(ISearchRequest $request, string $providerId, array $viewerTokens): array {
-		$sql = 'd.provider_id = ? AND d.access && CAST(? AS text[])';
+		$conditions = ['d.provider_id = ?', 'd.access && CAST(? AS text[])'];
 		$params = [$providerId, PgArray::toLiteral($viewerTokens)];
 
 		$metaTags = array_values(array_map('strval', $request->getMetaTags()));
 		if ($metaTags !== []) {
 			// any of the requested meta tags
-			$sql .= ' AND d.metatags && CAST(? AS text[])';
+			$conditions[] = 'd.metatags && CAST(? AS text[])';
 			$params[] = PgArray::toLiteral($metaTags);
 		}
 
 		$subTags = array_values(array_map('strval', $request->getSubTags(true)));
 		if ($subTags !== []) {
 			// all of the requested sub tags
-			$sql .= ' AND d.subtags @> CAST(? AS text[])';
+			$conditions[] = 'd.subtags @> CAST(? AS text[])';
 			$params[] = PgArray::toLiteral($subTags);
 		}
 
 		$since = (int)$request->getOption('since');
 		if ($since > 0) {
-			$sql .= ' AND d.modified_time >= ?';
+			$conditions[] = 'd.modified_time >= ?';
 			$params[] = (string)$since;
 		}
 
@@ -196,16 +266,89 @@ class SearchService {
 		// extension" arrives as one regex group with one entry: [['title' => '.*\.pdf']].
 		foreach ($request->getWildcardFilters() as $group) {
 			[$groupSql, $groupParams] = $this->patternGroup($group, false);
-			$sql .= " AND $groupSql";
+			$conditions[] = $groupSql;
 			array_push($params, ...$groupParams);
 		}
 		foreach ($request->getRegexFilters() as $group) {
 			[$groupSql, $groupParams] = $this->patternGroup($group, true);
-			$sql .= " AND $groupSql";
+			$conditions[] = $groupSql;
 			array_push($params, ...$groupParams);
 		}
 
-		return [$sql, $params];
+		return [$conditions, $params];
+	}
+
+	/**
+	 * The filters as one SQL condition. Hidden, each is written as (condition) IS TRUE: the same
+	 * rows, but no index can serve it, so the search cannot start from it (see startFromFilters()).
+	 *
+	 * @param list<string> $conditions
+	 */
+	private static function renderFilters(array $conditions, bool $hidden): string {
+		return implode(' AND ', array_map(static fn (string $c): string => $hidden ? "($c) IS TRUE" : $c, $conditions));
+	}
+
+	/**
+	 * Whether the search should start from the filters (provider, access, tags) rather than from
+	 * the full-text index, decided from the planner's row estimates for each side.
+	 *
+	 * Either way, every row a plan starts from that is not ruled out by cheap conditions on the
+	 * small heap row costs a fetch and decompression of its TOASTed vector, to test tsv @@ query
+	 * (always, when title substring matching makes the GIN result inexact). PostgreSQL prices
+	 * that test as nearly free and overestimates GIN scans, so left to itself it starts from the
+	 * filters even when they cover most of the index: 1.3 s instead of 0.3 s for 12,000 matches
+	 * among 90,000 visible documents. And starting from the full-text index when the filters are
+	 * narrow (a provider with 40 documents, a user with few files) tests every document containing
+	 * a common word: 640 ms instead of 160 ms. So the search starts from the filters only when
+	 * they select fewer than a tenth as many rows as the words do, and writes the other side as
+	 * IS TRUE (see renderFilters()) so the planner has no other index to start from.
+	 *
+	 * @param non-empty-array<string, ParsedQuery> $queries
+	 * @param list<string> $filterConditions
+	 * @param list<string> $filterParams
+	 */
+	private function startFromFilters(array $queries, array $filterConditions, array $filterParams): bool {
+		$t = $this->schemaService->getTableName();
+		$filtered = $this->estimateRows("SELECT 1 FROM $t d WHERE " . self::renderFilters($filterConditions, false), $filterParams);
+		[$matchSql, $matchParams] = $this->matchCondition($queries);
+		$matching = $this->estimateRows("SELECT 1 FROM $t d WHERE $matchSql", $matchParams);
+		return $filtered * self::FILTERS_FIRST_RATIO < $matching;
+	}
+
+	/**
+	 * Which rows each language branch applies to, in the order of $languages: documents indexed
+	 * in a language no longer configured go with the first.
+	 *
+	 * @param list<string> $languages
+	 * @return list<array{0: string, 1: list<string>}>
+	 */
+	private static function languageConditions(array $languages): array {
+		$others = array_slice($languages, 1);
+		$conditions = [];
+		foreach ($languages as $i => $language) {
+			$conditions[] = $i === 0
+				? ($others === [] ? ['TRUE', []] : ['d.config <> ALL (CAST(? AS regconfig[]))', ['{' . implode(',', $others) . '}']])
+				: ['d.config = CAST(? AS regconfig)', [$language]];
+		}
+		return $conditions;
+	}
+
+	/**
+	 * Which documents match, over every language branch.
+	 *
+	 * @param non-empty-array<string, ParsedQuery> $queries
+	 * @return array{0: string, 1: list<string>}
+	 */
+	private function matchCondition(array $queries): array {
+		$conditions = self::languageConditions(array_keys($queries));
+		$match = [];
+		$params = [];
+		foreach (array_values($queries) as $i => $query) {
+			[$condition, $conditionParams] = $conditions[$i];
+			$match[] = "($condition AND {$query->sql})";
+			array_push($params, ...$conditionParams, ...$query->params);
+		}
+		return [count($match) === 1 ? $match[0] : '(' . implode(' OR ', $match) . ')', $params];
 	}
 
 	/**
@@ -294,21 +437,13 @@ class SearchService {
 	 *
 	 * @param non-empty-array<string, ParsedQuery> $queries language => compiled query, fallback first
 	 * @param list<string> $filterParams
+	 * @param bool $filtersFirst start from the filters rather than the full-text index (see startFromFilters())
 	 * @param list<string> $excerptWords the search words as typed, lowercased, to find the excerpt window
 	 * @return list<array<string, mixed>>
 	 */
-	private function fullTextSearch(array $queries, string $filterSql, array $filterParams, int $limit, int $offset, array $excerptWords = []): array {
+	private function fullTextSearch(array $queries, string $filterSql, array $filterParams, bool $filtersFirst, int $limit, int $offset, array $excerptWords = []): array {
 		$t = $this->schemaService->getTableName();
-		$languages = array_keys($queries);
-		$others = array_slice($languages, 1);
-
-		// Which rows a branch applies to: one condition per language, in $languages order.
-		$conditions = [];
-		foreach ($languages as $i => $language) {
-			$conditions[] = $i === 0
-				? ($others === [] ? ['TRUE', []] : ['d.config <> ALL (CAST(? AS regconfig[]))', ['{' . implode(',', $others) . '}']])
-				: ['d.config = CAST(? AS regconfig)', [$language]];
-		}
+		$conditions = self::languageConditions(array_keys($queries));
 
 		$rankColumns = [];
 		$rankParams = [];
@@ -333,12 +468,16 @@ class SearchService {
 		}
 		$rankQuery = $rankCase === [] ? 'q.r0' : 'CASE ' . implode(' ', $rankCase) . ' ELSE q.r0 END';
 		$matchSql = count($match) === 1 ? $match[0] : '(' . implode(' OR ', $match) . ')';
+		if ($filtersFirst) {
+			// Starting from the filters: keep the GIN index out of it (see startFromFilters()).
+			$matchSql = "($matchSql) IS TRUE";
+		}
 		$allSql = count($all) === 1 ? $all[0] : '(' . implode(' OR ', $all) . ')';
 
 		$excerptSql = $this->excerptSource();
 		$headlineSql = $this->headlineSql();
 		[$rankSql, $rankSqlParams, $termColumns, $termParams, $fence]
-			= $this->idfRanking($queries, $conditions, $filterSql, $filterParams, $rankQuery, $rankCaseParams);
+			= $this->idfRanking($queries, $conditions, $filterSql, $filterParams, $filtersFirst, $rankQuery, $rankCaseParams);
 		$rankColumnsSql = implode(', ', [...$rankColumns, ...$termColumns]);
 
 		if ($fence) {
@@ -512,7 +651,7 @@ class SearchService {
 	 * @param list<string> $rankCaseParams
 	 * @return array{0: string, 1: list<string>, 2: list<string>, 3: list<string>, 4: bool}
 	 */
-	private function idfRanking(array $queries, array $conditions, string $filterSql, array $filterParams, string $rankQuery, array $rankCaseParams): array {
+	private function idfRanking(array $queries, array $conditions, string $filterSql, array $filterParams, bool $filtersFirst, string $rankQuery, array $rankCaseParams): array {
 		$plain = ["ts_rank_cd(d.tsv, $rankQuery, 32)", $rankCaseParams, [], [], false];
 
 		$queryList = array_values($queries);
@@ -526,7 +665,7 @@ class SearchService {
 			}
 		}
 
-		[$frequencies, $total] = $this->documentFrequencies($queryList, $conditions, $filterSql, $filterParams);
+		[$frequencies, $total] = $this->documentFrequencies($queryList, $conditions, $filterSql, $filterParams, $filtersFirst);
 		$weights = [];
 		foreach ($frequencies as $j => $df) {
 			if ($df > 0) {
@@ -594,9 +733,10 @@ class SearchService {
 	 * @param non-empty-list<ParsedQuery> $queries one per language, each with the same number of terms
 	 * @param list<array{0: string, 1: list<string>}> $conditions per language
 	 * @param list<string> $filterParams
+	 * @param bool $filtersFirst count from the filters rather than the full-text index (see startFromFilters())
 	 * @return array{0: list<int>, 1: float} document frequency per term, N
 	 */
-	private function documentFrequencies(array $queries, array $conditions, string $filterSql, array $filterParams): array {
+	private function documentFrequencies(array $queries, array $conditions, string $filterSql, array $filterParams, bool $filtersFirst): array {
 		$t = $this->schemaService->getTableName();
 		$limit = self::EXACT_FREQUENCY_LIMIT;
 		$columns = [];
@@ -611,7 +751,8 @@ class SearchService {
 				$branches[] = "($condition AND d.tsv @@ $termSql)";
 				array_push($termParams, ...$conditionParams, ...$sqlParams);
 			}
-			$terms[$j] = ["SELECT 1 FROM $t d WHERE (" . implode(' OR ', $branches) . ") AND $filterSql", [...$termParams, ...$filterParams]];
+			$termWhere = '(' . implode(' OR ', $branches) . ')' . ($filtersFirst ? ' IS TRUE' : '');
+			$terms[$j] = ["SELECT 1 FROM $t d WHERE $termWhere AND $filterSql", [...$termParams, ...$filterParams]];
 			$columns[] = "(SELECT count(*) FROM ({$terms[$j][0]} LIMIT $limit) x)";
 			array_push($params, ...$terms[$j][1]);
 		}

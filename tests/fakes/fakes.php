@@ -39,6 +39,8 @@ final class PdoResult implements IResult {
 final class PdoConnection implements IDBConnection {
 	/** @var list<string> */
 	public array $statements = [];
+	/** @var list<array{0: string, 1: list<mixed>}> statements with their parameters, in order */
+	public array $log = [];
 
 	public function __construct(
 		public PDO $pdo,
@@ -47,17 +49,28 @@ final class PdoConnection implements IDBConnection {
 		$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 	}
 	public function executeQuery(string $sql, array $params = [], $types = []): IResult {
+		$this->log[] = [$sql, array_values($params)];
 		$stmt = $this->pdo->prepare($this->sql($sql));
 		$stmt->execute(array_values($params));
 		return new PdoResult($stmt);
 	}
 	public function executeStatement($sql, array $params = [], array $types = []): int {
+		$this->log[] = [$sql, array_values($params)];
 		$stmt = $this->pdo->prepare($this->sql($sql));
 		$stmt->execute(array_values($params));
 		return $stmt->rowCount();
 	}
 	public function inTransaction(): bool {
 		return $this->pdo->inTransaction();
+	}
+	public function beginTransaction(): void {
+		$this->pdo->beginTransaction();
+	}
+	public function commit(): void {
+		$this->pdo->commit();
+	}
+	public function rollBack(): void {
+		$this->pdo->rollBack();
 	}
 	public function getDatabaseProvider(): string {
 		return self::PLATFORM_POSTGRES;
