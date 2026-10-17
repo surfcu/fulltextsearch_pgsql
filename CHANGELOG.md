@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-17
+
 ### Added
 - The Files app's *filter by extension* and *search in file name / content* options are applied. They were ignored: an extension filter returned every file type. Regex and wildcard filters follow the Elasticsearch platform's rules; a regex PostgreSQL cannot run safely matches nothing instead of failing the search.
 - PDFs are read without `pdftotext`: a bundled copy of smalot/pdfparser (LGPL-3.0, pure PHP) takes over when `pdftotext` is not installed or fails to run. It is namespaced under the app so it cannot clash with another app's copy. Files over 64 MB, or too big for the free `memory_limit`, are still indexed by name only, with a warning that says why.
