@@ -896,6 +896,72 @@ try {
 	$platform->deleteIndexes(array_map(static fn (string $id) => new TestIndex('files', $id), ['M1', 'M2', 'M3', 'M4']));
 	$config->setConfig(['language' => 'turkish']);
 
+	section('searches stay on the full-text index after ANALYZE');
+	// 4,000 documents whose search vectors are stored out of line (TOAST), all visible to alice,
+	// as in a real index. With fresh statistics, PostgreSQL's own choice is to read every row and
+	// test each vector, several times slower than the GIN index.
+	$config->setConfig(['language' => 'english']);
+	$conn->executeStatement(
+		"INSERT INTO ftspg_oc_index (provider_id, document_id, owner_id, access, config, title, content)
+		 SELECT 'plan', 'P' || n, 'alice', '{u:alice}', 'english', 'Doc ' || n,
+		        (SELECT string_agg(md5(n::text || '-' || g::text), ' ') FROM generate_series(1, 150) g)
+		        || CASE WHEN n % 10 = 0 THEN ' lantern' ELSE '' END || CASE WHEN n % 13 = 0 THEN ' meadow' ELSE '' END
+		 FROM generate_series(1, 4000) n"
+	);
+	$conn->executeStatement('ANALYZE ftspg_oc_index');
+	$conn->log = [];
+	$r = search($platform, 'alice', 'lantern meadow', ['provider' => 'plan']);
+	same(677, $r['total'], 'search over the TOASTed documents');
+	$planOf = static function (string $prefix) use ($conn): string {
+		$setup = null;
+		$statement = null;
+		foreach ($conn->log as [$sql, $params]) {
+			if (str_contains($sql, "set_config('enable_seqscan', 'off', true)")) {
+				$setup = [$sql, $params];
+			} elseif ($statement === null && str_starts_with(ltrim($sql), $prefix)) {
+				$statement = [$sql, $params];
+			}
+		}
+		if ($setup === null || $statement === null) {
+			return '';
+		}
+		// Replay the search's statement with the search's own settings, as it ran.
+		$conn->beginTransaction();
+		try {
+			$conn->executeQuery(...$setup)->closeCursor();
+			return implode("\n", array_column($conn->executeQuery('EXPLAIN ' . $statement[0], $statement[1])->fetchAll(), 'QUERY PLAN'));
+		} finally {
+			$conn->rollBack();
+		}
+	};
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'the search uses the GIN index, not a scan of every visible row');
+	$plan = $planOf('SELECT (SELECT count(*)');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'so do the IDF frequency counts');
+	same(['on', '4', 'on'], array_values($conn->executeQuery("SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit')")->fetch(PDO::FETCH_NUM)), 'the settings only applied to the search');
+	same(false, $conn->inTransaction(), 'and its transaction is closed');
+	$conn->beginTransaction();
+	$conn->executeStatement('SET LOCAL random_page_cost = 0.9');
+	search($platform, 'alice', 'lantern', ['provider' => 'plan']);
+	same(['on', '0.9'], array_values($conn->executeQuery("SELECT current_setting('enable_seqscan'), current_setting('random_page_cost')")->fetch(PDO::FETCH_NUM)), 'inside a caller\'s transaction, its settings are put back');
+	same(true, $conn->inTransaction(), 'and the transaction is left open');
+	$conn->rollBack();
+	// A provider with a few documents, searched for a word hundreds of others contain: testing
+	// those few vectors beats visiting every document with the word.
+	$conn->executeStatement(
+		"INSERT INTO ftspg_oc_index (provider_id, document_id, owner_id, access, config, title, content)
+		 SELECT 'tiny', 'T' || n, 'alice', '{u:alice}', 'english', 'Card ' || n, 'lantern on the shelf' FROM generate_series(1, 30) n"
+	);
+	$conn->executeStatement('ANALYZE ftspg_oc_index');
+	$conn->log = [];
+	same(30, search($platform, 'alice', 'lantern', ['provider' => 'tiny'])['total'], 'a small provider searched for a common word');
+	$plan = $planOf('WITH q AS');
+	check($plan !== '' && !str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'starts from the filters, not from every document with the word');
+	$conn->executeStatement("DELETE FROM ftspg_oc_index WHERE provider_id = 'tiny'");
+	$platform->resetIndex('plan');
+	$conn->executeStatement('ANALYZE ftspg_oc_index');
+	$config->setConfig(['language' => 'turkish']);
+
 	section('query plan uses the indexes');
 	$conn->executeStatement('SET enable_seqscan = off');
 	$plan = implode("\n", array_column($conn->executeQuery(
