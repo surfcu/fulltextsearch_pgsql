@@ -596,6 +596,68 @@ try {
 	same('W2', search($platform, 'alice', 'zebra giraffe')['ids'][0] ?? null, 'all-terms match beats many repeats of one term');
 	same(['W1', 'W2'], sorted(search($platform, 'alice', 'zebra giraffe')['ids']), 'partial matches still included');
 
+	section('rare words weigh more than common ones (IDF)');
+	// "report" is in 30 documents, "zanzibar" in one. No document has both. Body text against
+	// body text, then title against title: field weights (title > body) still apply on top.
+	for ($i = 1; $i <= 30; $i++) {
+		$platform->indexDocument(doc("R$i", 'alice', "Figures $i", 'The monthly report and the report summary.', [], 'idf'));
+	}
+	$platform->indexDocument(doc('Z1', 'alice', 'Trip notes', 'Flights booked to Zanzibar in March.', [], 'idf'));
+	// Bob's documents mention zanzibar everywhere, but alice cannot see them: they must not
+	// make the word look common to her.
+	for ($i = 1; $i <= 20; $i++) {
+		$platform->indexDocument(doc("B$i", 'bob', "Zanzibar $i", 'zanzibar zanzibar', [], 'idf'));
+	}
+	$r = search($platform, 'alice', 'report zanzibar', ['provider' => 'idf', 'size' => 5]);
+	same('Z1', $r['ids'][0] ?? null, 'one mention of the rare word outranks two of the common one');
+	same(31, $r['total'], 'every partial match is still returned');
+	$single = search($platform, 'alice', 'report', ['provider' => 'idf', 'size' => 50]);
+	same(30, $single['total'], 'single-word search unchanged');
+	$expected = (float)$conn->executeQuery(
+		"SELECT round((ts_rank_cd(tsv, to_tsquery('english', 'report:*'), 32) * 100)::numeric, 2) FROM ftspg_oc_index WHERE document_id = 'R1'"
+	)->fetchOne();
+	same($expected, (float)$single['docs'][0]->getScore(), 'single-word score is plain ts_rank_cd, as before');
+	$r = search($platform, 'bob', 'report zanzibar', ['provider' => 'idf', 'size' => 5]);
+	check(!in_array('Z1', $r['ids'], true), 'frequencies come from the viewer\'s own documents (bob does not see Z1)');
+	same('Z1', search($platform, 'alice', 'the report zanzibar', ['provider' => 'idf'])['ids'][0] ?? null, 'a stopword among the terms gets no weight');
+	same('Z1', search($platform, 'alice', 'report zanzibar qqxyzzy', ['provider' => 'idf'])['ids'][0] ?? null, 'a word no document contains gets no weight');
+	same('Z1', search($platform, 'alice', 'report "booked to zanzibar"', ['provider' => 'idf'])['ids'][0] ?? null, 'phrases are weighted like words');
+	same('Z1', search($platform, 'alice', 'report zanzibr', ['provider' => 'idf'])['ids'][0] ?? null, 'typo corrections count towards the term they correct');
+	$many = search($platform, 'alice', 'report zanzibar a1 b2 c3 d4 e5 f6 g7', ['provider' => 'idf']);
+	same(31, $many['total'], 'more than 8 terms falls back to one combined rank');
+	$platform->resetIndex('idf');
+	for ($i = 1; $i <= 30; $i++) {
+		$platform->indexDocument(doc("T$i", 'alice', "Report $i", 'Figures.', [], 'idf'));
+	}
+	$platform->indexDocument(doc('T99', 'alice', 'Zanzibar trip', 'Notes.', [], 'idf'));
+	same('T99', search($platform, 'alice', 'report zanzibar', ['provider' => 'idf'])['ids'][0] ?? null, 'among title matches, the rare word ranks first');
+	$platform->resetIndex('idf');
+	// Terms matching over a quarter of the index are ranked in the unfenced query shape.
+	$common = intdiv((int)$conn->executeQuery('SELECT count(*) FROM ftspg_oc_index')->fetchOne(), 2) + 10;
+	for ($i = 1; $i <= $common; $i++) {
+		$platform->indexDocument(doc("C$i", 'alice', "Memo $i", 'Weekly status and the status summary.', [], 'idf'));
+	}
+	$platform->indexDocument(doc('C0', 'alice', 'Trip notes', 'Flights booked to Zanzibar in March.', [], 'idf'));
+	$r = search($platform, 'alice', 'status zanzibar', ['provider' => 'idf', 'size' => 5]);
+	same('C0', $r['ids'][0] ?? null, 'rare word first when the common one matches most of the index too');
+	same($common + 1, $r['total'], 'and every match is counted');
+	$p2 = search($platform, 'alice', 'status zanzibar', ['provider' => 'idf', 'size' => 5, 'page' => 2]);
+	same([], array_values(array_intersect($r['ids'], $p2['ids'])), 'pages of an IDF-ranked search do not overlap');
+	$platform->resetIndex('idf');
+	// Over 10,000 matches: the frequency comes from the planner's estimate, N from reltuples.
+	$conn->executeStatement(
+		"INSERT INTO ftspg_oc_index (provider_id, document_id, owner_id, access, config, title, content)
+		 SELECT 'idf', 'X' || n, 'alice', '{u:alice}', 'english', 'Log ' || n, 'daily ledger and the ledger totals'
+		 FROM generate_series(1, 10050) n"
+	);
+	$platform->indexDocument(doc('X0', 'alice', 'Trip notes', 'Flights booked to Zanzibar in March.', [], 'idf'));
+	$conn->executeStatement('ANALYZE ftspg_oc_index');
+	$r = search($platform, 'alice', 'ledger zanzibar', ['provider' => 'idf', 'size' => 5]);
+	same('X0', $r['ids'][0] ?? null, 'a word in 10,000+ documents is weighed by its estimated frequency');
+	same(10051, $r['total'], 'all of them still match');
+	$platform->resetIndex('idf');
+	$conn->executeStatement('ANALYZE ftspg_oc_index');
+
 	section('file names');
 	$config->setConfig(['language' => 'english']);
 	$platform->indexDocument(doc('N1', 'alice', 'rapor_2025_final.pdf', ''));
@@ -747,6 +809,9 @@ try {
 	same(['M1'], search($platform, 'alice', '+studies +archive')['ids'], 'required terms in the English branch');
 	same([], search($platform, 'alice', 'studies -archive')['ids'], 'exclusions in the English branch');
 	same(['M2'], search($platform, 'alice', '"kütüphaneye verdik"')['ids'], 'phrases in the Turkish branch');
+	same(['M1', 'M2'], sorted(search($platform, 'alice', 'study kitaplarımız')['ids']), 'IDF-weighted search across both languages, each term stemmed per document');
+	$ids = search($platform, 'alice', 'studies rapor')['ids'];
+	same([], array_values(array_diff(['M1', 'M2', 'M3'], $ids)), 'terms that match in one language only still find their documents');
 
 	// Only metadata changed (a share): the content is not sent again, the language stays.
 	$platform->indexDocument(doc('M1', 'alice', 'Annual review', '', ['users' => ['bob']], 'files', IIndex::INDEX_META));

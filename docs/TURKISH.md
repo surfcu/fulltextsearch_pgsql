@@ -64,6 +64,10 @@ Kelimeler ayrıca **önek** olarak da eşleşir, yani yazarken sonuçlar gelir: 
 
 Dosya adları kelimelere ayrılarak dizinlenir: `final`, `2025` veya `final.pdf` aramaları *rapor_2025_final.pdf* dosyasını bulur. `pg_trgm` kuruluysa, en az üç harfli bir kelime başlığın herhangi bir yerinde de eşleşir: `butce` aramasıyla *YillikButceRaporu.xlsx* bulunur. Bu eşleşmeler normal kelime eşleşmelerinin altında sıralanır ve noktalı/noktasız I kuralına uyar (`IKLANDIR` aramasıyla *ISIKLANDIRMA_PLANI.pdf* bulunur).
 
+### Birden çok kelimeyle arama: nadir kelimeler daha ağır basar
+
+Birden çok kelimeyle aranınca her kelime, göremediğiniz belgeler hariç kaç belgede geçtiğine göre ağırlıklandırılır (BM25'in ters belge sıklığı). `fatura kırklareli` aramasında *Kırklareli* geçen birkaç belge, yalnızca *fatura* geçen yüzlerce belgenin önüne çıkar. Tüm kelimeleri içeren belgeler yine en üstte listelenir; tek kelimelik aramaların sıralaması değişmez.
+
 ### Noktalı ve noktasız I
 
 PostgreSQL küçük harfe çevirirken veritabanının yerel ayarını (locale) kullanır. Bu ayar neredeyse hiçbir zaman `tr_TR` değildir, bu yüzden normalde `I` harfi `ı` yerine `i` olur. Sonuç olarak `ISPARTA` aramada `ısparta` ile eşleşmez, büyük harfle yazılmış metinler kaçar.

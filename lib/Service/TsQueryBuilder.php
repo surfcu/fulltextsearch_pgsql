@@ -140,7 +140,7 @@ class TsQueryBuilder {
 		$rank = $this->join($positiveTs, '||');
 		$all = $this->join($positivePreds, 'AND');
 
-		return new ParsedQuery($match[0], $match[1], $rank[0], $rank[1], $all[0], $all[1], implode(' ', $words));
+		return new ParsedQuery($match[0], $match[1], $rank[0], $rank[1], $all[0], $all[1], implode(' ', $words), $positiveTs);
 	}
 
 	/**

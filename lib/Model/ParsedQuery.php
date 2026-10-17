@@ -17,6 +17,8 @@ final class ParsedQuery {
 	 * @param string $allSql boolean SQL on "d": documents containing every positive term, ranked first
 	 * @param list<string> $allParams
 	 * @param string $plainText the positive search words, for trigram matching
+	 * @param list<array{0: string, 1: list<string>}> $terms one tsquery expression per positive
+	 *                                                       term, in query order, for IDF weighting
 	 */
 	public function __construct(
 		public readonly string $sql,
@@ -26,6 +28,7 @@ final class ParsedQuery {
 		public readonly string $allSql,
 		public readonly array $allParams,
 		public readonly string $plainText,
+		public readonly array $terms = [],
 	) {
 	}
 }

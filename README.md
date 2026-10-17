@@ -5,6 +5,7 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 ## Features
 
 - **Ranked results with excerpts.** Title matches outrank tags, which outrank comments and other document parts, which outrank body text. Excerpts come from `ts_headline`.
+- **Rare words count more.** In a search with several words, each word is weighted by how few of the documents you can see contain it (BM25's inverse document frequency), so `invoice kırklareli` puts the few documents mentioning *Kırklareli* ahead of the many that only mention invoices. Documents containing every word still come first.
 - **Search-as-you-type.** Words match as prefixes: `rap` finds *rapor*, *raporlar*.
 - **File names are split into words.** `final`, `2025` or `final.pdf` all find *rapor_2025_final.pdf*; `img` finds *IMG20250412.jpg*. PostgreSQL would otherwise treat each file name as a single word.
 - **Substring matching in titles.** A word of three or more letters also matches anywhere inside a title: `butce` finds *YillikButceRaporu.xlsx*. These matches rank below normal word matches. Needs `pg_trgm`.

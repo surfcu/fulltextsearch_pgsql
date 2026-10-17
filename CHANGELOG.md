@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Office files: Excel numbers, formula results, inline strings, sheet names, comments and text boxes; Word comments and text boxes; SmartArt in Word, Excel and PowerPoint.
 
 ### Changed
+- Searches with several words rank by how rare each word is (BM25's inverse document frequency): a document with the one unusual word of a search is no longer buried under documents repeating the common one. Frequencies are counted among the documents the searching user can see; documents containing every word still come first, and single-word searches rank exactly as before. Multi-word searches matching thousands of documents take up to about 50% longer (see docs/ARCHITECTURE.md). No re-index needed.
 - Saving settings validates every value before storing any, so an invalid value no longer leaves the others half-applied.
 - A `pdftotext` that exits with an error and no output is reported as a failure instead of "no extractable text".
 
