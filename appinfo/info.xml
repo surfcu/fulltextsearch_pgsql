@@ -6,8 +6,9 @@
     <summary>PostgreSQL platform for Full Text Search</summary>
     <description><![CDATA[Index and search your Nextcloud using PostgreSQL's built-in full-text search, with no extra search server.
 
-- Weighted ranking (title > tags > comments/parts > content) with highlighted excerpts
+- Weighted ranking (title > tags > comments/parts > content), with rare words counting more in searches with several words, and excerpts around the match even in long documents
 - Prefix matching while typing, "exact phrases", -exclusions and OR
+- The Files app's filters: by extension, file name or content only, local/external/group folders
 - Typo correction and search without diacritics ("calisma" finds "çalışma")
 - Substring matching in titles and file names split into words
 - Every text search language your PostgreSQL server ships, including Turkish, and several at once: each document is indexed in its own language
@@ -16,7 +17,7 @@
 - Settings and status in Administration settings → Full text search, or with occ
 
 Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
-    <version>1.3.0</version>
+    <version>1.4.0</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>surfcu</author>
     <namespace>FullTextSearch_PgSql</namespace>
@@ -28,6 +29,7 @@ Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search a
     <website>https://github.com/surfcu/fulltextsearch_pgsql</website>
     <bugs>https://github.com/surfcu/fulltextsearch_pgsql/issues</bugs>
     <repository type="git">https://github.com/surfcu/fulltextsearch_pgsql</repository>
+    <screenshot>https://raw.githubusercontent.com/surfcu/fulltextsearch_pgsql/main/screenshots/admin-settings.png</screenshot>
 
     <dependencies>
         <php min-version="8.1"/>

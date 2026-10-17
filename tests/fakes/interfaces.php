@@ -23,6 +23,9 @@ namespace OCP {
 		public function executeQuery(string $sql, array $params = [], $types = []): DB\IResult;
 		public function executeStatement($sql, array $params = [], array $types = []): int;
 		public function inTransaction(): bool;
+		public function beginTransaction(): void;
+		public function commit(): void;
+		public function rollBack(): void;
 		public function getDatabaseProvider(): string;
 	}
 
