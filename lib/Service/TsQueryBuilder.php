@@ -21,6 +21,11 @@ use OCA\FullTextSearch_PgSql\Model\ParsedQuery;
  * With substring matching on (needs pg_trgm), a word of 3+ characters also matches when it
  * appears anywhere inside a title: "butce" finds "YillikButceRaporu.xlsx".
  *
+ * A search can be limited to some fields ("search in: file name / content"). The fields are
+ * passed as tsvector weight labels (A title, B tags, C parts, D content): words carry them as
+ * tsquery weights ('rapor':*A), which the GIN index still serves with a recheck; phrases, which
+ * phraseto_tsquery cannot label, are rechecked against ts_filter(tsv, weights).
+ *
  * User text never reaches SQL or the tsquery syntax unescaped: each term is a bound
  * parameter, quoted as a tsquery literal or escaped as a LIKE pattern.
  */
@@ -61,12 +66,18 @@ class TsQueryBuilder {
 	/**
 	 * @param bool $substring also match words inside titles (title_search LIKE '%word%')
 	 * @param array<string, list<string>> $alternatives lowercase word => words ORed in for it
+	 * @param string|null $weights only match in these fields, as tsvector weight labels ("A", "AD");
+	 *                             null for every field
 	 * @return ParsedQuery|null null when there is nothing positive to look for
 	 */
-	public function build(string $search, string $language, bool $substring = false, array $alternatives = []): ?ParsedQuery {
+	public function build(string $search, string $language, bool $substring = false, array $alternatives = [], ?string $weights = null): ?ParsedQuery {
 		$matches = $this->tokenize($search, $language);
+		if ($weights !== null && !str_contains($weights, 'A')) {
+			$substring = false; // titles are not searched
+		}
+		$filterWeights = $weights === null ? null : '{' . implode(',', str_split(strtolower($weights))) . '}';
 
-		/** @var array<string, list<array{ts: array{0: string, 1: list<string>}, pred: array{0: string, 1: list<string>}}>> $terms */
+		/** @var array<string, list<array{ts: array{0: string, 1: list<string>}, pred: array{0: string, 1: list<string>}, phrase: bool}>> $terms */
 		$terms = ['optional' => [], 'required' => [], 'excluded' => []];
 		$words = [];
 		$count = 0;
@@ -93,10 +104,17 @@ class TsQueryBuilder {
 				$ts = ['phraseto_tsquery(CAST(? AS regconfig), ?)', [$language, $text]];
 			} else {
 				$alts = $kind === 'excluded' ? [] : ($alternatives[mb_strtolower($text, 'UTF-8')] ?? []);
-				$ts = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $this->wordQuery($text, $kind !== 'excluded', $alts)]];
+				$ts = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $this->wordQuery($text, $kind !== 'excluded', $alts, $weights ?? '')]];
 			}
 
 			$pred = ['d.tsv @@ ' . $ts[0], $ts[1]];
+			if ($isPhrase && $filterWeights !== null) {
+				// The index finds the phrase anywhere; the recheck keeps it in the requested fields.
+				$pred = [
+					'(d.tsv @@ ' . $ts[0] . ' AND ts_filter(d.tsv, CAST(? AS "char"[])) @@ ' . $ts[0] . ')',
+					[...$ts[1], $filterWeights, ...$ts[1]],
+				];
+			}
 			if ($substring && !$isPhrase && $kind !== 'excluded' && mb_strlen($text) >= self::MIN_SUBSTRING_LENGTH) {
 				$pattern = '%' . addcslashes(mb_strtolower($text, 'UTF-8'), '\\%_') . '%';
 				// numnode() = 0 for stopwords ("the"), which must not substring-match "Other".
@@ -107,7 +125,7 @@ class TsQueryBuilder {
 				];
 			}
 
-			$terms[$kind][] = ['ts' => $ts, 'pred' => $pred];
+			$terms[$kind][] = ['ts' => $ts, 'pred' => $pred, 'phrase' => $isPhrase];
 			if ($kind !== 'excluded') {
 				$words[] = $text;
 			}
@@ -125,9 +143,23 @@ class TsQueryBuilder {
 		}
 
 		$match = $base;
-		if ($excluded !== []) {
+		if ($excluded !== [] && $filterWeights === null) {
 			$none = $this->join($excluded, '||');
 			$match = ['(' . $base[0] . ' AND NOT (d.tsv @@ ' . $none[0] . '))', [...$base[1], ...$none[1]]];
+		} elseif ($excluded !== []) {
+			// Exclusions only apply within the requested fields too.
+			/** @var list<array{0: string, 1: list<string>}> $exclusions */
+			$exclusions = [];
+			foreach ($terms['excluded'] as $term) {
+				[$tsSql, $tsParams] = $term['ts'];
+				$exclusions[] = $term['phrase']
+					? ['ts_filter(d.tsv, CAST(? AS "char"[])) @@ ' . $tsSql, [$filterWeights, ...$tsParams]]
+					: ['d.tsv @@ ' . $tsSql, $tsParams];
+			}
+			if ($exclusions !== []) {
+				[$noneSql, $noneParams] = $this->join($exclusions, 'OR');
+				$match = ['(' . $base[0] . ' AND NOT (' . $noneSql . '))', [...$base[1], ...$noneParams]];
+			}
 		}
 
 		/** @var list<array{0: string, 1: list<string>}> $positiveTs */
@@ -149,9 +181,12 @@ class TsQueryBuilder {
 	 * in sequence. The whole form still matches host names and e-mail addresses in content;
 	 * the parts match the split copy of titles.
 	 */
-	/** @param list<string> $alternatives typo corrections and accent variants, prefix-matched */
-	private function wordQuery(string $word, bool $prefix, array $alternatives = []): string {
-		$suffix = $prefix ? ':*' : '';
+	/**
+	 * @param list<string> $alternatives typo corrections and accent variants, prefix-matched
+	 * @param string $weights tsquery weight labels restricting the fields ("A", "AD"), '' for all
+	 */
+	private function wordQuery(string $word, bool $prefix, array $alternatives = [], string $weights = ''): string {
+		$suffix = $prefix ? ':*' . $weights : ($weights === '' ? '' : ':' . $weights);
 		$forms = [$this->literal($word) . $suffix];
 
 		$split = trim((string)preg_replace(array_keys(self::SPLIT_PATTERNS), array_values(self::SPLIT_PATTERNS), $word));
@@ -160,7 +195,7 @@ class TsQueryBuilder {
 			$forms[] = implode(' <-> ', array_map(fn (string $p): string => $this->literal($p) . $suffix, $parts));
 		}
 		foreach ($alternatives as $alternative) {
-			$forms[] = $this->literal($alternative) . ':*';
+			$forms[] = $this->literal($alternative) . ':*' . $weights;
 		}
 
 		return count($forms) === 1 ? $forms[0] : '(' . implode(') | (', $forms) . ')';

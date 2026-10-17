@@ -24,6 +24,19 @@ class SearchService {
 	private const FENCE_FRACTION = 0.25;
 	/** Terms matching more documents than this get the planner's estimate instead of an exact count. */
 	private const EXACT_FREQUENCY_LIMIT = 10000;
+	/**
+	 * Excerpts of longer texts come from this many characters around the first match: ts_headline
+	 * tokenizes all the text it is given, 70–90 ms for a 500 KB document.
+	 */
+	private const EXCERPT_WINDOW = 10000;
+	/** Characters kept before the first match, so a fragment can start a little earlier. */
+	private const EXCERPT_LEAD = 500;
+	/** Longest regex or wildcard filter pattern accepted from a search request. */
+	private const MAX_FILTER_PATTERN = 256;
+	/** Search request fields and the tsvector weight they are indexed with (see SchemaService). */
+	private const FIELD_WEIGHTS = ['title' => 'A', 'tags' => 'B', 'parts' => 'C', 'content' => 'D'];
+	/** Columns regex and wildcard filters can test. */
+	private const FILTER_COLUMNS = ['title' => 'd.title', 'content' => 'd.content'];
 	private const HEADLINE_OPTIONS = 'StartSel="",StopSel="",MaxFragments=3,MaxWords=30,MinWords=12,FragmentDelimiter="' . self::FRAGMENT_DELIMITER . '"';
 
 	public function __construct(
@@ -43,6 +56,12 @@ class SearchService {
 		$viewerTokens = AccessTokens::forViewer($access);
 		$languages = $this->configService->getLanguages();
 		$search = $request->getSearch();
+		$weights = $this->limitWeights($request->getLimitFields());
+		if ($weights === '') {
+			// Limited to fields this platform does not index.
+			$result->setTotal(0);
+			return;
+		}
 
 		$alternatives = [];
 		if ($this->configService->useTypoCorrection()) {
@@ -57,7 +76,7 @@ class SearchService {
 		/** @var array<string, ParsedQuery> $queries */
 		$queries = [];
 		foreach ($languages as $language) {
-			$query = $this->queryBuilder->build($search, $language, $this->fuzzyAvailable(), $alternatives);
+			$query = $this->queryBuilder->build($search, $language, $this->fuzzyAvailable(), $alternatives, $weights);
 			if ($query === null) {
 				break;
 			}
@@ -73,8 +92,13 @@ class SearchService {
 		$page = max(1, $request->getPage());
 		[$filterSql, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
 
-		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $size, ($page - 1) * $size);
-		if ($rows === [] && $page === 1 && $this->fuzzyAvailable() && $query->plainText !== '') {
+		$excerptWords = [];
+		foreach ($languages as $language) {
+			array_push($excerptWords, ...$this->queryBuilder->searchWords($search, $language));
+		}
+		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $size, ($page - 1) * $size, array_values(array_unique($excerptWords)));
+		$titlesSearched = $weights === null || str_contains($weights, 'A');
+		if ($rows === [] && $page === 1 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '') {
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
 			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size);
 		}
@@ -167,7 +191,98 @@ class SearchService {
 			$params[] = (string)$since;
 		}
 
+		// Each filter is a group of entries (field => pattern), any of which may match; every group
+		// must match. Same semantics as the Elasticsearch platform. The Files app's "filter by
+		// extension" arrives as one regex group with one entry: [['title' => '.*\.pdf']].
+		foreach ($request->getWildcardFilters() as $group) {
+			[$groupSql, $groupParams] = $this->patternGroup($group, false);
+			$sql .= " AND $groupSql";
+			array_push($params, ...$groupParams);
+		}
+		foreach ($request->getRegexFilters() as $group) {
+			[$groupSql, $groupParams] = $this->patternGroup($group, true);
+			$sql .= " AND $groupSql";
+			array_push($params, ...$groupParams);
+		}
+
 		return [$sql, $params];
+	}
+
+	/**
+	 * One wildcard or regex filter group as SQL: its entries ORed. A group is a list of entries,
+	 * each a field => pattern map, as the Elasticsearch platform reads them.
+	 *
+	 * Like Elasticsearch's wildcard and regexp queries, a pattern must match the whole value.
+	 * Matching ignores case, as Elasticsearch's analysed titles do. Wildcards are * and ?.
+	 * A regex is checked before it reaches PostgreSQL, where an invalid one would fail the
+	 * whole search: anything PCRE rejects, or uses constructs PostgreSQL lacks, matches nothing.
+	 * So does a field this platform has no column for.
+	 *
+	 * @return array{0: string, 1: list<string>}
+	 */
+	private function patternGroup(mixed $group, bool $regex): array {
+		$entries = [];
+		$params = [];
+		$pairs = [];
+		foreach (is_array($group) ? $group : [] as $entry) {
+			foreach (is_array($entry) ? $entry : [] as $field => $pattern) {
+				$pairs[] = [(string)$field, $pattern];
+			}
+		}
+		foreach ($pairs as [$field, $pattern]) {
+			$column = self::FILTER_COLUMNS[$field] ?? null;
+			if ($column === null || !is_string($pattern) || $pattern === '' || strlen($pattern) > self::MAX_FILTER_PATTERN) {
+				continue;
+			}
+			if ($regex) {
+				if (!self::isPortableRegex($pattern)) {
+					continue;
+				}
+				$entries[] = "$column ~* ?";
+				$params[] = '^(?:' . $pattern . ')$';
+			} else {
+				$entries[] = "$column ILIKE ?";
+				$params[] = strtr($pattern, ['\\' => '\\\\', '%' => '\\%', '_' => '\\_', '*' => '%', '?' => '_']);
+			}
+		}
+		return $entries === [] ? ['FALSE', []] : ['(' . implode(' OR ', $entries) . ')', $params];
+	}
+
+	/** A regex both PCRE and PostgreSQL accept with the same meaning, as far as can be told cheaply. */
+	private static function isPortableRegex(string $pattern): bool {
+		/*
+		 * Rejected: \K, \Q…\E, \R, \h, \v, \X, \A, \z, \Z, \G, and \b, \B (a backspace in PostgreSQL,
+		 * not a word boundary) – missing or different there;
+		 * groups starting with "(?" other than (?:, (?= and (?! (named and atomic groups, branch
+		 * reset, inline flags); possessive quantifiers such as a++.
+		 */
+		if (preg_match('/\\\\[KXRhHvVQEGAzZbB]|\\(\\?[^:=!]|[*+?}]\\+/', $pattern)) {
+			return false;
+		}
+		return @preg_match('/' . str_replace('/', '\\/', $pattern) . '/u', '') !== false;
+	}
+
+	/**
+	 * Fields a search is limited to ("search in: file name / content"), as tsvector weight labels:
+	 * null for no limit, '' when none of them is indexed by this platform.
+	 *
+	 * @param array<array-key, mixed> $fields
+	 */
+	private function limitWeights(array $fields): ?string {
+		if ($fields === []) {
+			return null;
+		}
+		$weights = [];
+		foreach ($fields as $field) {
+			$field = (string)$field;
+			// Comments and other parts arrive as "parts.comments".
+			$key = str_starts_with($field, 'parts.') ? 'parts' : $field;
+			if (isset(self::FIELD_WEIGHTS[$key])) {
+				$weights[self::FIELD_WEIGHTS[$key]] = true;
+			}
+		}
+		ksort($weights);
+		return implode('', array_keys($weights));
 	}
 
 	/**
@@ -179,9 +294,10 @@ class SearchService {
 	 *
 	 * @param non-empty-array<string, ParsedQuery> $queries language => compiled query, fallback first
 	 * @param list<string> $filterParams
+	 * @param list<string> $excerptWords the search words as typed, lowercased, to find the excerpt window
 	 * @return list<array<string, mixed>>
 	 */
-	private function fullTextSearch(array $queries, string $filterSql, array $filterParams, int $limit, int $offset): array {
+	private function fullTextSearch(array $queries, string $filterSql, array $filterParams, int $limit, int $offset, array $excerptWords = []): array {
 		$t = $this->schemaService->getTableName();
 		$languages = array_keys($queries);
 		$others = array_slice($languages, 1);
@@ -219,6 +335,8 @@ class SearchService {
 		$matchSql = count($match) === 1 ? $match[0] : '(' . implode(' OR ', $match) . ')';
 		$allSql = count($all) === 1 ? $all[0] : '(' . implode(' OR ', $all) . ')';
 
+		$excerptSql = $this->excerptSource();
+		$headlineSql = $this->headlineSql();
 		[$rankSql, $rankSqlParams, $termColumns, $termParams, $fence]
 			= $this->idfRanking($queries, $conditions, $filterSql, $filterParams, $rankQuery, $rankCaseParams);
 		$rankColumnsSql = implode(', ', [...$rankColumns, ...$termColumns]);
@@ -232,7 +350,7 @@ class SearchService {
 			$sql = <<<SQL
 				WITH q AS (SELECT $rankColumnsSql)
 				SELECT m.document_id, m.title, m.source, m.hash, m.modified_time, m.rank, m.total,
-					   ts_headline(m.config, m.body, m.rank_query, ?) AS excerpt
+					   h.excerpt
 				FROM (
 					SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config, d.body, d.all_match,
 						   $rankQuery AS rank_query,
@@ -249,12 +367,15 @@ class SearchService {
 					ORDER BY d.all_match DESC, rank DESC, d.modified_time DESC, d.id
 					LIMIT ? OFFSET ?
 				) m
+				CROSS JOIN LATERAL ($excerptSql) e
+				CROSS JOIN LATERAL ($headlineSql) h
 				ORDER BY m.all_match DESC, m.rank DESC, m.modified_time DESC, m.id
 				SQL;
 			$params = array_merge(
-				$rankParams, $termParams, [self::HEADLINE_OPTIONS],
+				$rankParams, $termParams,
 				$rankCaseParams, $rankSqlParams, $allParams, $matchParams,
-				$filterParams, [(string)$limit, (string)$offset]
+				$filterParams, [(string)$limit, (string)$offset],
+				[PgArray::toLiteral($excerptWords), self::HEADLINE_OPTIONS, self::HEADLINE_OPTIONS]
 			);
 		} else {
 			// The inner query filters, ranks and pages; ts_headline (expensive) only runs on the page.
@@ -262,7 +383,7 @@ class SearchService {
 			$sql = <<<SQL
 				WITH q AS (SELECT $rankColumnsSql)
 				SELECT m.document_id, m.title, m.source, m.hash, m.modified_time, m.rank, m.total,
-					   ts_headline(m.config, m.body, m.rank_query, ?) AS excerpt
+					   h.excerpt
 				FROM (
 					SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config,
 						   CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END AS body,
@@ -275,19 +396,85 @@ class SearchService {
 					ORDER BY all_match DESC, rank DESC, d.modified_time DESC, d.id
 					LIMIT ? OFFSET ?
 				) m
+				CROSS JOIN LATERAL ($excerptSql) e
+				CROSS JOIN LATERAL ($headlineSql) h
 				ORDER BY m.all_match DESC, m.rank DESC, m.modified_time DESC, m.id
 				SQL;
 
 			$params = array_merge(
-				$rankParams, $termParams, [self::HEADLINE_OPTIONS],
+				$rankParams, $termParams,
 				$rankCaseParams, $allParams, $rankSqlParams, $matchParams,
-				$filterParams, [(string)$limit, (string)$offset]
+				$filterParams, [(string)$limit, (string)$offset],
+				[PgArray::toLiteral($excerptWords), self::HEADLINE_OPTIONS, self::HEADLINE_OPTIONS]
 			);
 		}
 		$result = $this->db->executeQuery($sql, $params);
 		$rows = $result->fetchAll();
 		$result->closeCursor();
 		return $rows;
+	}
+
+	/**
+	 * The text ts_headline excerpts for a result row of the page (alias m): the whole body when
+	 * it is short, otherwise EXCERPT_WINDOW characters starting a little before the first match.
+	 *
+	 * The first match is the earliest position of any search word as typed, or of any lexeme of
+	 * the row's own tsquery (stems, accent variants, typo corrections), in the lowercased body,
+	 * preferring a word start. Stems usually begin their surface forms ("rapor" in "raporları").
+	 * When nothing is found, the window starts at the beginning, which is what ts_headline
+	 * shows anyway when it finds no match. Text past the window is not used for fragments.
+	 *
+	 * One parameter: the search words, as a text[] literal.
+	 */
+	private function excerptSource(): string {
+		$window = self::EXCERPT_WINDOW;
+		$lead = self::EXCERPT_LEAD;
+		$lowered = 'lower(' . $this->schemaService->normalized('b.text') . ')';
+		// querytree() prints the lexemes quoted, with quotes inside doubled: 'o''brien':*
+		$lexemes = "SELECT replace((regexp_matches(querytree(m.rank_query)::text, '''((?:[^'']|'''')+)''', 'g'))[1], '''''', '''')";
+		// A long body is detoasted once, into b.text: every function given the column itself
+		// would decompress it again, about 3 ms per 500 KB. octet_length() reads the stored size
+		// without decompressing; a body short in bytes is short in characters too. OFFSET 0 keeps
+		// PostgreSQL from inlining the subqueries, which would repeat the work at every use.
+		return <<<SQL
+			SELECT CASE WHEN b.text IS NULL THEN m.body
+			            ELSE substr(b.text, greatest(1, coalesce((
+			                SELECT min(p.pos) FROM (
+			                    SELECT CASE WHEN starts_with(l.lb, w.word) THEN 1
+			                                ELSE coalesce(nullif(strpos(l.lb, ' ' || w.word), 0) + 1, strpos(l.lb, w.word)) END AS pos
+			                    FROM (SELECT $lowered AS lb OFFSET 0) l,
+			                         unnest(CAST(? AS text[]) || ARRAY($lexemes)) AS w(word)
+			                    WHERE w.word <> ''
+			                ) p WHERE p.pos > 0
+			            ), 1) - $lead), $window) END AS source
+			FROM (SELECT CASE WHEN octet_length(m.body) > $window THEN m.body || '' END AS text OFFSET 0) b
+			SQL;
+	}
+
+	/**
+	 * The excerpt of a result row (alias m) from its excerpt source (alias e), as a lateral
+	 * subquery. Two parameters: the headline options, twice.
+	 *
+	 * Turkish rows are indexed with I mapped to ı and İ to i (see SchemaService::normalized()),
+	 * but ts_headline lowercases with the database locale, so uppercase words like ISPARTA would
+	 * never match the query and their excerpts would miss them. The mapped text is excerpted
+	 * instead, and each fragment is copied back from the original text at the same position:
+	 * the mapping replaces one character with one character, so positions agree, and users see
+	 * the text as written.
+	 */
+	private function headlineSql(): string {
+		$delimiter = self::FRAGMENT_DELIMITER;
+		return <<<SQL
+			SELECT CASE WHEN m.config = 'turkish'::regconfig THEN array_to_string(ARRAY(
+			           SELECT CASE WHEN strpos(n.text, f.fragment) > 0
+			                       THEN substr(e.source, strpos(n.text, f.fragment), length(f.fragment))
+			                       ELSE f.fragment END
+			           FROM (SELECT translate(e.source, 'Iİ', 'ıi') AS text) n,
+			                unnest(string_to_array(ts_headline(m.config, n.text, m.rank_query, ?), '$delimiter')) WITH ORDINALITY AS f(fragment, i)
+			           ORDER BY f.i
+			       ), '$delimiter')
+			       ELSE ts_headline(m.config, e.source, m.rank_query, ?) END AS excerpt
+			SQL;
 	}
 
 	/**

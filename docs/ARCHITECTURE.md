@@ -140,6 +140,19 @@ User text is always a bound parameter and quoted as a tsquery literal, so neithe
 
 The query pages inside a subquery and computes `count(*) OVER ()` for the total; `ts_headline` then runs only on the returned page. Excerpts are plain text (no markup), split into fragments.
 
+### Excerpts
+
+`ts_headline` tokenizes all the text it is given: 70–90 ms for a 500 KB document, so a page of long results spent over a second on excerpts alone. Bodies over 10,000 bytes are excerpted from a 10,000-character window starting 500 characters before the first match. The first match is the earliest position, in the lowercased body, of any search word as typed or any lexeme of the row's tsquery (stems, accent variants, typo corrections, read from `querytree()`), preferring a word start; stems usually begin their surface forms. Without a match (a title-only hit) the window starts at the beginning, as `ts_headline` would show anyway. A long body is detoasted once into a subquery column, and `octet_length()` decides "long" from the stored size without decompressing; `OFFSET 0` keeps PostgreSQL from inlining those subqueries and repeating the work at each use. On 20 results of 550 KB, excerpts take 280 ms instead of 1.5 s.
+
+For Turkish rows, `ts_headline` sees the text with `I→ı`, `İ→i` applied, like the indexed vector, otherwise `ISPARTA` would lowercase to `isparta` and never match. Each fragment is then copied back from the original text at the same position (the mapping is one character for one character), so excerpts show the text as written.
+
+### Filters and limited fields
+
+The Files app's search options arrive as request fields, interpreted as the Elasticsearch platform does:
+
+- **Regex and wildcard filters** (*filter by extension* is the regex group `[['title' => '.*\.pdf']]`): entries of a group are ORed, groups are ANDed, and a pattern must match the whole `title` or `content`, ignoring case (`~*` with `^(?:…)$`; wildcards `*` and `?` become `ILIKE`). A regex that PCRE rejects, or that uses constructs PostgreSQL reads differently (`\K`, `\Q…\E`, `\b`, named or atomic groups, inline flags, possessive quantifiers), matches nothing instead of failing the statement. So does a field without a column.
+- **Limit fields** (*search in file name / content*): `title`, `tags`, `parts.*` and `content` map to the vector weights A, B, C and D. Words carry them as tsquery weights (`'rapor':*A`), still served by the GIN index with a recheck; phrases, which `phraseto_tsquery` cannot label, are rechecked against `ts_filter(tsv, '{a}')`; exclusions only exclude within the limited fields. Title substring and title similarity matching only run when titles are searched. A limit naming no indexed field finds nothing.
+
 ### Ranking several words by rarity
 
 `ts_rank_cd` counts occurrences and weights them by field (title A, tags B, parts C, body D), but it has no idea how common a word is. In `invoice kırklareli`, a document mentioning *invoice* twice in its body outranks the one document mentioning *Kırklareli* once, although nearly every document says *invoice*. With two to eight positive terms (words or phrases), each one is scored separately and weighted by BM25's inverse document frequency:
