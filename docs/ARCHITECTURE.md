@@ -135,10 +135,43 @@ That is a single GIN-indexed test. Share links are stored for `getDocument()` bu
 User text is always a bound parameter and quoted as a tsquery literal, so neither SQL nor tsquery operators can be injected. Three expressions are built:
 
 - **match**: required terms ANDed (or, if there are none, optional terms ORed), minus exclusions;
-- **rank**: every positive term, for `ts_rank_cd`;
+- **rank**: every positive term, for `ts_rank_cd`, and each positive term on its own for IDF weighting (below);
 - **all**: every positive term ANDed. Rows matching it sort first, so precise matches are never buried under partial ones.
 
 The query pages inside a subquery and computes `count(*) OVER ()` for the total; `ts_headline` then runs only on the returned page. Excerpts are plain text (no markup), split into fragments.
+
+### Ranking several words by rarity
+
+`ts_rank_cd` counts occurrences and weights them by field (title A, tags B, parts C, body D), but it has no idea how common a word is. In `invoice kırklareli`, a document mentioning *invoice* twice in its body outranks the one document mentioning *Kırklareli* once, although nearly every document says *invoice*. With two to eight positive terms (words or phrases), each one is scored separately and weighted by BM25's inverse document frequency:
+
+```
+idf_i = ln(1 + (N - df_i + 0.5) / (df_i + 0.5))
+rank  = Σ idf_i · ts_rank_cd(tsv, term_i, 32) / Σ idf_i
+```
+
+Normalisation 32 maps each term's weighted occurrence count *c* to *c* / (*c* + 1), a saturating term frequency like BM25's, and the weighted mean keeps `rank` between 0 and 1. Rows containing every term still sort first (`all_match`); the IDF rank orders within that group and among partial matches. Field weights still apply inside each term's score, so a common word in a title can still beat a rare word in body text, as it would with BM25F.
+
+**Frequencies.** Before the search, one statement counts each term's documents with its own subquery: the term's `@@` in each language branch plus the search filters (provider, access tokens, tags, `since`). The GIN indexes answer those conditions exactly, so rows are counted without reading their tsvector; one scan with a `FILTER` per term would detoast every match once per term, six times slower on long documents. Only documents the viewer can open are counted, so ranking reveals nothing about other users' documents.
+
+- Counting stops at 10,000 matches. For a term that common, the planner's estimate (`EXPLAIN (FORMAT JSON)` of the same subquery) is used instead: `ANALYZE` keeps statistics on the most common lexemes, so the estimate is within a few percent for frequent words, and exact counts are spent on rare words, where they matter.
+- **N** is `pg_class.reltuples` for the index table, or an exact `count(*)` below 10,000 rows. Counting the viewer's visible documents on every keystroke would cost more than the search. When df is much smaller than N, the difference between two weights is ln(df_j / df_i) whatever N is, so the estimate barely matters; `max(N, df)` keeps the logarithm defined if statistics are stale.
+- A term no visible document contains (a stopword, an unknown word) gets no weight. If fewer than two terms remain, or there is one positive term or more than eight, the single `ts_rank_cd` over the whole query is used, exactly as before: with one term IDF cannot change the order.
+- Typo alternatives and accent variants are part of their word's tsquery, so they count towards that word's frequency.
+
+The weights are bound into the search as numbers rather than computed in a CTE of the same statement: a second reference to the `q` CTE would materialise it and rule out the parallel scan PostgreSQL uses for large result sets.
+
+**Query shape.** Each extra term costs one more `ts_rank_cd` per matching row. Costed into the scan, that makes PostgreSQL prefer a parallel sequential scan even for a few thousand matches, which tests every row's tsvector and is slower than the bitmap scan of the GIN index. So when the terms' frequencies add up to less than a quarter of the index, the matching scan sits in an `OFFSET 0` subquery that is planned as before, and ranking happens above it. Above that share, PostgreSQL scans in parallel anyway, as it did before, and the unfenced query lets the workers rank.
+
+**Cost**, measured on 100,000 synthetic documents (300 words each, every 20th 8,000 words) with PostgreSQL 16, median of 5:
+
+| Search | Matches | Before | After |
+|---|---|---|---|
+| one word | 195 / 90,000 | 10 ms / 1.5 s | unchanged |
+| two words, mid frequency | 9,000–12,000 | 140–215 ms | 175–320 ms |
+| three words, mid frequency | 7,000 | 115 ms | 150–210 ms |
+| two or three words, one in 90% of documents | 90,000 | 1.2–1.5 s | 1.3–1.7 s |
+
+On instances where searches match a few hundred documents, the difference is a few milliseconds.
 
 With `pg_trgm` available, each plain search word of three or more characters can also be satisfied by `title_search LIKE '%word%'`, served by the trigram index. The planner combines it with the `tsv` index in one bitmap scan. Stopwords are excluded with `numnode(to_tsquery(…)) > 0`, which PostgreSQL evaluates once at planning time. Substring-only matches have no full-text rank, so they sort after real word matches.
 
