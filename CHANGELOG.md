@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The end date of unified search's date filter is applied. Only the start date was: with a range such as *last month*, files modified after it were still listed.
+
 ## [1.4.0] - 2026-10-17
 
 ### Added

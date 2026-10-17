@@ -255,10 +255,16 @@ class SearchService {
 			$params[] = PgArray::toLiteral($subTags);
 		}
 
+		// Modification date range from unified search's date filter (Unix timestamps, inclusive).
 		$since = (int)$request->getOption('since');
 		if ($since > 0) {
 			$conditions[] = 'd.modified_time >= ?';
 			$params[] = (string)$since;
+		}
+		$until = (int)$request->getOption('until');
+		if ($until > 0) {
+			$conditions[] = 'd.modified_time <= ?';
+			$params[] = (string)$until;
 		}
 
 		// Each filter is a group of entries (field => pattern), any of which may match; every group

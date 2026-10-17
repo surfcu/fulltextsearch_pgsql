@@ -251,6 +251,11 @@ try {
 	same(['F1', 'F3'], sorted(search($platform, 'alice', 'invoice', ['metatags' => ['pdf']])['ids']), 'metatags: any of');
 	same(['F2', 'F3'], sorted(search($platform, 'alice', 'invoice', ['subtags' => ['files_external']])['ids']), 'subtags: all of');
 	same(['F2', 'F3'], sorted(search($platform, 'alice', 'invoice', ['options' => ['since' => '1500']])['ids']), 'since option');
+	same(['F1', 'F2'], sorted(search($platform, 'alice', 'invoice', ['options' => ['until' => '2500']])['ids']), 'until option');
+	same(['F2'], search($platform, 'alice', 'invoice', ['options' => ['since' => '1500', 'until' => '2500']])['ids'], 'since and until together: a date range');
+	same(['F2', 'F3'], sorted(search($platform, 'alice', 'invoice', ['options' => ['since' => '2000', 'until' => '3000']])['ids']), 'range bounds are inclusive');
+	same([], search($platform, 'alice', 'invoice', ['options' => ['since' => '2500', 'until' => '1500']])['ids'], 'an empty range finds nothing');
+	same(['F2'], search($platform, 'alice', 'invocie', ['options' => ['since' => '1500', 'until' => '2500']])['ids'], 'the range also applies to the typo-tolerant title fallback');
 	$p1 = search($platform, 'alice', 'invoice', ['size' => 2, 'page' => 1]);
 	$p2 = search($platform, 'alice', 'invoice', ['size' => 2, 'page' => 2]);
 	same(3, $p1['total'], 'total counts all matches');
