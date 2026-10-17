@@ -124,6 +124,9 @@ function search(PostgreSQLPlatform $platform, string $viewer, string $q, array $
 		'getMetaTags' => $opts['metatags'] ?? [],
 		'getSubTags' => $opts['subtags'] ?? [],
 		'getOption' => fn (string $o, string $d = '') => (string)($opts['options'][$o] ?? $d),
+		'getRegexFilters' => $opts['regex'] ?? [],
+		'getWildcardFilters' => $opts['wildcard'] ?? [],
+		'getLimitFields' => $opts['limit'] ?? [],
 	]);
 	$provider = double(IFullTextSearchProvider::class, ['getId' => $opts['provider'] ?? 'files']);
 	$result = double(ISearchResult::class, [
@@ -254,6 +257,70 @@ try {
 	same(2, count($p1['ids']), 'page 1 has page-size results');
 	same(1, count($p2['ids']), 'page 2 has the remainder');
 	same([], array_values(array_intersect($p1['ids'], $p2['ids'])), 'pages do not overlap');
+
+	section('extension, wildcard and regex filters');
+	$platform->indexDocument(doc('E1', 'alice', 'Plan 2025.pdf', 'harbour expansion plan', [], 'flt'));
+	$platform->indexDocument(doc('E2', 'alice', 'PLAN 2026.PDF', 'harbour expansion plan', [], 'flt'));
+	$platform->indexDocument(doc('E3', 'alice', 'Plan 2025.odt', 'harbour expansion plan', [], 'flt'));
+	$platform->indexDocument(doc('E4', 'alice', 'pdf_notes.txt', 'harbour expansion plan', [], 'flt'));
+	$platform->indexDocument(doc('E5', 'alice', 'plan%draft.md', 'harbour expansion plan', [], 'flt'));
+	$f = ['provider' => 'flt'];
+	// The Files app's "filter by extension": one group with one entry.
+	$pdf = [[['title' => '.*\.pdf']]];
+	same(['E1', 'E2'], sorted(search($platform, 'alice', 'harbour', $f + ['regex' => $pdf])['ids']), 'extension filter as the Files app sends it, ignoring case');
+	same(['E1', 'E2', 'E3'], sorted(search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '.*\.pdf'], ['title' => '.*\.odt']]]])['ids']), 'entries of a group: any may match');
+	same(['E1'], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '.*\.pdf']], [['title' => '.*2025.*']]]])['ids'], 'groups: all must match');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => 'pdf']]]])['ids'], 'a regex must match the whole title');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '.*\.p(df']]]])['ids'], 'an invalid regex matches nothing instead of failing the search');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '.*\.pdf++']]]])['ids'], 'constructs PostgreSQL reads differently match nothing');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '\bplan.*']]]])['ids'], '\\b (a word boundary in PCRE, a backspace in PostgreSQL) matches nothing');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['owner' => '.*']]]])['ids'], 'a field without a column matches nothing');
+	same(['E3'], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => '*.odt']]]])['ids'], 'wildcard filter');
+	same(['E1', 'E2', 'E3'], sorted(search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => 'plan 202?.*']]]])['ids']), '? matches one character, case ignored');
+	same(['E5'], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => 'plan%*']]]])['ids'], '% and _ in a wildcard are literal');
+	same(['E1', 'E2'], sorted(search($platform, 'alice', 'harbour', $f + ['regex' => [[['content' => '.*expansion.*']]], 'wildcard' => [[['title' => '*pdf']]]])['ids']), 'content can be filtered too, and both kinds combine');
+	$platform->resetIndex('flt');
+
+	section('search limited to file names or content');
+	$platform->indexDocument(doc('L1', 'alice', 'Lighthouse survey', 'Notes about the coast.', [], 'lim'));
+	$platform->indexDocument(doc('L2', 'alice', 'Coast notes', 'The lighthouse survey was finished.', [], 'lim'));
+	$platform->indexDocument(doc('L3', 'alice', 'Minutes', 'Nothing here.', ['parts' => ['comments' => 'lighthouse visit next week']], 'lim'));
+	$platform->indexDocument(doc('L4', 'alice', 'Keepers', 'Old photos.', ['tags' => ['lighthouse']], 'lim'));
+	$l = ['provider' => 'lim'];
+	same(['L1', 'L2', 'L3', 'L4'], sorted(search($platform, 'alice', 'lighthouse', $l)['ids']), 'no limit: every field');
+	same(['L1'], search($platform, 'alice', 'lighthouse', $l + ['limit' => ['title']])['ids'], 'file names only');
+	same(['L2'], search($platform, 'alice', 'lighthouse', $l + ['limit' => ['content']])['ids'], 'content only');
+	same(['L1', 'L2'], sorted(search($platform, 'alice', 'lighthouse', $l + ['limit' => ['title', 'content']])['ids']), 'file names and content, not comments or tags');
+	same(['L3'], search($platform, 'alice', 'lighthouse', $l + ['limit' => ['parts.comments']])['ids'], 'parts by name');
+	same([], search($platform, 'alice', 'lighthouse', $l + ['limit' => ['nonexistent']])['ids'], 'a field this platform does not index finds nothing');
+	same(['L1'], search($platform, 'alice', 'lighth', $l + ['limit' => ['title']])['ids'], 'prefixes still match');
+	same(['L2'], search($platform, 'alice', '"lighthouse survey"', $l + ['limit' => ['content']])['ids'], 'phrases are limited too');
+	same([], search($platform, 'alice', '"lighthouse survey" -finished', $l + ['limit' => ['content']])['ids'], 'exclusions apply within the limited fields');
+	same(['L1'], search($platform, 'alice', 'lighthouse -coast', $l + ['limit' => ['title']])['ids'], 'an excluded word elsewhere in the document does not exclude it');
+	same([], search($platform, 'alice', 'ghthou', $l + ['limit' => ['content']])['ids'], 'no title substring matching when titles are not searched');
+	same(['L1'], search($platform, 'alice', 'ghthou', $l + ['limit' => ['title']])['ids'], 'title substring matching when they are');
+	same(['L1', 'L2'], sorted(search($platform, 'alice', 'lighthouse coast', $l + ['limit' => ['title', 'content']])['ids']), 'several words with IDF ranking, limited');
+	$platform->resetIndex('lim');
+
+	section('excerpts of long documents');
+	$filler = str_repeat('Lorem ipsum dolor sit amet consectetur adipiscing elit. ', 4000);
+	$platform->indexDocument(doc('X1', 'alice', 'Annual report', $filler . 'The Zanzibar office opened in spring. ' . $filler, [], 'exc'));
+	$x = search($platform, 'alice', 'zanzibar', ['provider' => 'exc'])['docs'][0] ?? null;
+	$excerpt = implode(' … ', array_column($x?->getExcerpts() ?? [], 'excerpt'));
+	check(str_contains($excerpt, 'Zanzibar office'), 'excerpt found 224,000 characters into the text: ' . mb_substr($excerpt, 0, 80));
+	$x = search($platform, 'alice', 'offices', ['provider' => 'exc'])['docs'][0] ?? null;
+	check(str_contains(implode(' ', array_column($x?->getExcerpts() ?? [], 'excerpt')), 'office opened'), 'located through the stem when the typed word does not occur ("offices" finds "office")');
+	$x = search($platform, 'alice', 'annual', ['provider' => 'exc'])['docs'][0] ?? null;
+	check(str_starts_with((string)($x?->getExcerpts()[0]['excerpt'] ?? ''), 'Lorem ipsum'), 'title-only match: excerpt from the beginning');
+	$config->setConfig(['language' => 'turkish']);
+	$platform->indexDocument(doc('X2', 'alice', 'Gezi', $filler . 'ISPARTA GÜLLERİ çok güzel. ' . $filler, [], 'exc'));
+	$x = search($platform, 'alice', 'ısparta', ['provider' => 'exc'])['docs'][0] ?? null;
+	check(str_contains(implode(' ', array_column($x?->getExcerpts() ?? [], 'excerpt')), 'ISPARTA'), 'Turkish dotless I when locating the excerpt');
+	$platform->indexDocument(doc('X3', 'alice', 'Not', 'Bu yıl İSTANBUL ofisinde IŞIK sorunu vardı.', [], 'exc'));
+	$excerpt = (string)(search($platform, 'alice', 'ışık', ['provider' => 'exc'])['docs'][0]?->getExcerpts()[0]['excerpt'] ?? '');
+	check(str_contains($excerpt, 'İSTANBUL ofisinde IŞIK sorunu'), 'Turkish uppercase words are shown as written in excerpts: ' . $excerpt);
+	$config->setConfig(['language' => 'english']);
+	$platform->resetIndex('exc');
 
 	section('content extraction');
 	$b64 = fn (string $s) => base64_encode($s);

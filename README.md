@@ -4,7 +4,8 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 
 ## Features
 
-- **Ranked results with excerpts.** Title matches outrank tags, which outrank comments and other document parts, which outrank body text. Excerpts come from `ts_headline`.
+- **Ranked results with excerpts.** Title matches outrank tags, which outrank comments and other document parts, which outrank body text. Excerpts come from `ts_headline`, taken around the first match in long documents so they stay fast and show the match even deep in a 500 KB text.
+- **Search filters from the Files app**: *filter by extension* and *search in file name / content* work as with Elasticsearch, as do the local/external/group folder filters.
 - **Rare words count more.** In a search with several words, each word is weighted by how few of the documents you can see contain it (BM25's inverse document frequency), so `invoice kırklareli` puts the few documents mentioning *Kırklareli* ahead of the many that only mention invoices. Documents containing every word still come first.
 - **Search-as-you-type.** Words match as prefixes: `rap` finds *rapor*, *raporlar*.
 - **File names are split into words.** `final`, `2025` or `final.pdf` all find *rapor_2025_final.pdf*; `img` finds *IMG20250412.jpg*. PostgreSQL would otherwise treat each file name as a single word.

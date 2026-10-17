@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The Files app's *filter by extension* and *search in file name / content* options are applied. They were ignored: an extension filter returned every file type. Regex and wildcard filters follow the Elasticsearch platform's rules; a regex PostgreSQL cannot run safely matches nothing instead of failing the search.
 - PDFs are read without `pdftotext`: a bundled copy of smalot/pdfparser (LGPL-3.0, pure PHP) takes over when `pdftotext` is not installed or fails to run. It is namespaced under the app so it cannot clash with another app's copy. Files over 64 MB, or too big for the free `memory_limit`, are still indexed by name only, with a warning that says why.
 - `pdf_extractor` setting: `auto` (default), `pdftotext` or `pdfparser`.
 - Admin panel in Administration settings → Full text search: every setting, plus the status of PostgreSQL, `pg_trgm`, `pdftotext`, the bundled parser and the index size. Saving warns when a language change needs a rebuild.
@@ -17,11 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Office files: Excel numbers, formula results, inline strings, sheet names, comments and text boxes; Word comments and text boxes; SmartArt in Word, Excel and PowerPoint.
 
 ### Changed
+- Excerpts of long documents come from a window around the first match instead of the whole text: a page of twenty 500 KB results went from about 1.5 s to 0.3 s, and the excerpt now shows the match even far into the text.
 - Searches with several words rank by how rare each word is (BM25's inverse document frequency): a document with the one unusual word of a search is no longer buried under documents repeating the common one. Frequencies are counted among the documents the searching user can see; documents containing every word still come first, and single-word searches rank exactly as before. Multi-word searches matching thousands of documents take up to about 50% longer (see docs/ARCHITECTURE.md). No re-index needed.
 - Saving settings validates every value before storing any, so an invalid value no longer leaves the others half-applied.
 - A `pdftotext` that exits with an error and no output is reported as a failure instead of "no extractable text".
 
 ### Fixed
+- Turkish excerpts missed words written with a capital I or İ (`ISPARTA`, `İSTANBUL`), because `ts_headline` lowercased them with the database locale. They are now matched like the index matches them, and shown as written.
 - Words that Word, Excel, PowerPoint or LibreOffice store in several formatting runs (after a spelling check, a partial edit or partial bold) were indexed as separate fragments, so `hippopotamus` missed a document where it had been stored as `hippo` + `potamus`. Office XML is now read node by node and only paragraph, cell and line ends separate words. Re-index office documents to benefit: `occ fulltextsearch:reset && occ fulltextsearch:index`.
 - XML entities in office documents were indexed undecoded (`R&amp;D`), and text in angle brackets extracted from office files and PDFs was mistaken for HTML and removed.
 - Deleted tracked changes, Word field codes, spreadsheet formulas and comment authors are no longer indexed. PowerPoint slides are read in presentation order with their notes after them.

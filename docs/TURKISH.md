@@ -81,6 +81,8 @@ Uygulama, dil `turkish` olduğunda hem dizinlenen metinde hem de aramada `I → 
 | İstanbul | `istanbul`, `İSTANBUL` | ✓ |
 | ÇALIŞMALARIMIZ | `çalışma` | ✓ |
 
+Sonuçlardaki alıntılar da aynı kurala uyar: `ışık` aramasında alıntı *IŞIK* kelimesinin geçtiği yerden alınır ve metin yazıldığı gibi gösterilir.
+
 ### Türkçe karakterler olmadan arama ve yazım hataları
 
 Dizindeki tüm kelimelerden bir kelime listesi tutulur. Bu sayede:
