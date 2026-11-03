@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-11-03
+
+First release on the Nextcloud App Store. The app itself is unchanged from 1.4.1.
+
+### Changed
+- The Nextcloud 35 tests run against the Full Text Search app's `stable35` branch: its `master` branch now targets Nextcloud 36.
+
 ## [1.4.1] - 2026-10-18
 
 ### Fixed
