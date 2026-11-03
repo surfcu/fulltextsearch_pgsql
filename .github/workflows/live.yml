@@ -23,7 +23,7 @@ jobs:
           # Database owned by the Nextcloud user, as in Nextcloud's install guide: the app
           # must create pg_trgm itself.
           - { nextcloud: '34', server: stable34, fulltextsearch: stable34, files: stable34, php: '8.3', postgres: '16', db: owner, trgm: '1' }
-          - { nextcloud: '35', server: stable35, fulltextsearch: master,   files: stable35, php: '8.4', postgres: '17', db: owner, trgm: '1' }
+          - { nextcloud: '35', server: stable35, fulltextsearch: stable35, files: stable35, php: '8.4', postgres: '17', db: owner, trgm: '1' }
           # Installer creates its own user on a database it does not own: no pg_trgm, the
           # trigram features must switch off cleanly.
           - { nextcloud: '30', server: stable30, fulltextsearch: stable30, files: stable30, php: '8.2', postgres: '13', db: superuser, trgm: '0' }
