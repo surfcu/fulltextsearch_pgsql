@@ -16,7 +16,7 @@
 - Text extraction for plain text, OpenDocument and Office files (including Office 97–2003 with catdoc), and PDFs (pdftotext when installed, a built-in parser otherwise)
 - Settings and status in Administration settings → Full text search, or with occ
 
-Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search app.]]></description>
+Requires Nextcloud to run on PostgreSQL 13 or newer, plus the Full Text Search app.]]></description>
     <version>1.4.2</version>
     <licence>AGPL-3.0-or-later</licence>
     <author>surfcu</author>
@@ -33,8 +33,8 @@ Requires Nextcloud to run on PostgreSQL 12 or newer, plus the Full Text Search a
 
     <dependencies>
         <php min-version="8.1"/>
-        <database min-version="12">pgsql</database>
-        <nextcloud min-version="29" max-version="35"/>
+        <database min-version="13">pgsql</database>
+        <nextcloud min-version="30" max-version="35"/>
     </dependencies>
 
     <repair-steps>

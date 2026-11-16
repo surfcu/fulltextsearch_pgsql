@@ -129,6 +129,48 @@ expect admin 'quokka'       'invoice.pdf'            # PDF via pdftotext
 expect_trgm admin 'butce'     'YillikButceRaporu.txt'  # substring in a title
 expect bob   'hippopotamus' ''                       # not shared with bob
 
+step "Live share path: share file with bob, re-index, unshare"
+share_id=$(php -r '
+require_once "lib/base.php";
+\OC::$server->getSession()->set("user_id", "admin");
+\OC::$server->getUserSession()->setUser(\OC::$server->getUserManager()->get("admin"));
+$node = \OC::$server->getRootFolder()->getUserFolder("admin")->get("rapor_2025_final.docx");
+$sm = \OC::$server->getShareManager();
+$share = $sm->newShare();
+$share->setNode($node);
+$share->setShareType(\OCP\Share\IShare::TYPE_USER);
+$share->setSharedBy("admin");
+$share->setSharedWith("bob");
+$share->setPermissions(\OCP\Constants::PERMISSION_READ);
+$s = $sm->createShare($share);
+echo $s->getId();
+')
+echo "      created share $share_id (admin -> bob)"
+touch "$files/rapor_2025_final.docx"
+occ files:scan admin >/dev/null
+if ! occ fulltextsearch:index --no-readline > /tmp/ftspg-index-share.log 2>&1; then
+	echo "FAIL  occ fulltextsearch:index (share)"
+	tr -d '\033' < /tmp/ftspg-index-share.log | tail -n 40
+	failures=$((failures + 1))
+fi
+expect bob 'hippopotamus' 'rapor_2025_final.docx'
+
+php -r '
+require_once "lib/base.php";
+$sm = \OC::$server->getShareManager();
+$s = $sm->getShareById((int)$argv[1]);
+$sm->deleteShare($s);
+' "$share_id"
+echo "      deleted share $share_id"
+touch "$files/rapor_2025_final.docx"
+occ files:scan admin >/dev/null
+if ! occ fulltextsearch:index --no-readline > /tmp/ftspg-index-unshare.log 2>&1; then
+	echo "FAIL  occ fulltextsearch:index (unshare)"
+	tr -d '\033' < /tmp/ftspg-index-unshare.log | tail -n 40
+	failures=$((failures + 1))
+fi
+expect bob 'hippopotamus' ''
+
 step "PDF fallback: bundled parser instead of pdftotext"
 occ fulltextsearch_pgsql:configure '{"pdf_extractor":"pdfparser"}' >/dev/null
 check_out=$(occ fulltextsearch:check)
@@ -201,8 +243,8 @@ occ maintenance:repair >/dev/null
 expect admin 'hippopotamus' 'rapor_2025_final.docx'
 
 step "Nextcloud log (warnings and errors from this app)"
-if grep -h 'fulltextsearch_pgsql\|FullTextSearch_PgSql' data/nextcloud.log 2>/dev/null | grep -E '"level":[3-4]'; then
-	echo "FAIL  errors logged"
+if grep -h 'fulltextsearch_pgsql\|FullTextSearch_PgSql' data/nextcloud.log 2>/dev/null | grep -E '"level":[2-4]'; then
+	echo "FAIL  warnings or errors logged"
 	failures=$((failures + 1))
 else
 	echo "ok    none"

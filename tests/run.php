@@ -238,6 +238,194 @@ try {
 	same(['Q3'], search($platform, 'alice', '+budget -review')['ids'], 'required plus exclusion');
 	same(['Q1', 'Q3'], sorted(search($platform, 'alice', 'budget -revi')['ids']), 'exclusions are exact words, not prefixes');
 
+	section('query syntax fuzzer (2,500 queries)');
+	// Deterministic seedable LCG: 100% reproducible across all PHP 8.1-8.5 environments.
+	$fuzzSeed = 1337;
+	$fuzzRand = static function (int $min = 0, int $max = 1) use (&$fuzzSeed): int {
+		$fuzzSeed = ($fuzzSeed * 1103515245 + 12345) & 0x7FFFFFFF;
+		return $min + ($fuzzSeed % ($max - $min + 1));
+	};
+	$fuzzChoice = static function (array $items) use (&$fuzzRand): mixed {
+		return $items[$fuzzRand(0, count($items) - 1)];
+	};
+
+	// Atom dictionaries covering English, Turkish diacritics, numbers, punctuation, and Unicode
+	$fuzzWords = [
+		'budget', 'review', 'marketing', 'plan', 'notes', 'meeting', 'report', 'annual', 'spring', 'spend',
+		'the', 'of', 'and', 'to', 'a', 'in', 'that', 'is', 'for', 'with',
+		'çalışma', 'İpek', 'ISPARTA', 'ışık', 'Isparta', 'İstanbul', 'bütçe', 'öğrenci', 'sözleşmesi', 'GÜLLERİ', 'şeker',
+		'café', 'naïve', 'über', 'résumé', 'тест', 'δοκιμή', '日本語', 'العربية', '🚀',
+		'2025', '4711', 'v2', 'IMG2025', 'doc123', '0x1a', 'Q1', 'N1',
+		"o'brien", 'e-mail', 'final.pdf', 'rapor_2025', 'user@example.com', 'example.com',
+		'a', 'x', 'z', str_repeat('a', 120), str_repeat('w', 250),
+	];
+	$fuzzPrefixes = ['', '', '+', '-', '!', '~', '&', '|'];
+	$fuzzSuffixes = ['', '', '*', ':*', ':*A', ':*D', '?', '%', '_', ':', '!', '?'];
+	$fuzzInfixes = [' ', '  ', "\t", ' OR ', ' AND ', ' NOT ', ' | ', ' & ', ' <-> ', ' <1> ', ' <2> ', ', ', '; ', ' / ', ' \\ '];
+	$fuzzProbes = [
+		"'); DROP TABLE ftspg_oc_index; --",
+		"'; DROP TABLE ftspg_oc_words; --",
+		"' OR '1'='1",
+		"' OR 1=1 --",
+		"admin'--",
+		'" OR ""="',
+		"' UNION SELECT null, null, null--",
+		"/* comment */",
+		"/* unclosed comment",
+		"-- single line comment",
+		"<!-- xml comment -->",
+		"CAST(? AS regconfig)",
+		"to_tsquery('simple', 'x')",
+		'$$quoted$$',
+		"\0",
+		"nul\0byte",
+		"\xff\xfe broken utf8",
+		"\xC3\x28",
+		'\\\\',
+		"'",
+		"''",
+		"'''",
+		"''''",
+		'a & | ! :* <-> (',
+		'::::',
+		'* * *',
+		'+ + +',
+		'- - -',
+		'OR OR OR',
+		'AND AND AND',
+		'NOT NOT NOT',
+	];
+
+	// Generator building 2,500 queries across 5 distinct structural categories
+	$generateFuzzQuery = static function (int $idx) use (&$fuzzRand, &$fuzzChoice, $fuzzWords, $fuzzPrefixes, $fuzzSuffixes, $fuzzInfixes, $fuzzProbes): string {
+		// Category 1: Baseline Hand-crafted & Edge-case Torture Corpus (0..99)
+		if ($idx < count($fuzzProbes)) {
+			return $fuzzProbes[$idx];
+		}
+		if ($idx < 100) {
+			$edgePatterns = [
+				'""', '"', '"""', "''''", '()', '(()', '())', '((()))', '[,]', '{;}',
+				'+ + - -', 'OR AND NOT', ':::*:::*', '***', '???', '%%%',
+				'"unclosed phrase with budget', 'unclosed" phrase with review',
+				'+budget -budget', '"budget review" -budget', '+(budget review)',
+				'çalışma OR "İstanbul ofisi" -bütçe', 'İSTANBUL & ışık | ISPARTA',
+				str_repeat('word ', 40),
+				str_repeat('a', 120) . ' ' . str_repeat('b', 120),
+			];
+			return $edgePatterns[$idx % count($edgePatterns)];
+		}
+
+		// Category 2: Single-Clause Mutational Fuzzing (100..599)
+		if ($idx < 600) {
+			$word = $fuzzChoice($fuzzWords);
+			$prefix = $fuzzChoice($fuzzPrefixes);
+			$suffix = $fuzzChoice($fuzzSuffixes);
+			$clause = $prefix . $word . $suffix;
+			$wrapMode = $fuzzRand(0, 5);
+			return match ($wrapMode) {
+				1 => '(' . $clause . ')',
+				2 => '(' . $clause,
+				3 => '"' . $clause . '"',
+				4 => '"' . $clause,
+				default => $clause,
+			};
+		}
+
+		// Category 3: Multi-Clause Boolean & Phrase Fuzzing (600..1599)
+		if ($idx < 1600) {
+			$clauseCount = $fuzzRand(2, 6);
+			$parts = [];
+			for ($c = 0; $c < $clauseCount; $c++) {
+				$isPhrase = ($fuzzRand(0, 4) === 0);
+				if ($isPhrase) {
+					$w1 = $fuzzChoice($fuzzWords);
+					$w2 = $fuzzChoice($fuzzWords);
+					$pPrefix = $fuzzChoice(['', '+', '-']);
+					$closed = ($fuzzRand(0, 5) !== 0);
+					$parts[] = $pPrefix . '"' . $w1 . ' ' . $w2 . ($closed ? '"' : '');
+				} else {
+					$parts[] = $fuzzChoice($fuzzPrefixes) . $fuzzChoice($fuzzWords) . $fuzzChoice($fuzzSuffixes);
+				}
+			}
+			$res = '';
+			foreach ($parts as $pIdx => $part) {
+				$res .= ($pIdx === 0 ? '' : $fuzzChoice($fuzzInfixes)) . $part;
+			}
+			return $res;
+		}
+
+		// Category 4: Hostile SQL Injection & Operator Bombardment (1600..2099)
+		if ($idx < 2100) {
+			$probe = $fuzzChoice($fuzzProbes);
+			$word = $fuzzChoice($fuzzWords);
+			$layout = $fuzzRand(0, 4);
+			return match ($layout) {
+				0 => $probe . ' ' . $word,
+				1 => $word . ' ' . $probe,
+				2 => '"' . $word . ' ' . $probe . '"',
+				3 => '(' . $probe . ') OR ' . $word,
+				default => $probe . ' ' . $probe . ' ' . $word,
+			};
+		}
+
+		// Category 5: Turkish, Diacritic & Mixed Unicode Permutations (2100..2499)
+		$turkishPool = ['çalışma', 'İpek', 'ISPARTA', 'ışık', 'Isparta', 'İstanbul', 'bütçe', 'öğrenci', 'sözleşmesi', 'GÜLLERİ', 'şeker'];
+		$intlPool = ['café', 'naïve', 'über', 'тест', 'δοκιμή', '日本語', 'العربية', '🚀'];
+		$tWord1 = $fuzzChoice($turkishPool);
+		$tWord2 = $fuzzChoice($turkishPool);
+		$iWord = $fuzzChoice($intlPool);
+		$op = $fuzzChoice([' OR ', ' AND ', ' ', ' +', ' -']);
+		return $tWord1 . $op . $tWord2 . ($fuzzRand(0, 1) ? ' ' . $iWord : '');
+	};
+
+	$fuzzErrors = [];
+	$fuzzTotal = 2500;
+	$fuzzStart = microtime(true);
+
+	// Execute across English (1,500 queries) and Turkish (1,000 queries) configurations
+	$fuzzLangs = [
+		['lang' => 'english', 'count' => 1500],
+		['lang' => 'turkish', 'count' => 1000],
+	];
+
+	$fuzzIndex = 0;
+	foreach ($fuzzLangs as $fl) {
+		$config->setConfig(['language' => $fl['lang']]);
+		for ($i = 0; $i < $fl['count']; $i++) {
+			$q = $generateFuzzQuery($fuzzIndex++);
+			try {
+				$res = search($platform, 'alice', $q);
+				if (!is_array($res) || !isset($res['total']) || !is_int($res['total']) || $res['total'] < 0) {
+					$fuzzErrors[] = [
+						'index' => $fuzzIndex - 1,
+						'query' => $q,
+						'lang' => $fl['lang'],
+						'error' => 'Malformed result array',
+					];
+				}
+			} catch (Throwable $e) {
+				$fuzzErrors[] = [
+					'index' => $fuzzIndex - 1,
+					'query' => $q,
+					'lang' => $fl['lang'],
+					'error' => get_class($e) . ': ' . $e->getMessage(),
+				];
+				if (count($fuzzErrors) >= 20) {
+					break 2; // Safeguard against cascading connection collapse
+				}
+			}
+		}
+	}
+
+	// Restore test state & release memory accumulated in PDO mock
+	$config->setConfig(['language' => 'english']);
+	$conn->log = [];
+	$conn->statements = [];
+	$fuzzDuration = microtime(true) - $fuzzStart;
+
+	check($schema->tableExists(), 'table still exists after fuzzer (no injection succeeded)');
+	same([], $fuzzErrors, sprintf('fuzzer: %d varied queries executed with zero unhandled SQL exceptions (took %.2fs)', $fuzzIndex, $fuzzDuration));
+
 	section('typo tolerance');
 	same(['Q2', 'Q1'], search($platform, 'alice', 'markting plann')['ids'], 'typos corrected; the document with both words first');
 	$config->setConfig(['use_trigram' => false]);
