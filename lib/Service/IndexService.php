@@ -110,7 +110,9 @@ class IndexService {
 		$metaTags = array_map([$extractor, 'sanitize'], $this->strings($document->getMetaTags()));
 		$parts = [];
 		foreach ($document->getParts() as $name => $value) {
-			$parts[(string)$name] = $extractor->clean((string)$value);
+			$val = (string)$value;
+			$strip = $extractor->looksLikeMarkup($val, '', true);
+			$parts[(string)$name] = $extractor->clean($val, $strip);
 		}
 
 		$t = $this->schemaService->getTableName();

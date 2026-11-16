@@ -36,6 +36,8 @@ use ZipArchive;
 
 require __DIR__ . '/bootstrap.php';
 
+ini_set('memory_limit', '512M');
+
 // Any warning, notice or deprecation raised from the app's own code fails the run. This is
 // what makes the PHP 8.4/8.5 CI jobs meaningful. Errors silenced with @ are ignored.
 $appIssues = [];
@@ -270,11 +272,11 @@ try {
 		"admin'--",
 		'" OR ""="',
 		"' UNION SELECT null, null, null--",
-		"/* comment */",
-		"/* unclosed comment",
-		"-- single line comment",
-		"<!-- xml comment -->",
-		"CAST(? AS regconfig)",
+		'/* comment */',
+		'/* unclosed comment',
+		'-- single line comment',
+		'<!-- xml comment -->',
+		'CAST(? AS regconfig)',
 		"to_tsquery('simple', 'x')",
 		'$$quoted$$',
 		"\0",
@@ -554,6 +556,131 @@ try {
 	$pptx = $makeZip(['ppt/slides/slide1.xml' => '<p:sld><a:t>Armadillo</a:t></p:sld>', 'ppt/slides/slide2.xml' => '<p:sld><a:t>Pangolin</a:t></p:sld>']);
 	$platform->indexDocument(doc('T5', 'alice', 'deck.pptx', $b64($pptx), ['encoded' => IIndexDocument::ENCODED_BASE64]));
 	same(['T5'], search($platform, 'alice', 'pangolin')['ids'], 'pptx slides extracted');
+
+	section('smart markup stripping and tag spacing (B2)');
+
+	// 1. Direct unit verification of looksLikeMarkup()
+	same(false, $extractor->looksLikeMarkup('Plain text without markup'), 'plain text without markup is false');
+	same(false, $extractor->looksLikeMarkup('Contact <john.doe@example.com> for info', 'notes.txt'), 'email in txt file is not markup');
+	same(false, $extractor->looksLikeMarkup('Map<String, Integer> mapping;', 'App.java'), 'generics in code file is not markup');
+	same(false, $extractor->looksLikeMarkup('Condition a < b and c > d holds', 'test.py'), 'inequalities in code file is not markup');
+	same(true, $extractor->looksLikeMarkup("<!DOCTYPE html>\n<html><body>Hi</body></html>"), 'starts with <!DOCTYPE html>');
+	same(true, $extractor->looksLikeMarkup("   \t\r\n<!doctype html>"), 'starts with <!doctype (case-insensitive + leading whitespace)');
+	same(true, $extractor->looksLikeMarkup("\xEF\xBB\xBF<!DOCTYPE html>"), 'starts with <!DOCTYPE after UTF-8 BOM');
+	same(true, $extractor->looksLikeMarkup('<html lang="en"><body>Hello</body></html>'), 'starts with <html');
+	same(true, $extractor->looksLikeMarkup('<?xml version="1.0" encoding="UTF-8"?><root/>'), 'starts with <?xml');
+	same(true, $extractor->looksLikeMarkup('<svg xmlns="http://www.w3.org/2000/svg"><text>Hi</text></svg>'), 'starts with <svg');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'index.html'), 'title ends in .html');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'PAGE.HTM'), 'title ends in .HTM (case-insensitive)');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'doc.xhtml'), 'title ends in .xhtml');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'data.xml'), 'title ends in .xml');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'icon.svg'), 'title ends in .svg');
+	same(false, $extractor->looksLikeMarkup('<p>paragraph</p>', 'notes.txt', false), 'internal tags with unencoded=false and .txt title is false');
+	same(true, $extractor->looksLikeMarkup('<p>paragraph</p>', 'snippet', true), 'unencoded=true detects </p>');
+	same(true, $extractor->looksLikeMarkup('<div>division</div>', 'snippet', true), 'unencoded=true detects </div>');
+	same(true, $extractor->looksLikeMarkup('<span>text</span>', 'snippet', true), 'unencoded=true detects </span>');
+	same(true, $extractor->looksLikeMarkup('<a href="#">link</a>', 'snippet', true), 'unencoded=true detects </a>');
+	same(true, $extractor->looksLikeMarkup('<li>item</li>', 'snippet', true), 'unencoded=true detects </li>');
+	same(true, $extractor->looksLikeMarkup('<td>cell</td>', 'snippet', true), 'unencoded=true detects </td>');
+	same(true, $extractor->looksLikeMarkup('Line1<br>Line2', 'snippet', true), 'unencoded=true detects <br>');
+	same(true, $extractor->looksLikeMarkup('Line1<br/>Line2', 'snippet', true), 'unencoded=true detects <br/>');
+	same(true, $extractor->looksLikeMarkup('Line1<br />Line2', 'snippet', true), 'unencoded=true detects <br />');
+	same(false, $extractor->looksLikeMarkup('Reach <user@example.com>', 'comment', true), 'unencoded=true ignores angle brackets without closing tags');
+
+	// 2. Direct unit verification of clean()
+	same('hello world', $extractor->clean('hello world'), 'clean() preserves text');
+	same('Contact <john.doe@example.com>', $extractor->clean('Contact <john.doe@example.com>'), 'clean() preserves email by default');
+	same('Map<String, Integer>', $extractor->clean('Map<String, Integer>'), 'clean() preserves generic types by default');
+	same('a < b and c > d', $extractor->clean('a < b and c > d'), 'clean() preserves inequalities by default');
+	same('First Second', $extractor->clean('<p>First</p><p>Second</p>', true), 'clean() with stripMarkup=true separates block tags with space');
+	same('Heading Content', $extractor->clean('<h2>Heading</h2><p>Content</p>', true), 'clean() separates heading and paragraph');
+	same('Item 1 Item 2', $extractor->clean('<li>Item 1</li><li>Item 2</li>', true), 'clean() separates list items');
+	same('Cell A Cell B', $extractor->clean('<td>Cell A</td><td>Cell B</td>', true), 'clean() separates table cells');
+	same('Line 1 Line 2', $extractor->clean('Line 1<br>Line 2', true), 'clean() separates br tags');
+	same('Line 1 Line 2', $extractor->clean('Line 1<br/>Line 2', true), 'clean() separates br/ tags');
+	same('unbelievable', $extractor->clean('un<b>believable</b>', true), 'clean() strips inline tags without spaces: unbelievable');
+	same('supercalifragilistic', $extractor->clean('super<i>cali</i>fragilistic', true), 'clean() strips inline tags without spaces: italic');
+	same('refactoring', $extractor->clean('re<span>factor</span>ing', true), 'clean() strips inline tags without spaces: span');
+	same('stronghold', $extractor->clean('strong<strong>hold</strong>', true), 'clean() strips inline tags without spaces: strong');
+	same('R&D <draft>', $extractor->clean('R&amp;D &lt;draft&gt;', true), 'clean() decodes entities after tag stripping');
+
+	// 3. E2E: Plain text file preserves angle brackets in indexing and search
+	$plainContent = "Contact <john.doe@example.com> or visit <https://nextcloud.com/docs>.\nIn Java use Map<String, Integer> when a < b and c > d.";
+	$platform->indexDocument(doc('B2_PLAIN', 'alice', 'developer-guide.txt', $b64($plainContent), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_PLAIN'], search($platform, 'alice', 'john.doe@example.com')['ids'], 'plain text search finds email inside angle brackets');
+	same(['B2_PLAIN'], search($platform, 'alice', 'nextcloud.com')['ids'], 'plain text search finds url inside angle brackets');
+	same(['B2_PLAIN'], search($platform, 'alice', 'Integer')['ids'], 'plain text search finds generic parameter Integer');
+	same(['B2_PLAIN'], search($platform, 'alice', 'String')['ids'], 'plain text search finds generic parameter String');
+	$storedPlain = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B2_PLAIN'")->fetchOne();
+	check(str_contains($storedPlain, '<john.doe@example.com>'), 'stored content preserves <john.doe@example.com>');
+	check(str_contains($storedPlain, '<https://nextcloud.com/docs>'), 'stored content preserves <https://...>');
+	check(str_contains($storedPlain, 'Map<String, Integer>'), 'stored content preserves Map<String, Integer>');
+	check(str_contains($storedPlain, 'a < b and c > d'), 'stored content preserves a < b and c > d');
+
+	// 4. E2E: Genuine HTML/XML/SVG files have markup cleanly stripped
+	$htmlDoc = "<!DOCTYPE html>\n<html><head><title>Annual</title></head><body><h1>Quarterly Report</h1><p>Financial results exceeded all expectations.</p></body></html>";
+	$platform->indexDocument(doc('B2_HTML_DOC', 'alice', 'report.txt', $b64($htmlDoc), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_HTML_DOC'], search($platform, 'alice', 'expectations')['ids'], 'html with DOCTYPE indexes body text');
+	same(['B2_HTML_DOC'], search($platform, 'alice', '"Quarterly Report"')['ids'], 'html with DOCTYPE keeps heading words');
+	same([], search($platform, 'alice', 'DOCTYPE')['ids'], 'DOCTYPE tag is stripped and not searchable');
+	same([], search($platform, 'alice', 'body')['ids'], 'body tag is stripped and not searchable');
+
+	$svgDoc = '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><text x="20" y="40">Vector diagram caption</text></svg>';
+	$platform->indexDocument(doc('B2_SVG', 'alice', 'graphic.txt', $b64($svgDoc), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_SVG'], search($platform, 'alice', 'caption')['ids'], 'svg text element is indexed');
+
+	$xmlDoc = '<?xml version="1.0" encoding="UTF-8"?><catalog><item><title>Ceramic</title><description>Handcrafted pottery vase</description></item></catalog>';
+	$platform->indexDocument(doc('B2_XML', 'alice', 'catalog.txt', $b64($xmlDoc), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_XML'], search($platform, 'alice', 'pottery')['ids'], 'xml item description is indexed');
+
+	$extHtml = '<div class="content"><h3>System Diagnostics</h3><p>All background services operational.</p></div>';
+	$platform->indexDocument(doc('B2_EXT_HTML', 'alice', 'status.HTML', $b64($extHtml), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_EXT_HTML'], search($platform, 'alice', 'operational')['ids'], 'file with .HTML extension strips markup');
+
+	// 5. E2E: Unencoded HTML fragment has tags cleanly stripped
+	$unencodedFragment = '<p>First line of unencoded notes.</p><br><p>Second line with important action points.</p>';
+	$platform->indexDocument(doc('B2_UNENC', 'alice', 'notes', $unencodedFragment, ['encoded' => IIndexDocument::NOT_ENCODED]));
+	same(['B2_UNENC'], search($platform, 'alice', '"unencoded notes"')['ids'], 'unencoded fragment indexes text');
+	same(['B2_UNENC'], search($platform, 'alice', '"action points"')['ids'], 'unencoded fragment indexes second paragraph');
+
+	// 6. E2E: Block tags spacing prevents word fusion
+	$blockHtml = '<p>FirstParagraph</p><p>SecondParagraph</p><div>DivisionAlpha</div><div>DivisionBeta</div>';
+	$platform->indexDocument(doc('B2_BLOCK', 'alice', 'blocks.html', $b64($blockHtml), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_BLOCK'], search($platform, 'alice', '"FirstParagraph SecondParagraph"')['ids'], 'block tags separated with whitespace');
+	same(['B2_BLOCK'], search($platform, 'alice', '"DivisionAlpha DivisionBeta"')['ids'], 'div blocks separated with whitespace');
+	same([], search($platform, 'alice', 'FirstParagraphSecondParagraph')['ids'], 'block tags do not fuse words together');
+	$storedBlock = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B2_BLOCK'")->fetchOne();
+	check(!str_contains($storedBlock, 'FirstParagraphSecondParagraph'), 'stored content has no word fusion');
+	check(str_contains($storedBlock, 'FirstParagraph SecondParagraph'), 'stored content has space between paragraphs');
+
+	// 7. E2E: Inline tags do not split words with spaces
+	$inlineHtml = '<p>This is un<b>believable</b> and super<i>cali</i>fragilistic and re<span>factor</span>ing a strong<strong>hold</strong>.</p>';
+	$platform->indexDocument(doc('B2_INLINE', 'alice', 'inline.html', $b64($inlineHtml), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_INLINE'], search($platform, 'alice', 'unbelievable')['ids'], 'inline tag <b> does not split unbelievable');
+	same(['B2_INLINE'], search($platform, 'alice', 'supercalifragilistic')['ids'], 'inline tag <i> does not split supercalifragilistic');
+	same(['B2_INLINE'], search($platform, 'alice', 'refactoring')['ids'], 'inline tag <span> does not split refactoring');
+	same(['B2_INLINE'], search($platform, 'alice', 'stronghold')['ids'], 'inline tag <strong> does not split stronghold');
+	same([], search($platform, 'alice', '"un believable"')['ids'], 'inline tag does not add spaces inside word');
+
+	// 8. E2E: Parts / comments: plain text preserves angle brackets, HTML strips markup with block spaces
+	$platform->indexDocument(doc('B2_PART_TXT', 'alice', 'task.txt', '', [
+		'parts' => ['comments' => 'Assigned to <ops-team@example.com> for triage on <server-01>.'],
+	]));
+	same(['B2_PART_TXT'], search($platform, 'alice', 'ops-team@example.com')['ids'], 'plain text comment preserves email inside angle brackets');
+	$storedPartTxt = (string)$conn->executeQuery("SELECT parts_text FROM ftspg_oc_index WHERE document_id = 'B2_PART_TXT'")->fetchOne();
+	check(str_contains($storedPartTxt, '<ops-team@example.com>'), 'parts_text preserves angle-bracketed email');
+	check(str_contains($storedPartTxt, '<server-01>'), 'parts_text preserves angle-bracketed hostname');
+
+	$platform->indexDocument(doc('B2_PART_HTML', 'alice', 'review.txt', '', [
+		'parts' => ['comments' => '<p>Please review <b>promptly</b></p><p>Approval needed by EOD</p>'],
+	]));
+	same(['B2_PART_HTML'], search($platform, 'alice', 'promptly')['ids'], 'html comment indexes inline word cleanly');
+	same(['B2_PART_HTML'], search($platform, 'alice', '"promptly Approval"')['ids'], 'html comment separates paragraphs with space');
+	same([], search($platform, 'alice', 'promptlyApproval')['ids'], 'html comment does not fuse words across paragraphs');
+	$storedPartHtml = (string)$conn->executeQuery("SELECT parts_text FROM ftspg_oc_index WHERE document_id = 'B2_PART_HTML'")->fetchOne();
+	check(!str_contains($storedPartHtml, 'promptlyApproval'), 'parts_text has no word fusion in html comment');
+	check(str_contains($storedPartHtml, 'promptly Approval'), 'parts_text has whitespace between html comment paragraphs');
+	check(!str_contains($storedPartHtml, '<p>'), 'parts_text has html tags stripped');
 
 	section('office documents as Word, Excel, PowerPoint and LibreOffice write them');
 	$w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';

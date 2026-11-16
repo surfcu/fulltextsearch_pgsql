@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live test log inspection catches Nextcloud log warnings (levels 2–4).
 - Committed `composer.lock` for reproducible App Store builds.
 
+### Fixed
+- Preserve angle brackets in plain text and prevent word fusion across HTML block tags. Re-indexing of text files is needed to benefit.
+
 ## [1.4.2] - 2026-11-03
 
 First release on the Nextcloud App Store. The app itself is unchanged from 1.4.1.

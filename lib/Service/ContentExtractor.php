@@ -27,6 +27,8 @@ class ContentExtractor {
 	private const PDF_TIMEOUT_SECONDS = 60;
 	private const TOOL_TIMEOUT_SECONDS = 60;
 
+	private const BLOCK_TAGS_PATTERN = '#</?(?:p|div|td|th|li|ul|ol|table|tr|h[1-6]|header|footer|section|article|blockquote|pre|aside|nav|main|figure|figcaption|br|hr)\b[^>]*>#i';
+
 	/** Compound File (OLE2): Office 97–2003 documents, and password-protected Office files. */
 	private const OLE_SIGNATURE = "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
 
@@ -65,7 +67,8 @@ class ContentExtractor {
 		}
 
 		if ($document->isContentEncoded() !== IIndexDocument::ENCODED_BASE64) {
-			return new ExtractedContent($this->clean($content));
+			$strip = $this->looksLikeMarkup($content, $document->getTitle(), true);
+			return new ExtractedContent($this->clean($content, $strip));
 		}
 
 		$raw = base64_decode($content, true);
@@ -73,10 +76,10 @@ class ContentExtractor {
 			return new ExtractedContent('', 'content is not valid base64');
 		}
 
-		return $this->extractFromBytes($raw);
+		return $this->extractFromBytes($raw, $document->getTitle());
 	}
 
-	public function extractFromBytes(string $raw): ExtractedContent {
+	public function extractFromBytes(string $raw, string $title = ''): ExtractedContent {
 		if (str_starts_with($raw, '%PDF-')) {
 			return $this->extractPdf($raw);
 		}
@@ -87,9 +90,48 @@ class ContentExtractor {
 			return $this->extractLegacyOffice($raw);
 		}
 		if ($this->looksLikeText($raw)) {
-			return new ExtractedContent($this->clean($this->toUtf8($raw)));
+			$text = $this->toUtf8($raw);
+			$strip = $this->looksLikeMarkup($text, $title, false);
+			return new ExtractedContent($this->clean($text, $strip));
 		}
 		return new ExtractedContent('', 'binary content in an unsupported format, indexed without content');
+	}
+
+	/**
+	 * Detect genuine markup (HTML, XML, SVG) to avoid stripping valid angle brackets in
+	 * plain text files or plain comments.
+	 */
+	public function looksLikeMarkup(string $text, string $title = '', bool $unencoded = false): bool {
+		if (str_starts_with($text, "\xEF\xBB\xBF")) {
+			$text = substr($text, 3);
+		} elseif (str_starts_with($text, "\xFF\xFE") || str_starts_with($text, "\xFE\xFF")) {
+			$text = substr($text, 2);
+		}
+		$trimmed = ltrim($text);
+
+		$prefix = strtolower(substr($trimmed, 0, 10));
+		if (str_starts_with($prefix, '<!doctype')
+			|| str_starts_with($prefix, '<html')
+			|| str_starts_with($prefix, '<?xml')
+			|| str_starts_with($prefix, '<svg')
+		) {
+			return true;
+		}
+
+		if ($title !== '') {
+			$lowerTitle = strtolower($title);
+			foreach (['.html', '.htm', '.xhtml', '.xml', '.svg'] as $ext) {
+				if (str_ends_with($lowerTitle, $ext)) {
+					return true;
+				}
+			}
+		}
+
+		if ($unencoded && preg_match('#</(?:p|div|span|a|li|td)\s*>|<br\s*/?>#i', $text) === 1) {
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -101,16 +143,22 @@ class ContentExtractor {
 	}
 
 	/**
-	 * Normalise text for PostgreSQL: valid UTF-8, no NUL bytes, no markup, bounded size.
+	 * Normalise text for PostgreSQL: valid UTF-8, no NUL bytes, bounded size.
 	 *
-	 * @param bool $stripMarkup remove HTML found in the text. Off for text that extraction
-	 *                          already made plain (office, PDF), where "<draft>" is content.
+	 * @param bool $stripMarkup remove HTML found in the text. Off by default so plain text
+	 *                          keeps angle brackets intact; enabled when markup is detected.
 	 */
-	public function clean(string $text, bool $stripMarkup = true): string {
+	public function clean(string $text, bool $stripMarkup = false): string {
 		$text = $this->toUtf8($text);
 		$text = str_replace("\0", ' ', $text);
-		if ($stripMarkup && preg_match('#</?[a-zA-Z][^>]*>#', $text)) {
-			$text = html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+		if ($stripMarkup) {
+			if (str_contains($text, '<')) {
+				$text = (string)preg_replace(self::BLOCK_TAGS_PATTERN, ' ', $text);
+				$text = strip_tags($text);
+			}
+			if (str_contains($text, '&')) {
+				$text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+			}
 		}
 		$text = trim((string)preg_replace('/\s+/u', ' ', $text));
 
