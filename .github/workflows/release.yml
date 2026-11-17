@@ -31,7 +31,7 @@ jobs:
       APP_ID: fulltextsearch_pgsql
       TAG: ${{ github.event.release.tag_name }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Check the version
         run: |
