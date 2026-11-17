@@ -259,7 +259,7 @@ class SearchService {
 		}
 		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, ($page - 1) * $size, array_values(array_unique($excerptWords)));
 		$titlesSearched = $weights === null || str_contains($weights, 'A');
-		if ($rows === [] && $page === 1 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '') {
+		if ($rows === [] && $page === 1 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '' && $query->plainWordsOnly) {
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
 			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size);
 		}

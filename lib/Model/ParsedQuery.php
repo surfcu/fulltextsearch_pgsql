@@ -19,6 +19,7 @@ final class ParsedQuery {
 	 * @param string $plainText the positive search words, for trigram matching
 	 * @param list<array{0: string, 1: list<string>}> $terms one tsquery expression per positive
 	 *                                                       term, in query order, for IDF weighting
+	 * @param bool $plainWordsOnly true when the query contains only plain optional words (no +, -, or phrases)
 	 */
 	public function __construct(
 		public readonly string $sql,
@@ -29,6 +30,7 @@ final class ParsedQuery {
 		public readonly array $allParams,
 		public readonly string $plainText,
 		public readonly array $terms = [],
+		public readonly bool $plainWordsOnly = true,
 	) {
 	}
 }

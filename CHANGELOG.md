@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Skip the trigram title-similarity fallback when a query uses exclusions (`-`), required terms (`+`), or phrases (`"..."`), keeping plain-word `OR`/`AND` searches eligible; no re-indexing is needed.
 - Extraction and vocabulary limits: drain `stdout` and `stderr` concurrently and terminate stalled or output-capped extraction tools, cap Office extraction at 128 MB of uncompressed XML and 2,000 entries, prevent mid-sentence word fusion at OpenDocument annotations/notes and index headers/footers from `styles.xml`, restrict metadata-only vocabulary updates to title and tags, and skip upgrade vocabulary population when `typo_correction` is disabled. Re-indexing of OpenDocument files is needed to benefit from the note and header/footer extraction fixes.
 
 ## [1.5.0] - 2026-11-17

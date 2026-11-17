@@ -452,6 +452,40 @@ try {
 	same([], search($platform, 'alice', 'markting plann')['ids'], 'fallback disabled by use_trigram=false');
 	$config->setConfig(['use_trigram' => true]);
 
+	section('title fallback respects exclusions, required terms and phrases (A2)');
+	$platform->indexDocument(doc('A2_DRAFT', 'alice', 'budgets_draft.txt', '', [], 'a2'));
+	$platform->indexDocument(doc('A2_PLAN', 'alice', 'marketing_plan.txt', '', [], 'a2'));
+	$a2 = ['provider' => 'a2'];
+	same(['A2_DRAFT'], search($platform, 'alice', 'budget', $a2)['ids'], 'A2 baseline: plain word finds document');
+	same([], search($platform, 'alice', 'budget -draft', $a2)['ids'], 'A2: title fallback suppressed when exclusion is present');
+	same([], search($platform, 'alice', '+budget -draft', $a2)['ids'], 'A2: title fallback suppressed when required and excluded terms are present');
+	same([], search($platform, 'alice', '"draft budgets"', $a2)['ids'], 'A2: title fallback suppressed for phrase query');
+	$config->setConfig(['typo_correction' => false]);
+	same([], search($platform, 'alice', '+budgt +draft', $a2)['ids'], 'A2: title fallback suppressed when required terms (+) are present');
+	same([], search($platform, 'alice', '+"draft budgets"', $a2)['ids'], 'A2: title fallback suppressed for required phrase query');
+	same(['A2_PLAN'], search($platform, 'alice', 'markting OR plann', $a2)['ids'], 'A2: plain-word fallback works with OR');
+	same(['A2_PLAN'], search($platform, 'alice', 'markting AND plann', $a2)['ids'], 'A2: plain-word fallback works with AND');
+	$config->setConfig(['typo_correction' => true]);
+	$platform->resetIndex('a2');
+
+	$qb = new TsQueryBuilder();
+	foreach (['budget', 'markting OR plann', 'markting AND plann', 'e-mail', 'budget -'] as $plainQuery) {
+		same(true, $qb->build($plainQuery, 'english')?->plainWordsOnly, "A2 unit: plainWordsOnly is true for '$plainQuery'");
+	}
+	foreach ([
+		'budget -draft',
+		'+budget -draft',
+		'+budget',
+		'"budgets draft"',
+		'+"draft budgets"',
+		'budget -"draft"',
+		'budget -OR',
+		'budget +AND',
+		'budget "OR"',
+	] as $constrainedQuery) {
+		same(false, $qb->build($constrainedQuery, 'english')?->plainWordsOnly, "A2 unit: plainWordsOnly is false for '$constrainedQuery'");
+	}
+
 	section('filters and paging');
 	$platform->indexDocument(doc('F1', 'alice', 'Invoice one', 'invoice', ['metatags' => ['pdf'], 'subtags' => ['files' => 'local'], 'mtime' => 1000]));
 	$platform->indexDocument(doc('F2', 'alice', 'Invoice two', 'invoice', ['metatags' => ['doc'], 'subtags' => ['files' => 'external'], 'mtime' => 2000]));
