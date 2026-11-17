@@ -59,8 +59,8 @@ class VocabularyService {
 	 * @return int number of distinct words
 	 */
 	public function rebuild(?callable $progress = null, int $batchSize = 500): int {
-		$t = $this->schemaService->getTableName();
-		$w = $this->schemaService->getWordsTableName();
+		$t = $this->schemaService->getQualifiedTableName();
+		$w = $this->schemaService->getQualifiedWordsTableName();
 
 		$result = $this->db->executeQuery("SELECT count(*), coalesce(max(id), 0) FROM $t");
 		[$total, $maxId] = array_map('intval', $result->fetch(\PDO::FETCH_NUM) ?: [0, 0]);
@@ -81,7 +81,7 @@ class VocabularyService {
 	}
 
 	public function count(): int {
-		$result = $this->db->executeQuery('SELECT count(*) FROM ' . $this->schemaService->getWordsTableName());
+		$result = $this->db->executeQuery('SELECT count(*) FROM ' . $this->schemaService->getQualifiedWordsTableName());
 		$count = (int)$result->fetchOne();
 		$result->closeCursor();
 		return $count;
@@ -107,7 +107,7 @@ class VocabularyService {
 			return [];
 		}
 
-		$w = $this->schemaService->getWordsTableName();
+		$w = $this->schemaService->getQualifiedWordsTableName();
 		$branches = [];
 		$params = [];
 		foreach ($validWords as $idx => $word) {
@@ -217,6 +217,9 @@ class VocabularyService {
 			return $alternatives;
 		}
 
+		$ts = $this->schemaService->getTrigramSchema();
+		$simFn = $ts !== null ? "{$ts}.similarity" : 'similarity';
+		$simOp = $ts !== null ? "OPERATOR({$ts}.%)" : '%';
 		$spellingBranches = [];
 		$spellingParams = [];
 		$foldedInputs = [];
@@ -227,9 +230,9 @@ class VocabularyService {
 			$maxDistance = $length >= 7 ? 2 : 1;
 			$foldedInputs[$idx] = $folded;
 			$maxDistances[$idx] = $maxDistance;
-			$spellingBranches[] = "(SELECT $idx AS idx, word, folded, similarity(folded, ?) AS score
+			$spellingBranches[] = "(SELECT $idx AS idx, word, folded, {$simFn}(folded, ?) AS score
 				FROM $w
-				WHERE folded % ? AND length(folded) BETWEEN ? AND ?
+				WHERE folded {$simOp} ? AND length(folded) BETWEEN ? AND ?
 				ORDER BY score DESC, word
 				LIMIT " . self::SHORTLIST . ')';
 			array_push(
@@ -318,8 +321,8 @@ class VocabularyService {
 	}
 
 	private function insertSql(string $where, bool $withContent = true, bool $withParts = true): string {
-		$t = $this->schemaService->getTableName();
-		$w = $this->schemaService->getWordsTableName();
+		$t = $this->schemaService->getQualifiedTableName();
+		$w = $this->schemaService->getQualifiedWordsTableName();
 		$s = $this->schemaService;
 		// The 'simple' configuration lowercases without stemming or stopwords: surface words.
 		$fields = [
@@ -348,7 +351,7 @@ class VocabularyService {
 
 	private function countBetween(int $from, int $to): int {
 		$result = $this->db->executeQuery(
-			'SELECT count(*) FROM ' . $this->schemaService->getTableName() . ' WHERE id > ? AND id <= ?',
+			'SELECT count(*) FROM ' . $this->schemaService->getQualifiedTableName() . ' WHERE id > ? AND id <= ?',
 			[(string)$from, (string)$to]
 		);
 		$count = (int)$result->fetchOne();

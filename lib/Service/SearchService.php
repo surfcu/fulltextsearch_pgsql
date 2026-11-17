@@ -352,7 +352,7 @@ class SearchService {
 	 * @return array{0: callable(list<string>, bool=): list<string>, 1: callable(list<string>): list<string>}
 	 */
 	private function vocabularyProbes(array $languages, ?string $weights, array $filterConditions, array $filterParams): array {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		$langConditions = self::languageConditions($languages);
 		// Hide provider_id from the planner so EXISTS uses GIN (tsv/access) instead of scanning every row via doc_uniq.
 		$probeConditions = $filterConditions;
@@ -514,7 +514,7 @@ class SearchService {
 			'SELECT owner_id, array_to_json(access) AS access, array_to_json(links) AS links,
 					array_to_json(tags) AS tags, array_to_json(metatags) AS metatags, array_to_json(subtags) AS subtags,
 					source, hash, modified_time, title, parts, content, info
-			 FROM ' . $this->schemaService->getTableName() . ' WHERE provider_id = ? AND document_id = ?',
+			 FROM ' . $this->schemaService->getQualifiedTableName() . ' WHERE provider_id = ? AND document_id = ?',
 			[$providerId, $documentId]
 		);
 		$row = $result->fetch();
@@ -634,7 +634,7 @@ class SearchService {
 	 * @param list<string> $filterParams
 	 */
 	private function startFromFilters(array $queries, array $filterConditions, array $filterParams): bool {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		$filtered = $this->estimateRows("SELECT 1 FROM $t d WHERE " . self::renderFilters($filterConditions, false), $filterParams);
 		[$matchSql, $matchParams] = $this->matchCondition($queries);
 		$matching = $this->estimateRows("SELECT 1 FROM $t d WHERE $matchSql", $matchParams);
@@ -962,7 +962,7 @@ class SearchService {
 	 * @return list<array<string, mixed>>
 	 */
 	private function fullTextSearch(array $queries, string $filterSql, array $filterParams, bool $filtersFirst, int $limit, int $offset, array $excerptWords = []): array {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		$conditions = self::languageConditions(array_keys($queries));
 
 		$rankColumns = [];
@@ -1256,7 +1256,7 @@ class SearchService {
 	 * @return array{0: list<int>, 1: float} document frequency per term, N
 	 */
 	private function documentFrequencies(array $queries, array $conditions, string $filterSql, array $filterParams, bool $filtersFirst): array {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		$limit = self::EXACT_FREQUENCY_LIMIT;
 		$columns = [];
 		$params = [];
@@ -1276,7 +1276,7 @@ class SearchService {
 			array_push($params, ...$terms[$j][1]);
 		}
 		$columns[] = "(SELECT CASE WHEN c.reltuples >= 10000 THEN c.reltuples::bigint ELSE (SELECT count(*) FROM $t) END
-			FROM pg_class c WHERE c.oid = to_regclass(?))";
+			FROM pg_catalog.pg_class c WHERE c.oid = pg_catalog.to_regclass(?))";
 		$params[] = $t;
 
 		$result = $this->db->executeQuery('SELECT ' . implode(', ', $columns), $params);
@@ -1316,7 +1316,7 @@ class SearchService {
 	 * @param list<string> $filterParams
 	 */
 	private function fullTextCount(array $queries, string $filterSql, array $filterParams, bool $filtersFirst): int {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		[$matchSql, $matchParams] = $this->matchCondition($queries);
 		if ($filtersFirst) {
 			$matchSql = "($matchSql) IS TRUE";
@@ -1335,15 +1335,18 @@ class SearchService {
 	 * @return list<array<string, mixed>>
 	 */
 	private function titleSimilaritySearch(string $text, string $filterSql, array $filterParams, int $limit, int $offset = 0): array {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
+		$ts = $this->schemaService->getTrigramSchema();
+		$wordSim = $ts !== null ? "{$ts}.word_similarity" : 'word_similarity';
+		$wordOp = $ts !== null ? "OPERATOR({$ts}.<%)" : '<%';
 		$joined = "CASE WHEN d.content = '' THEN d.parts_text WHEN d.parts_text = '' THEN d.content ELSE d.content || ' ' || d.parts_text END";
 		$sql = <<<SQL
 			SELECT d.document_id, d.title, d.source, d.hash, d.modified_time,
-				   word_similarity(?, d.title_search) AS rank,
+				   {$wordSim}(?, d.title_search) AS rank,
 				   count(*) OVER () AS total,
 				   left($joined, 300) AS excerpt
 			FROM $t d
-			WHERE ? <% d.title_search AND $filterSql
+			WHERE ? {$wordOp} d.title_search AND $filterSql
 			ORDER BY rank DESC, d.modified_time DESC, d.id
 			LIMIT ? OFFSET ?
 			SQL;
@@ -1360,10 +1363,12 @@ class SearchService {
 	 * @param list<string> $filterParams
 	 */
 	private function titleSimilarityCount(string $text, string $filterSql, array $filterParams): int {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
+		$ts = $this->schemaService->getTrigramSchema();
+		$wordOp = $ts !== null ? "OPERATOR({$ts}.<%)" : '<%';
 		$text = mb_strtolower($text, 'UTF-8');
 		$result = $this->db->executeQuery(
-			"SELECT count(*) FROM $t d WHERE ? <% d.title_search AND $filterSql",
+			"SELECT count(*) FROM $t d WHERE ? {$wordOp} d.title_search AND $filterSql",
 			array_merge([$text], $filterParams)
 		);
 		$count = (int)$result->fetchOne();

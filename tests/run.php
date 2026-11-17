@@ -3211,6 +3211,361 @@ try {
 	} finally {
 		$s2Cleanup();
 	}
+
+	section('1.4.2/1.5.x to schema v3 upgrade fixture (S3)');
+	$s3UpCleanup = static function () use ($conn): void {
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s3up_index, ftspg_s3up_words');
+		$conn->executeStatement('DROP FUNCTION IF EXISTS ftspg_s3up_regconfig(text)');
+	};
+	$s3UpCleanup();
+
+	try {
+		$s3UpSysConfig = new ArrayConfig(['dbtableprefix' => 's3up_']);
+		$s3UpSchema = new SchemaService($conn, $s3UpSysConfig, $logger);
+		$s3UpConfig = new ConfigService(new ArrayAppConfig(), $s3UpSchema);
+		$s3UpConfig->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		$s3UpVocab = new VocabularyService($conn, $s3UpSchema);
+		$s3UpIndex = new IndexService($conn, $s3UpSchema, $s3UpConfig, new ContentExtractor($s3UpConfig), $s3UpVocab, $logger, new LanguageDetector($conn, $s3UpConfig, $logger));
+		$s3UpSearch = new SearchService($conn, $s3UpSchema, $s3UpConfig, new TsQueryBuilder(), $s3UpVocab);
+		$s3UpPlatform = new PostgreSQLPlatform($s3UpConfig, $s3UpSchema, $s3UpIndex, $s3UpSearch, $logger, new ContentExtractor($s3UpConfig));
+
+		$v2Norm = static fn (string $c): string => "CASE WHEN config = 'turkish'::regconfig THEN translate($c, 'Iİ', 'ıi') ELSE $c END";
+		$v2Title = $v2Norm('title');
+		$v2SplitTitle = $s3UpSchema->splitWords($v2Title);
+		$v2Tags = $v2Norm('tags_text');
+		$v2Parts = $v2Norm('parts_text');
+		$v2Content = $v2Norm('content');
+
+		$conn->executeStatement(<<<SQL
+			CREATE TABLE ftspg_s3up_index (
+				id            bigserial    PRIMARY KEY,
+				provider_id   varchar(64)  NOT NULL,
+				document_id   varchar(254) NOT NULL,
+				owner_id      varchar(64)  NOT NULL DEFAULT '',
+				access        text[]       NOT NULL DEFAULT '{}',
+				links         text[]       NOT NULL DEFAULT '{}',
+				tags          text[]       NOT NULL DEFAULT '{}',
+				metatags      text[]       NOT NULL DEFAULT '{}',
+				subtags       text[]       NOT NULL DEFAULT '{}',
+				source        varchar(64)  NOT NULL DEFAULT '',
+				hash          varchar(128) NOT NULL DEFAULT '',
+				modified_time bigint       NOT NULL DEFAULT 0,
+				indexed_at    bigint       NOT NULL DEFAULT 0,
+				config        regconfig    NOT NULL,
+				title         text         NOT NULL DEFAULT '',
+				tags_text     text         NOT NULL DEFAULT '',
+				parts         jsonb        NOT NULL DEFAULT '{}',
+				parts_text    text         NOT NULL DEFAULT '',
+				content       text         NOT NULL DEFAULT '',
+				info          jsonb        NOT NULL DEFAULT '{}',
+				tsv           tsvector     GENERATED ALWAYS AS (
+					setweight(to_tsvector(config, $v2Title), 'A')
+					|| setweight(to_tsvector(config, $v2SplitTitle), 'A')
+					|| setweight(to_tsvector(config, $v2Tags), 'B')
+					|| setweight(to_tsvector(config, $v2Parts), 'C')
+					|| setweight(to_tsvector(config, $v2Content), 'D')
+				) STORED,
+				title_search  text         GENERATED ALWAYS AS (lower($v2Title)) STORED,
+				CONSTRAINT ftspg_s3up_index_doc_uniq UNIQUE (provider_id, document_id)
+			)
+			SQL);
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s3up_index.tsv IS 'ftspg schema 2'");
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_index_tsv_idx ON ftspg_s3up_index USING GIN (tsv)');
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_index_access_idx ON ftspg_s3up_index USING GIN (access)');
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_index_metatags_idx ON ftspg_s3up_index USING GIN (metatags)');
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_index_subtags_idx ON ftspg_s3up_index USING GIN (subtags)');
+		$conn->executeStatement(sprintf(
+			'CREATE TABLE ftspg_s3up_words (word text COLLATE "C" PRIMARY KEY, folded text COLLATE "C" GENERATED ALWAYS AS (translate(word, \'%s\', \'%s\')) STORED)',
+			\OCA\FullTextSearch_PgSql\Tools\Fold::FROM,
+			\OCA\FullTextSearch_PgSql\Tools\Fold::TO
+		));
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_words_folded_idx ON ftspg_s3up_words (folded)');
+		if ($s3UpSchema->hasTrigram()) {
+			$conn->executeStatement('CREATE INDEX ftspg_s3up_index_title_search_trgm_idx ON ftspg_s3up_index USING GIN (title_search gin_trgm_ops)');
+			$conn->executeStatement('CREATE INDEX ftspg_s3up_words_folded_trgm_idx ON ftspg_s3up_words USING GIN (folded gin_trgm_ops)');
+		}
+
+		$conn->executeStatement(
+			'INSERT INTO ftspg_s3up_index (provider_id, document_id, owner_id, access, source, hash, config, title, tags_text, parts_text, content) VALUES '
+			. "('files', 'S3UP_EN1', 'alice', '{u:alice}', 'local', 'hash_en_1', 'english'::regconfig, 'Quarterly budget review', 'finance', 'annual_comment', 'The studies were archived cleanly.'), "
+			. "('files', 'S3UP_EN2', 'bob', '{u:bob}', 'external', 'hash_en_2', 'english'::regconfig, 'Private notes', '', '', 'Bob confidential report.'), "
+			. "('files', 'S3UP_TR1', 'alice', '{u:alice}', 'local', 'hash_tr_1', 'turkish'::regconfig, 'ISPARTA GÜLLERİ', 'İSTANBUL', 'proje_notu', 'Yeni çalışma kapsamında kitapları inceledik.'), "
+			. "('files', 'S3UP_TR2', 'alice', '{u:alice}', 'share', 'hash_tr_2', 'turkish'::regconfig, 'Yıllık toplantı', '', '', 'Veri tabanı planlaması tamamlandı.')"
+		);
+		$conn->executeStatement(
+			'INSERT INTO ftspg_s3up_words (word) VALUES '
+			. "('quarterly'), ('budget'), ('studies'), ('archived'), ('çalışma'), ('ısparta'), ('istanbul'), ('kitapları'), ('planlaması')"
+		);
+
+		same(false, $s3UpSchema->isCurrent(), 'S3 upgrade fixture: pre-upgrade isCurrent() is false');
+		$loadRefused = false;
+		try {
+			$s3UpPlatform->loadPlatform();
+		} catch (\RuntimeException) {
+			$loadRefused = true;
+		}
+		same(true, $loadRefused, 'S3 upgrade fixture: loadPlatform() refuses stale v2 schema');
+		same(
+			'regconfig',
+			(string)$conn->executeQuery("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s3up_index') AND attname = 'config' AND NOT attisdropped")->fetchOne(),
+			'S3 upgrade fixture: loadPlatform() leaves config as regconfig'
+		);
+
+		$s3UpSchema->ensureSchema();
+		same(true, $s3UpSchema->isCurrent(), 'S3 upgrade fixture: ensureSchema() brings schema to current');
+		same(
+			'ftspg schema 3',
+			$conn->executeQuery("SELECT col_description(to_regclass('ftspg_s3up_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s3up_index') AND attname = 'tsv' AND NOT attisdropped")->fetchOne(),
+			'S3 upgrade fixture: tsv comment updated to ftspg schema 3'
+		);
+		$s3UpFnRow = $conn->executeQuery(
+			"SELECT p.provolatile, p.proparallel FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = current_schema() AND p.proname = 'ftspg_s3up_regconfig' AND pg_get_function_identity_arguments(p.oid) = 'text'"
+		)->fetch();
+		same('i', is_array($s3UpFnRow) ? (string)$s3UpFnRow['provolatile'] : null, 'S3 upgrade fixture: ftspg_s3up_regconfig(text) is IMMUTABLE');
+		same('s', is_array($s3UpFnRow) ? (string)$s3UpFnRow['proparallel'] : null, 'S3 upgrade fixture: ftspg_s3up_regconfig(text) is PARALLEL SAFE');
+
+		$s3UpColTypes = [];
+		$s3UpRegCols = [];
+		foreach ($conn->executeQuery("SELECT attname, format_type(atttypid, atttypmod) AS typ FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s3up_index') AND attnum > 0 AND NOT attisdropped")->fetchAll() as $row) {
+			$colName = (string)$row['attname'];
+			$colType = (string)$row['typ'];
+			$s3UpColTypes[$colName] = $colType;
+			if (str_starts_with($colType, 'reg')) {
+				$s3UpRegCols[] = $colName . ':' . $colType;
+			}
+		}
+		foreach (['config', 'provider_id', 'document_id', 'owner_id', 'source', 'hash'] as $col) {
+			same('text', $s3UpColTypes[$col] ?? null, "S3 upgrade fixture: $col migrated to text");
+		}
+		same([], $s3UpRegCols, 'S3 upgrade fixture: zero reg* columns after upgrade');
+
+		same(4, $s3UpSchema->countDocuments(), 'S3 upgrade fixture: index row count preserved');
+		same(9, $s3UpVocab->count(), 'S3 upgrade fixture: vocabulary row count preserved');
+		$s3UpEnRow = $conn->executeQuery("SELECT config, owner_id, source, hash FROM ftspg_s3up_index WHERE document_id = 'S3UP_EN1'")->fetch();
+		same(['config' => 'english', 'owner_id' => 'alice', 'source' => 'local', 'hash' => 'hash_en_1'], $s3UpEnRow, 'S3 upgrade fixture: English metadata and config preserved');
+		$s3UpTrRow = $conn->executeQuery("SELECT config, owner_id, source, hash FROM ftspg_s3up_index WHERE document_id = 'S3UP_TR1'")->fetch();
+		same(['config' => 'turkish', 'owner_id' => 'alice', 'source' => 'local', 'hash' => 'hash_tr_1'], $s3UpTrRow, 'S3 upgrade fixture: Turkish metadata and config preserved');
+
+		same(['S3UP_EN1'], search($s3UpPlatform, 'alice', 'study')['ids'], 'S3 upgrade fixture: English stemming search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'kitaplarımız')['ids'], 'S3 upgrade fixture: Turkish stemming search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'ısparta')['ids'], 'S3 upgrade fixture: Turkish lowercase I folding search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'Isparta')['ids'], 'S3 upgrade fixture: Turkish uppercase I folding search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'istanbul')['ids'], 'S3 upgrade fixture: Turkish tags_text İ folding search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'calisma')['ids'], 'S3 upgrade fixture: preserved vocabulary accent variant search works');
+		if ($s3UpSchema->hasTrigram()) {
+			same(['S3UP_EN1'], search($s3UpPlatform, 'alice', 'quartrly')['ids'], 'S3 upgrade fixture: preserved vocabulary typo correction works');
+		}
+
+		$s3LongProvider = str_repeat('p', 80);
+		$s3LongDocId = str_repeat('d', 300);
+		$s3LongRes = $s3UpPlatform->indexDocument(doc($s3LongDocId, 'alice', 'PostUpgradeWideTitle', 'postupgradewideneedle content', [], $s3LongProvider));
+		same(true, $s3LongRes->isStatus(IIndex::INDEX_DONE), 'S3 upgrade fixture: post-upgrade >254 doc_id and >64 provider_id insert succeeds');
+		same([$s3LongDocId], search($s3UpPlatform, 'alice', 'postupgradewideneedle', ['provider' => $s3LongProvider])['ids'], 'S3 upgrade fixture: post-upgrade wide-id document is searchable');
+	} finally {
+		$s3UpCleanup();
+	}
+
+	section('pg_catalog reg* column assertion (S3)');
+	$ocTableCount = (int)$conn->executeQuery(
+		"SELECT count(*)
+		 FROM pg_catalog.pg_class c
+		 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		 WHERE c.relkind IN ('r', 'p')
+		   AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+		   AND n.nspname <> 'information_schema'
+		   AND c.relname IN ('ftspg_oc_index', 'ftspg_oc_words')"
+	)->fetchOne();
+	check($ocTableCount >= 2, 'S3 catalog: ftspg_oc_index and ftspg_oc_words exist in pg_catalog');
+	$regColumns = $conn->executeQuery(
+		"SELECT n.nspname || '.' || c.relname || '.' || a.attname || ':' || pg_catalog.format_type(a.atttypid, a.atttypmod) AS col
+		 FROM pg_catalog.pg_attribute a
+		 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+		 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+		 LEFT JOIN pg_catalog.pg_type elem ON elem.oid = t.typelem AND t.typcategory = 'A'
+		 WHERE c.relkind IN ('r', 'p', 'm')
+		   AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+		   AND n.nspname <> 'information_schema'
+		   AND c.relname LIKE 'ftspg\_%' ESCAPE '\'
+		   AND a.attnum > 0
+		   AND NOT a.attisdropped
+		   AND (t.typname LIKE 'reg%' OR elem.typname LIKE 'reg%')
+		 ORDER BY 1"
+	)->fetchAll(\PDO::FETCH_COLUMN);
+	same([], $regColumns, 'S3 catalog: zero reg* or _reg* columns on any ftspg_* table');
+
+	section('pg_dump / pg_restore under empty search_path (S3)');
+	$dsnBody = str_starts_with($dsn, 'pgsql:') ? substr($dsn, 6) : $dsn;
+	$rawPairs = str_contains($dsnBody, ';')
+		? explode(';', $dsnBody)
+		: (preg_split('/\s+/', trim($dsnBody)) ?: []);
+	$dsnParts = [];
+	foreach ($rawPairs as $pair) {
+		$pair = trim($pair);
+		if ($pair === '' || !str_contains($pair, '=')) {
+			continue;
+		}
+		[$k, $v] = explode('=', $pair, 2);
+		$dsnParts[strtolower(trim($k))] = trim($v);
+	}
+	$pgEnv = getenv();
+	if (!is_array($pgEnv)) {
+		$pgEnv = [];
+	}
+	unset($pgEnv['PGDATABASE']);
+	if (isset($dsnParts['host']) && $dsnParts['host'] !== '') {
+		$pgEnv['PGHOST'] = $dsnParts['host'];
+	}
+	if (isset($dsnParts['port']) && $dsnParts['port'] !== '') {
+		$pgEnv['PGPORT'] = $dsnParts['port'];
+	}
+	if (isset($dsnParts['user']) && $dsnParts['user'] !== '') {
+		$pgEnv['PGUSER'] = $dsnParts['user'];
+	}
+	if (isset($dsnParts['password'])) {
+		$pgEnv['PGPASSWORD'] = $dsnParts['password'];
+	}
+	if (isset($dsnParts['sslmode']) && $dsnParts['sslmode'] !== '') {
+		$pgEnv['PGSSLMODE'] = $dsnParts['sslmode'];
+	}
+	$sourceDb = $dsnParts['dbname'] ?? ($dsnParts['user'] ?? 'postgres');
+	$restoreDb = 'ftspg_restore_test_' . getmypid();
+	$qRestoreDb = '"' . str_replace('"', '""', $restoreDb) . '"';
+	$restoreParts = $dsnParts;
+	$restoreParts['dbname'] = $restoreDb;
+	$restoreDsn = 'pgsql:' . implode(';', array_map(
+		static fn (string $k, string $v): string => "$k=$v",
+		array_keys($restoreParts),
+		array_values($restoreParts)
+	));
+	$dumpFile = sys_get_temp_dir() . '/ftspg_s3_dump_' . getmypid() . '_' . mt_rand() . '.dump';
+
+	$runPgTool = static function (array $cmd, array $env): array {
+		$proc = proc_open($cmd, [
+			0 => ['pipe', 'r'],
+			1 => ['pipe', 'w'],
+			2 => ['pipe', 'w'],
+		], $pipes, null, $env);
+		if (!is_resource($proc)) {
+			throw new \RuntimeException('Failed to spawn ' . $cmd[0]);
+		}
+		fclose($pipes[0]);
+		$stdout = stream_get_contents($pipes[1]);
+		$stderr = stream_get_contents($pipes[2]);
+		fclose($pipes[1]);
+		fclose($pipes[2]);
+		$code = proc_close($proc);
+		return [$code, is_string($stdout) ? $stdout : '', is_string($stderr) ? $stderr : ''];
+	};
+
+	$restorePdo = null;
+	$restoreConn = null;
+	$restoreSchema = null;
+	$restoreConfig = null;
+	$restoreVocab = null;
+	$restoreDetector = null;
+	$restoreIndex = null;
+	$restoreSearch = null;
+	$restorePlatform = null;
+
+	try {
+		[$dumpVerCode, $dumpVerOut, $dumpVerErr] = $runPgTool(['pg_dump', '--version'], $pgEnv);
+		same(0, $dumpVerCode, 'S3 pg_dump --version exits 0: ' . trim($dumpVerOut . ' ' . $dumpVerErr));
+		[$restoreVerCode, $restoreVerOut, $restoreVerErr] = $runPgTool(['pg_restore', '--version'], $pgEnv);
+		same(0, $restoreVerCode, 'S3 pg_restore --version exits 0: ' . trim($restoreVerOut . ' ' . $restoreVerErr));
+
+		$config->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		$platform->indexDocument(doc('S3DUMP_EN', 'alice', 'Annual budget archive', 'The quarterly studies were published in the archive.', [], 's3dump'));
+		$platform->indexDocument(doc('S3DUMP_TR', 'alice', 'ISPARTA GÜLLERİ', 'İSTANBUL ofisinde ISPARTA çalışma ve kitapları inceledik.', [], 's3dump'));
+		$platform->indexDocument(doc('S3DUMP_IDF', 'alice', 'Budget summary', 'budget common word and rarexylophone needle', [], 's3dump'));
+		$sourceCount = $schema->countDocuments();
+		check($sourceCount >= 3, 'S3 dump/restore: source database populated');
+
+		[$dumpCode, , $dumpErr] = $runPgTool(['pg_dump', '-w', '-Fc', '-f', $dumpFile, $sourceDb], $pgEnv);
+		same(0, $dumpCode, 'S3 pg_dump exits 0' . ($dumpErr === '' ? '' : ': ' . trim($dumpErr)));
+		same('', trim($dumpErr), 'S3 pg_dump produces empty stderr');
+		check(is_file($dumpFile) && filesize($dumpFile) > 0, 'S3 pg_dump produces non-empty archive');
+
+		[$listCode, $listOut, $listErr] = $runPgTool(['pg_restore', '-l', $dumpFile], $pgEnv);
+		same(0, $listCode, 'S3 pg_restore -l exits 0' . ($listErr === '' ? '' : ': ' . trim($listErr)));
+		$fnLine = null;
+		$tblLine = null;
+		foreach (explode("\n", $listOut) as $lineIdx => $line) {
+			if ($fnLine === null && preg_match('/\bFUNCTION\b.*\bftspg_oc_regconfig\b/', $line) === 1) {
+				$fnLine = $lineIdx;
+			}
+			if ($tblLine === null && preg_match('/\bTABLE\b.*\bftspg_oc_index\b/', $line) === 1) {
+				$tblLine = $lineIdx;
+			}
+		}
+		check($fnLine !== null && $tblLine !== null && $fnLine < $tblLine, 'S3 pg_restore -l places FUNCTION ftspg_oc_regconfig before TABLE ftspg_oc_index');
+
+		$conn->executeStatement("DROP DATABASE IF EXISTS $qRestoreDb WITH (FORCE)");
+		$conn->executeStatement("CREATE DATABASE $qRestoreDb TEMPLATE template0");
+		[$restoreCode, , $restoreErr] = $runPgTool(['pg_restore', '-w', '-e', '--no-owner', '--no-acl', '-d', $restoreDb, $dumpFile], $pgEnv);
+		same(0, $restoreCode, 'S3 pg_restore exits 0' . ($restoreErr === '' ? '' : ': ' . trim($restoreErr)));
+		same('', trim($restoreErr), 'S3 pg_restore produces empty stderr');
+
+		$restorePdo = new PDO($restoreDsn);
+		$restorePdo->exec("SET search_path = ''");
+		$spVal = (string)$restorePdo->query("SELECT pg_catalog.current_setting('search_path')")->fetchColumn();
+		check(in_array($spVal, ['', '""'], true), 'S3 empty search_path: current_setting is empty');
+		same(true, (bool)$restorePdo->query('SELECT pg_catalog.current_schema() IS NULL')->fetchColumn(), 'S3 empty search_path: current_schema() is NULL');
+
+		$restoreConn = new PdoConnection($restorePdo);
+		$restoreSchema = new SchemaService($restoreConn, new ArrayConfig(['dbtableprefix' => 'oc_']), $logger);
+		$restoreConfig = new ConfigService(new ArrayAppConfig(), $restoreSchema);
+		$restoreConfig->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		$restoreVocab = new VocabularyService($restoreConn, $restoreSchema);
+		$restoreDetector = new LanguageDetector($restoreConn, $restoreConfig, $logger);
+		$restoreExtractor = new ContentExtractor($restoreConfig);
+		$restoreIndex = new IndexService($restoreConn, $restoreSchema, $restoreConfig, $restoreExtractor, $restoreVocab, $logger, $restoreDetector);
+		$restoreSearch = new SearchService($restoreConn, $restoreSchema, $restoreConfig, new TsQueryBuilder(), $restoreVocab);
+		$restorePlatform = new PostgreSQLPlatform($restoreConfig, $restoreSchema, $restoreIndex, $restoreSearch, $logger, $restoreExtractor);
+
+		same(true, $restoreSchema->isCurrent(), 'S3 empty search_path: SchemaService::isCurrent() returns true');
+		same($sourceCount, $restoreSchema->countDocuments(), 'S3 empty search_path: SchemaService::countDocuments() matches source');
+		same(['S3DUMP_EN'], search($restorePlatform, 'alice', 'study', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: English search works');
+
+		$trDumpRes = search($restorePlatform, 'alice', 'ısparta', ['provider' => 's3dump']);
+		same(['S3DUMP_TR'], $trDumpRes['ids'], 'S3 empty search_path: Turkish I/İ search works');
+		$trDumpExcerpt = isset($trDumpRes['docs'][0]) ? implode(' ', array_column($trDumpRes['docs'][0]->getExcerpts() ?? [], 'excerpt')) : '';
+		check(str_contains($trDumpExcerpt, 'ISPARTA'), 'S3 empty search_path: Turkish ts_headline excerpt preserves casing');
+
+		same(['S3DUMP_IDF', 'S3DUMP_EN'], search($restorePlatform, 'alice', 'budget rarexylophone', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: multi-word IDF search works');
+		same(['S3DUMP_TR'], search($restorePlatform, 'alice', 'calisma', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: vocabulary accent variant works');
+
+		if ($restoreSchema->hasTrigram()) {
+			same(['S3DUMP_EN'], search($restorePlatform, 'alice', 'quartrly', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: vocabulary typo correction (pg_trgm similarity/%) works');
+			$restoreConfig->setConfig(['language' => 'turkish,english', 'typo_correction' => false]);
+			same(['S3DUMP_EN'], search($restorePlatform, 'alice', 'annuall', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: title similarity fallback (pg_trgm word_similarity/<%) works');
+			$restoreConfig->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		}
+
+		$emptySpInsert = $restorePlatform->indexDocument(doc('S3DUMP_EMPTY_SP', 'alice', 'Empty path insert', 'verification payload under empty search path', [], 's3dump'));
+		same(true, $emptySpInsert->isStatus(IIndex::INDEX_DONE), 'S3 empty search_path: IndexService::upsert() succeeds');
+		same(['S3DUMP_EMPTY_SP'], search($restorePlatform, 'alice', 'verification', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: newly indexed doc is searchable');
+		same('Empty path insert', $restorePlatform->getDocument('s3dump', 'S3DUMP_EMPTY_SP')->getTitle(), 'S3 empty search_path: getDocument() round-trips');
+	} finally {
+		$restorePlatform = null;
+		$restoreSearch = null;
+		$restoreIndex = null;
+		$restoreDetector = null;
+		$restoreVocab = null;
+		$restoreConfig = null;
+		$restoreSchema = null;
+		$restoreConn = null;
+		$restorePdo = null;
+		$conn->executeStatement("DROP DATABASE IF EXISTS $qRestoreDb WITH (FORCE)");
+		if (is_file($dumpFile)) {
+			@unlink($dumpFile);
+		}
+		$platform->resetIndex('s3dump');
+		$config->setConfig(['language' => 'turkish']);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";
