@@ -125,8 +125,16 @@ class ConfigService {
 
 		if (array_key_exists(self::PDFTOTEXT_PATH, $config)) {
 			$path = trim((string)$config[self::PDFTOTEXT_PATH]);
-			if ($path !== '' && !is_executable($path)) {
-				throw new InvalidArgumentException('pdftotext_path is not an executable file: ' . $path);
+			if ($path !== '') {
+				if (basename($path) !== 'pdftotext') {
+					throw new InvalidArgumentException('pdftotext_path binary must be named pdftotext: ' . $path);
+				}
+				if (!is_file($path) || !is_executable($path)) {
+					throw new InvalidArgumentException('pdftotext_path is not an executable file: ' . $path);
+				}
+				if (!$this->validatePdfToTextVersion($path)) {
+					throw new InvalidArgumentException('pdftotext_path does not output pdftotext version information: ' . $path);
+				}
 			}
 			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::PDFTOTEXT_PATH, $path);
 		}
@@ -204,5 +212,52 @@ class ConfigService {
 	public function getPdfExtractor(): string {
 		$value = $this->appConfig->getValueString(Application::APP_ID, self::PDF_EXTRACTOR, self::DEFAULTS[self::PDF_EXTRACTOR]);
 		return in_array($value, self::PDF_EXTRACTORS, true) ? $value : self::DEFAULTS[self::PDF_EXTRACTOR];
+	}
+
+	/**
+	 * Run `<path> -v` and check that the output contains "pdftotext" (case-insensitive).
+	 */
+	private function validatePdfToTextVersion(string $path): bool {
+		$pipes = [];
+		$process = @proc_open(
+			[$path, '-v'],
+			[1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+			$pipes
+		);
+		if (!is_resource($process)) {
+			$output = [];
+			@exec(escapeshellarg($path) . ' -v 2>&1', $output);
+			$combined = implode("\n", $output);
+			return stripos($combined, 'pdftotext') !== false;
+		}
+
+		stream_set_blocking($pipes[1], false);
+		stream_set_blocking($pipes[2], false);
+		$stdout = '';
+		$stderr = '';
+		$deadline = time() + 2;
+		while ((!feof($pipes[1]) || !feof($pipes[2])) && time() < $deadline) {
+			$chunk1 = fread($pipes[1], 4096);
+			if ($chunk1 !== false && $chunk1 !== '') {
+				$stdout .= $chunk1;
+			}
+			$chunk2 = fread($pipes[2], 4096);
+			if ($chunk2 !== false && $chunk2 !== '') {
+				$stderr .= $chunk2;
+			}
+			if (feof($pipes[1]) && feof($pipes[2])) {
+				break;
+			}
+			usleep(10000);
+		}
+		if (time() >= $deadline) {
+			@proc_terminate($process);
+		}
+		@fclose($pipes[1]);
+		@fclose($pipes[2]);
+		@proc_close($process);
+
+		$combined = $stdout . "\n" . $stderr;
+		return stripos($combined, 'pdftotext') !== false;
 	}
 }

@@ -471,7 +471,9 @@ class ContentExtractor {
 	private function findPdfToText(): ?string {
 		$configured = $this->configService->getPdfToTextPath();
 		if ($configured !== '') {
-			return is_executable($configured) ? $configured : null;
+			return (basename($configured) === 'pdftotext' && is_file($configured) && is_executable($configured))
+				? $configured
+				: null;
 		}
 		return $this->findBinary('pdftotext');
 	}
@@ -487,7 +489,7 @@ class ContentExtractor {
 		);
 		foreach (array_unique(array_filter($dirs)) as $dir) {
 			$candidate = rtrim($dir, '/') . '/' . $name;
-			if (@is_executable($candidate)) {
+			if (@is_file($candidate) && @is_executable($candidate)) {
 				return $candidate;
 			}
 		}

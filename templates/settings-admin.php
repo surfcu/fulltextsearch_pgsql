@@ -84,12 +84,6 @@ foreach ($_['pdfExtractors'] as $extractor): ?>
 			<?php p($l->t('pdftotext (poppler-utils) is faster and copes with more files. The built-in parser needs nothing installed, but uses more memory and skips files over 64 MB.')); ?>
 		</p>
 		<p class="ftspg-field">
-			<label for="ftspg-pdftotext-path"><?php p($l->t('Path to pdftotext')); ?></label>
-			<input type="text" id="ftspg-pdftotext-path" name="pdftotext_path" spellcheck="false" autocomplete="off"
-				placeholder="<?php p($l->t('Found on PATH')); ?>"
-				value="<?php p((string)$config['pdftotext_path']); ?>">
-		</p>
-		<p class="ftspg-field">
 			<label for="ftspg-max-content-size"><?php p($l->t('Text kept per document (bytes)')); ?></label>
 			<input type="number" id="ftspg-max-content-size" name="max_content_size" min="0" max="1000000" required
 				value="<?php p((string)$config['max_content_size']); ?>">

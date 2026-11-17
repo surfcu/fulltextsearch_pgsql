@@ -14,6 +14,7 @@ namespace OCA\FullTextSearch_PgSql\Tests;
 
 use OC\FullTextSearch\Model\DocumentAccess;
 use OC\FullTextSearch\Model\IndexDocument;
+use OCA\FullTextSearch_PgSql\Controller\SettingsController;
 use OCA\FullTextSearch_PgSql\Migration\CreateIndexTable;
 use OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform;
 use OCA\FullTextSearch_PgSql\Service\ConfigService;
@@ -22,14 +23,17 @@ use OCA\FullTextSearch_PgSql\Service\IndexService;
 use OCA\FullTextSearch_PgSql\Service\LanguageDetector;
 use OCA\FullTextSearch_PgSql\Service\SchemaService;
 use OCA\FullTextSearch_PgSql\Service\SearchService;
+use OCA\FullTextSearch_PgSql\Service\StatusService;
 use OCA\FullTextSearch_PgSql\Service\TsQueryBuilder;
 use OCA\FullTextSearch_PgSql\Service\VocabularyService;
+use OCP\AppFramework\Http;
 use OCP\FullTextSearch\IFullTextSearchProvider;
 use OCP\FullTextSearch\Model\IIndex;
 use OCP\FullTextSearch\Model\IIndexDocument;
 use OCP\FullTextSearch\Model\IRunner;
 use OCP\FullTextSearch\Model\ISearchRequest;
 use OCP\FullTextSearch\Model\ISearchResult;
+use OCP\IRequest;
 use PDO;
 use Throwable;
 use ZipArchive;
@@ -808,8 +812,10 @@ try {
 	same('warning', $runnerLog['P2b'][0] ?? null, 'damaged xref: indexed with a warning');
 
 	// A pdftotext that is installed but fails: auto falls back to the parser and says why.
-	$brokenTool = tempnam(sys_get_temp_dir(), 'ftspg-pdftotext');
-	file_put_contents($brokenTool, "#!/bin/sh\nexit 3\n");
+	$testToolDir = sys_get_temp_dir() . '/ftspg_tool_' . mt_rand();
+	mkdir($testToolDir);
+	$brokenTool = $testToolDir . '/pdftotext';
+	file_put_contents($brokenTool, "#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.0\"; exit 0; fi\nexit 3\n");
 	chmod($brokenTool, 0755);
 	$config->setConfig(['pdf_extractor' => 'auto', 'pdftotext_path' => $brokenTool]);
 	$runnerLog = [];
@@ -828,6 +834,7 @@ try {
 	$platform->indexDocument(doc('P5', 'alice', 'missing.pdf', $b64($makePdf('Okapi')), ['encoded' => IIndexDocument::ENCODED_BASE64]));
 	check(str_contains($runnerLog['P5'][1] ?? '', 'pdftotext is selected but not found'), 'pdf_extractor=pdftotext without pdftotext: warning says so');
 	unlink($brokenTool);
+	rmdir($testToolDir);
 
 	$config->setConfig(['pdf_extractor' => 'auto', 'pdftotext_path' => '']);
 	same($hasPdfToText ? 'pdftotext' : 'pdfparser', $extractor->pdfTool(), 'auto: pdftotext preferred when installed');
@@ -890,6 +897,301 @@ try {
 	same('warning', $runnerLog['S2'][0] ?? '', 'tsvector over 1 MB: falls back with a warning');
 	same(['S2'], search($platform, 'alice', 'vocabulary')['ids'], 'oversized document still findable by title');
 	$config->setConfig(['max_content_size' => 512000]);
+
+	section('safe upsert retry and size caps (B1)');
+
+	// -------------------------------------------------------------------------
+	// 1. Statement timeout / non-54000 exception preserves existing content
+	// -------------------------------------------------------------------------
+	$docTimeout = doc('B1_TIMEOUT', 'alice', 'Original Durable Title', 'Original durable content that must never be wiped');
+	$platform->indexDocument($docTimeout);
+	$storedOriginal = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B1_TIMEOUT'")->fetchOne();
+	same('Original durable content that must never be wiped', $storedOriginal, 'B1: document initialized with durable content');
+
+	// Create an IDBConnection proxy that intercepts upsert and simulates SQLSTATE 57014 (statement timeout)
+	$timeoutProxy = new class($conn) implements \OCP\IDBConnection {
+		public bool $simulateTimeout = false;
+		public function __construct(
+			private \OCP\IDBConnection $inner,
+		) {
+		}
+		public function executeStatement($sql, array $params = [], array $types = []): int {
+			if ($this->simulateTimeout && str_starts_with(trim($sql), 'INSERT INTO')) {
+				$e = new \PDOException('canceling statement due to statement timeout', 57014);
+				$e->errorInfo = ['57014', 57014, 'canceling statement due to statement timeout'];
+				throw $e;
+			}
+			return $this->inner->executeStatement($sql, $params, $types);
+		}
+		public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+			return $this->inner->executeQuery($sql, $params, $types);
+		}
+		public function inTransaction(): bool {
+			return $this->inner->inTransaction();
+		}
+		public function beginTransaction(): void {
+			$this->inner->beginTransaction();
+		}
+		public function commit(): void {
+			$this->inner->commit();
+		}
+		public function rollBack(): void {
+			$this->inner->rollBack();
+		}
+		public function getDatabaseProvider(): string {
+			return $this->inner->getDatabaseProvider();
+		}
+	};
+
+	$timeoutIndexService = new IndexService($timeoutProxy, $schema, $config, $extractor, $vocabulary, $logger, $detector);
+	$timeoutPlatform = new PostgreSQLPlatform($config, $schema, $timeoutIndexService, $searchService, $logger, $extractor);
+	$timeoutPlatform->setRunner(double(IRunner::class, [
+		'newIndexResult' => function (IIndex $index, string $message, string $status, int $type) use (&$runnerLog) {
+			$runnerLog[$index->getDocumentId()] = [$status, $message];
+		},
+		'newIndexError' => function (IIndex $index, string $message) use (&$runnerLog) {
+			$runnerLog[$index->getDocumentId()] = ['error', $message];
+		},
+		'updateAction' => '',
+	]));
+
+	// Re-indexing attempt with active timeout simulation
+	$timeoutProxy->simulateTimeout = true;
+	$reindexDoc = doc('B1_TIMEOUT', 'alice', 'Updated Title', 'Replacement content that aborted');
+	$indexResult = $timeoutPlatform->indexDocument($reindexDoc);
+
+	same(true, $indexResult->isStatus(IIndex::INDEX_FAILED), 'B1: statement timeout marks index status as INDEX_FAILED');
+	same('fail', $runnerLog['B1_TIMEOUT'][0] ?? '', 'B1: runner log reports fail status on statement timeout');
+	$storedAfterTimeout = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B1_TIMEOUT'")->fetchOne();
+	same('Original durable content that must never be wiped', $storedAfterTimeout, 'B1: statement timeout leaves original content intact in database');
+
+	// Verify direct rethrow on IndexService::indexDocument
+	try {
+		$timeoutIndexService->indexDocument($reindexDoc);
+		check(false, 'B1: IndexService directly rethrows non-54000 exception');
+	} catch (Throwable $e) {
+		check(str_contains($e->getMessage(), 'statement timeout'), 'B1: non-54000 exception is rethrown');
+	}
+	$timeoutProxy->simulateTimeout = false;
+
+	// -------------------------------------------------------------------------
+	// 2. Stepwise degradation: content cut to half (Step 1)
+	// -------------------------------------------------------------------------
+	$config->setConfig(['max_content_size' => 1000000]);
+	mt_srand(101);
+	$halfWords = [];
+	for ($i = 0; $i < 90000; $i++) {
+		$halfWords[] = 'w' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$firstHalfMarker = $halfWords[0];
+	$secondHalfMarker = $halfWords[89999];
+	$runnerLog = [];
+	$docHalf = doc('B1_HALF', 'alice', 'Half Degradation Title', implode(' ', $halfWords));
+	$platform->indexDocument($docHalf);
+
+	same('warning', $runnerLog['B1_HALF'][0] ?? '', 'B1: oversized content degrades with warning');
+	check(str_contains($runnerLog['B1_HALF'][1] ?? '', 'half'), 'B1: warning indicates content cut to half');
+	$storedHalfLen = (int)$conn->executeQuery("SELECT octet_length(content) FROM ftspg_oc_index WHERE document_id = 'B1_HALF'")->fetchOne();
+	check($storedHalfLen > 350000 && $storedHalfLen < 550000, "B1: content cut to half (length $storedHalfLen)");
+	same(['B1_HALF'], search($platform, 'alice', $firstHalfMarker)['ids'], 'B1: first half content is searchable');
+	same([], search($platform, 'alice', $secondHalfMarker)['ids'], 'B1: second half content was cut');
+
+	// -------------------------------------------------------------------------
+	// 3. Three 500 KB parts (pre-flight cap and Step 4 degradation)
+	// -------------------------------------------------------------------------
+	mt_srand(202);
+	$partWords = [];
+	for ($i = 0; $i < 100000; $i++) {
+		$partWords[] = 'p' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$part1 = 'partonehead ' . implode(' ', array_slice($partWords, 0, 33000));
+	$part2 = 'parttwohead ' . implode(' ', array_slice($partWords, 33000, 33000));
+	$part3 = 'partthreehead ' . implode(' ', array_slice($partWords, 66000, 33000));
+
+	$runnerLog = [];
+	$docParts = doc('B1_PARTS', 'alice', 'ThreeUniqueBigPartsTitle', '', [
+		'parts' => [
+			'section1' => $part1,
+			'section2' => $part2,
+			'section3' => $part3,
+		],
+	]);
+	$platform->indexDocument($docParts);
+
+	same('warning', $runnerLog['B1_PARTS'][0] ?? '', 'B1: document with three 500 KB parts indexes with warning');
+	same(['B1_PARTS'], search($platform, 'alice', 'ThreeUniqueBigPartsTitle')['ids'], 'B1: document with large parts is findable by title');
+	same(['B1_PARTS'], search($platform, 'alice', 'partonehead')['ids'], 'B1: document with large parts is findable by initial part term');
+	$storedPartsLen = (int)$conn->executeQuery("SELECT octet_length(parts_text) FROM ftspg_oc_index WHERE document_id = 'B1_PARTS'")->fetchOne();
+	check($storedPartsLen <= 65536, "B1: parts_text capped to 64 KB (length $storedPartsLen)");
+
+	// -------------------------------------------------------------------------
+	// 4. 700 KB title (Step 5 degradation: title cut to 4,000 characters)
+	// -------------------------------------------------------------------------
+	mt_srand(303);
+	$titleWords = [];
+	for ($i = 0; $i < 70000; $i++) {
+		$titleWords[] = 't' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$hugeTitle = 'ImportantTitlePrefix ' . implode(' ', $titleWords);
+
+	$runnerLog = [];
+	$docTitle = doc('B1_TITLE', 'alice', $hugeTitle, 'uniquepayloadbody text');
+	$platform->indexDocument($docTitle);
+
+	same('warning', $runnerLog['B1_TITLE'][0] ?? '', 'B1: 700 KB title indexes with warning');
+	check(str_contains($runnerLog['B1_TITLE'][1] ?? '', 'title') || str_contains($runnerLog['B1_TITLE'][1] ?? '', '4000'), 'B1: warning notes title cut');
+	same(['B1_TITLE'], search($platform, 'alice', 'ImportantTitlePrefix')['ids'], 'B1: document findable by title prefix');
+	same(['B1_TITLE'], search($platform, 'alice', 'uniquepayloadbody')['ids'], 'B1: content of large title document is findable');
+	$storedTitleLen = (int)$conn->executeQuery("SELECT length(title) FROM ftspg_oc_index WHERE document_id = 'B1_TITLE'")->fetchOne();
+	check($storedTitleLen <= 4000, "B1: stored title capped to at most 4000 characters (length $storedTitleLen)");
+
+	// -------------------------------------------------------------------------
+	// 5. NUL byte in info keys and values (avoid SQLSTATE 22P05)
+	// -------------------------------------------------------------------------
+	$runnerLog = [];
+	$docNul = doc('B1_NUL_INFO', 'alice', 'NUL Info Title', 'body text for nul info test', [
+		'links' => ["token\0one", "token\x00two"],
+		'subtags' => ["src\0one" => "tag\0one"],
+	]);
+	$docNul->setInfo("meta\0key", "value\0with\0null");
+	$docNul->setInfoArray('nested', [
+		"sub\0key" => "deep\0value",
+		'number' => 42,
+		'flag' => true,
+	]);
+	$platform->indexDocument($docNul);
+
+	same('ok', $runnerLog['B1_NUL_INFO'][0] ?? '', 'B1: document with NUL in info indexes with ok status');
+	$row = $conn->executeQuery("SELECT info, links, subtags FROM ftspg_oc_index WHERE document_id = 'B1_NUL_INFO'")->fetch(\PDO::FETCH_ASSOC);
+	$rawInfo = (string)$row['info'];
+	check(!str_contains($rawInfo, '\u0000') && !str_contains($rawInfo, "\0"), 'B1: info jsonb has no NUL bytes');
+	$decodedInfo = json_decode($rawInfo, true);
+	same('valuewithnull', $decodedInfo['metakey'] ?? '', 'B1: info keys and string values stripped of NUL bytes');
+	same('deepvalue', $decodedInfo['nested']['subkey'] ?? '', 'B1: nested info keys and string values stripped of NUL bytes');
+	check(str_contains((string)$row['links'], 'tokenone') && str_contains((string)$row['links'], 'tokentwo') && !str_contains((string)$row['links'], "\0"), 'B1: links sanitized of NUL bytes');
+	check(str_contains((string)$row['subtags'], 'tagone') && !str_contains((string)$row['subtags'], "\0"), 'B1: subtags sanitized of NUL bytes');
+	same(['B1_NUL_INFO'], search($platform, 'alice', 'body text')['ids'], 'B1: document with NUL info is searchable');
+
+	// -------------------------------------------------------------------------
+	// 6. Upsert inside caller transaction with SAVEPOINT
+	// -------------------------------------------------------------------------
+	$conn->beginTransaction();
+	same(true, $conn->inTransaction(), 'B1: caller transaction started');
+
+	mt_srand(404);
+	$txWords = [];
+	for ($i = 0; $i < 90000; $i++) {
+		$txWords[] = 'tx' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$docTx = doc('B1_TX_DOC', 'alice', 'Transaction Safety Doc', implode(' ', $txWords));
+	$platform->indexDocument($docTx);
+
+	// Execute an additional statement in the same transaction to prove transaction is healthy (no 25P02)
+	$conn->executeStatement(
+		"INSERT INTO ftspg_oc_index (provider_id, document_id, owner_id, access, config, title, content)
+		 VALUES ('files', 'B1_TX_SIBLING', 'alice', '{u:alice}', 'english', 'Sibling Doc', 'sibling payload content')"
+	);
+
+	// Commit outer transaction
+	$conn->commit();
+	same(false, $conn->inTransaction(), 'B1: caller transaction committed successfully without 25P02 error');
+	same(['B1_TX_DOC'], search($platform, 'alice', 'Transaction Safety Doc')['ids'], 'B1: degraded doc in committed transaction is findable');
+	same(['B1_TX_SIBLING'], search($platform, 'alice', 'sibling payload content')['ids'], 'B1: sibling doc in same transaction is findable');
+
+	// Verify rollback behavior
+	$conn->beginTransaction();
+	$docRollback = doc('B1_TX_ROLLBACK', 'alice', 'Rollback Target Doc', 'content that will be rolled back');
+	$platform->indexDocument($docRollback);
+	$conn->rollBack();
+	same(false, $conn->inTransaction(), 'B1: caller transaction rolled back');
+	same([], search($platform, 'alice', 'Rollback Target Doc')['ids'], 'B1: rolled back document is absent from index');
+
+	$config->setConfig(['max_content_size' => 512000]);
+
+	section('pdftotext_path lockdown & validation (B3)');
+
+	// 1. Directory and non-pdftotext binaries are rejected by ConfigService::setConfig
+	try {
+		$config->setConfig(['pdftotext_path' => __DIR__]);
+		check(false, 'B3: directory rejected as pdftotext_path');
+	} catch (\InvalidArgumentException $e) {
+		check(str_contains($e->getMessage(), 'pdftotext_path'), 'B3: directory rejected as pdftotext_path');
+	}
+
+	$nonPdfBinary = PHP_BINARY ?: '/bin/sh';
+	try {
+		$config->setConfig(['pdftotext_path' => $nonPdfBinary]);
+		check(false, 'B3: binary not named pdftotext rejected by setConfig');
+	} catch (\InvalidArgumentException $e) {
+		check(str_contains($e->getMessage(), 'pdftotext'), 'B3: binary not named pdftotext rejected by setConfig');
+	}
+
+	// 2. An executable named pdftotext that does not print pdftotext on -v is rejected
+	$invalidToolDir = sys_get_temp_dir() . '/ftspg_badtool_' . mt_rand();
+	mkdir($invalidToolDir);
+	$invalidTool = $invalidToolDir . '/pdftotext';
+	file_put_contents($invalidTool, "#!/bin/sh\necho \"different-tool version 1.0\"\nexit 0\n");
+	chmod($invalidTool, 0755);
+	try {
+		$config->setConfig(['pdftotext_path' => $invalidTool]);
+		check(false, 'B3: tool without pdftotext in -v output rejected by setConfig');
+	} catch (\InvalidArgumentException $e) {
+		check(str_contains($e->getMessage(), 'pdftotext'), 'B3: tool without pdftotext in -v output rejected by setConfig');
+	} finally {
+		@unlink($invalidTool);
+		@rmdir($invalidToolDir);
+	}
+
+	// 3. A valid pdftotext executable that outputs version is accepted via ConfigService::setConfig
+	$validToolDir = sys_get_temp_dir() . '/ftspg_goodtool_' . mt_rand();
+	mkdir($validToolDir);
+	$validTool = $validToolDir . '/pdftotext';
+	file_put_contents($validTool, "#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.02.0\"; exit 0; fi\nexit 0\n");
+	chmod($validTool, 0755);
+	try {
+		$config->setConfig(['pdftotext_path' => $validTool]);
+		same($validTool, $config->getPdfToTextPath(), 'B3: valid pdftotext tool accepted via setConfig');
+	} finally {
+		$config->setConfig(['pdftotext_path' => '']);
+		@unlink($validTool);
+		@rmdir($validToolDir);
+	}
+
+	// 4. SettingsController::save rejects pdftotext_path with HTTP 400
+	$statusService = new StatusService($schema, $vocabulary, $extractor);
+	$settingsController = new SettingsController(
+		'fulltextsearch_pgsql',
+		double(IRequest::class, []),
+		$config,
+		$statusService
+	);
+	$saveResponse = $settingsController->save(['pdftotext_path' => '/usr/bin/pdftotext']);
+	same(Http::STATUS_BAD_REQUEST, $saveResponse->getStatus(), 'B3: SettingsController::save rejects pdftotext_path with HTTP 400');
+	same(
+		'pdftotext_path cannot be configured from the web interface',
+		$saveResponse->getData()['message'] ?? '',
+		'B3: rejection error message is informative'
+	);
+
+	// Also verify that SettingsController::save without pdftotext_path succeeds
+	$okResponse = $settingsController->save(['use_trigram' => true]);
+	same(Http::STATUS_OK, $okResponse->getStatus(), 'B3: SettingsController::save succeeds when pdftotext_path is absent');
+
+	// 5. Bad stored path in appConfig is ignored at use (findPdfToText returns null)
+	// Case 5a: Stored path is a non-pdftotext binary
+	$appConfig->setValueString('fulltextsearch_pgsql', 'pdftotext_path', '/bin/sh');
+	same(null, $extractor->findPdfToTextPath(), 'B3: non-pdftotext stored path ignored at use');
+
+	// Case 5b: Stored path is a directory named pdftotext
+	$dirTool = sys_get_temp_dir() . '/ftspg_dir_' . mt_rand() . '/pdftotext';
+	mkdir($dirTool, 0755, true);
+	$appConfig->setValueString('fulltextsearch_pgsql', 'pdftotext_path', $dirTool);
+	same(null, $extractor->findPdfToTextPath(), 'B3: directory named pdftotext in appConfig ignored at use');
+	rmdir($dirTool);
+	rmdir(dirname($dirTool));
+
+	// Restore clean config
+	$appConfig->setValueString('fulltextsearch_pgsql', 'pdftotext_path', '');
 
 	section('partial updates');
 	$platform->indexDocument(doc('P1', 'alice', 'Shared later', 'secret content about narwhals'));

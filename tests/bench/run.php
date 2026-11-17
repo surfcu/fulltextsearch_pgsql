@@ -181,7 +181,7 @@ if ($forceGenerate || $currentDocs < $targetDocs) {
 	$pdo->exec("DROP INDEX IF EXISTS {$tableName}_title_search_trgm_idx");
 	$pdo->exec("TRUNCATE $tableName, $wordsTableName");
 
-	$pdo->exec("SET synchronous_commit = off");
+	$pdo->exec('SET synchronous_commit = off');
 	$pdo->exec("SET maintenance_work_mem = '256MB'");
 
 	$prng = new XorShift32($seed);
@@ -227,7 +227,7 @@ if ($forceGenerate || $currentDocs < $targetDocs) {
 		$pdo->commit();
 
 		if (($b + 1) % 10 === 0 || $b === $batches - 1) {
-			echo "  Indexed " . min($docId - 1, $targetDocs) . " / $targetDocs documents\n";
+			echo '  Indexed ' . min($docId - 1, $targetDocs) . " / $targetDocs documents\n";
 		}
 	}
 
@@ -241,7 +241,7 @@ if ($forceGenerate || $currentDocs < $targetDocs) {
 	// Populate words table
 	$wordChunks = array_chunk($vocab, 1000);
 	foreach ($wordChunks as $chunk) {
-		$wValues = implode(', ', array_map(fn($w) => "('$w')", $chunk));
+		$wValues = implode(', ', array_map(fn ($w) => "('$w')", $chunk));
 		$pdo->exec("INSERT INTO $wordsTableName (word) VALUES $wValues ON CONFLICT DO NOTHING");
 	}
 
@@ -355,7 +355,7 @@ foreach ($scenarios as $sc) {
 		'median_ms' => round($median, 2),
 		'min_ms' => round($min, 2),
 		'max_ms' => round($max, 2),
-		'runs_ms' => array_map(fn($t) => round($t, 2), $times),
+		'runs_ms' => array_map(fn ($t) => round($t, 2), $times),
 	];
 }
 
