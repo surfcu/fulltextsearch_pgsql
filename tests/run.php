@@ -1604,7 +1604,7 @@ try {
 	same('Z1', search($platform, 'alice', 'the report zanzibar', ['provider' => 'idf'])['ids'][0] ?? null, 'a stopword among the terms gets no weight');
 	same('Z1', search($platform, 'alice', 'report zanzibar qqxyzzy', ['provider' => 'idf'])['ids'][0] ?? null, 'a word no document contains gets no weight');
 	same('Z1', search($platform, 'alice', 'report "booked to zanzibar"', ['provider' => 'idf'])['ids'][0] ?? null, 'phrases are weighted like words');
-	same('Z1', search($platform, 'alice', 'report zanzibr', ['provider' => 'idf'])['ids'][0] ?? null, 'typo corrections count towards the term they correct');
+	same('Z1', search($platform, 'alice', 'report zanzibr', ['provider' => 'idf', 'size' => 50])['ids'][0] ?? null, 'typo corrections count towards the term they correct');
 	$many = search($platform, 'alice', 'report zanzibar a1 b2 c3 d4 e5 f6 g7', ['provider' => 'idf']);
 	same(31, $many['total'], 'more than 8 terms falls back to one combined rank');
 	$platform->resetIndex('idf');
@@ -1711,6 +1711,168 @@ try {
 	same([], $ids('recieve'), 'typo_correction=false turns it off');
 	same(['V3'], $ids('calisma'), 'accent variants off too');
 	$config->setConfig(['typo_correction' => true]);
+
+	section('viewer-scoped typo correction (A3)');
+	$a3 = ['provider' => 'a3'];
+	$a3Qb = new TsQueryBuilder();
+	[$emptyTsSql, $emptyTsParams] = $a3Qb->wordTsQuery('', 'english');
+	same(0, (int)$conn->executeQuery("SELECT numnode($emptyTsSql)", $emptyTsParams)->fetchOne(), 'A3: wordTsQuery empty string has numnode 0');
+	[$punctTsSql, $punctTsParams] = $a3Qb->wordTsQuery('---', 'english');
+	same(0, (int)$conn->executeQuery("SELECT numnode($punctTsSql)", $punctTsParams)->fetchOne(), 'A3: wordTsQuery punctuation-only has numnode 0');
+	[$trTsSql, $trTsParams] = $a3Qb->wordTsQuery('İZMİR', 'turkish');
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['turkish', "'iZMiR':*"]], [$trTsSql, $trTsParams], 'A3: wordTsQuery maps Turkish İ -> i');
+	same("'izmir':*", (string)$conn->executeQuery("SELECT ($trTsSql)::text", $trTsParams)->fetchOne(), 'A3: wordTsQuery Turkish İ compiles cleanly in PostgreSQL');
+	[$trDotlessSql, $trDotlessParams] = $a3Qb->wordTsQuery('ISIK', 'turkish');
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['turkish', "'ıSıK':*"]], [$trDotlessSql, $trDotlessParams], 'A3: wordTsQuery maps Turkish I -> ı');
+	same("'ısık':*", (string)$conn->executeQuery("SELECT ($trDotlessSql)::text", $trDotlessParams)->fetchOne(), 'A3: wordTsQuery Turkish I compiles cleanly in PostgreSQL');
+	[$wTsSql, $wTsParams] = $a3Qb->wordTsQuery('budget', 'english', 'A');
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['english', "'budget':*A"]], [$wTsSql, $wTsParams], 'A3: wordTsQuery applies optional weight labels');
+	[$simpleExactSql, $simpleExactParams] = $a3Qb->wordTsQuery('receive', 'simple', null, false);
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['simple', "'receive'"]], [$simpleExactSql, $simpleExactParams], 'A3: wordTsQuery simple exact omits prefix wildcard');
+	[$simplePrefixSql, $simplePrefixParams] = $a3Qb->wordTsQuery('receive', 'simple', null, true);
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['simple', "'receive':*"]], [$simplePrefixSql, $simplePrefixParams], 'A3: wordTsQuery simple prefix keeps :*');
+
+	$platform->indexDocument(doc('A3_B_RECV', 'bob', 'Parcel', 'We will receive the parcel tomorrow.', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_ACC', 'bob', 'Rapor', 'Yeni çözümleme raporu hazırlandı.', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_SPELL_ALPHA', 'bob', 'Protocol', 'Secret kryptonw protocol.', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_SPELL_DIST', 'bob', 'Blueprint', 'Secret zephyrkl blueprint.', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_STOP_DECOYS', 'bob', 'Decoys', 'wish chat form hate budget', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_STOP_REAL', 'bob', 'Real', 'Notes with details that came from friends who have budget.', [], 'a3'));
+
+	// 1. Word-existence invariance: Alice privately indexing receivex/zeppeliny must not alter Bob's results.
+	$a3BeforeRecv = search($platform, 'bob', 'receivex', $a3);
+	$a3BeforeAbsent = search($platform, 'bob', 'zeppeliny', $a3);
+	same(['A3_B_RECV'], $a3BeforeRecv['ids'], 'A3: Bob finds receive via receivex before Alice indexes receivex');
+	same([], $a3BeforeAbsent['ids'], 'A3: Bob gets no results for zeppeliny before Alice indexes zeppeliny');
+
+	$platform->indexDocument(doc('A3_A_RECVX', 'alice', 'Private', 'Private receivex draft and zeppeliny memo.', [], 'a3'));
+	$a3AfterRecv = search($platform, 'bob', 'receivex', $a3);
+	$a3AfterAbsent = search($platform, 'bob', 'zeppeliny', $a3);
+	same($a3BeforeRecv['ids'], $a3AfterRecv['ids'], 'A3: word-existence invariance keeps Bob results for receivex identical');
+	same($a3BeforeRecv['total'], $a3AfterRecv['total'], 'A3: word-existence invariance keeps Bob total for receivex identical');
+	same($a3BeforeAbsent['ids'], $a3AfterAbsent['ids'], 'A3: word-existence invariance keeps Bob absent-word results identical');
+
+	// 2. Crowding-out invariance (accent): 3+ and >12 shorter private variants must not displace Bob's variant.
+	$platform->indexDocument(doc('A3_A_ACC3', 'alice', 'Accents 3', 'çözüma çözüme çözümü', [], 'a3'));
+	same(['A3_B_ACC'], search($platform, 'bob', 'cozum', $a3)['ids'], 'A3: 3 shorter private accent variants do not crowd out Bob çözümleme');
+	$platform->indexDocument(doc('A3_A_ACC15', 'alice', 'Accents 15', 'çözümb çözümc çözümd çözümf çözümg çözümh çözümi çözümj çözümüş çözümüşleri çözümk çözümm çözümn çözümo', [], 'a3'));
+	same(['A3_B_ACC'], search($platform, 'bob', 'cozum', $a3)['ids'], 'A3: >12 shorter private accent variants do not crowd out Bob çözümleme');
+
+	// 3. Crowding-out invariance (spelling): alphabetical & closer/20+ private variants must not displace Bob's correction.
+	$platform->indexDocument(doc('A3_A_SPELL_ALPHA', 'alice', 'Alpha', 'kryptona kryptonb', [], 'a3'));
+	same(['A3_B_SPELL_ALPHA'], search($platform, 'bob', 'kryptonx', $a3)['ids'], 'A3: alphabetically earlier private variants do not crowd out Bob kryptonw');
+	$platform->indexDocument(doc('A3_A_SPELL_DIST2', 'alice', 'Dist 2', 'zephyrb zephyrc', [], 'a3'));
+	same(['A3_B_SPELL_DIST'], search($platform, 'bob', 'zephyrx', $a3)['ids'], 'A3: closer 1-edit private variants do not crowd out Bob 2-edit zephyrkl');
+	$zephyrMore = [];
+	foreach (range('a', 'z') as $ch) {
+		if (!in_array($ch, ['b', 'c', 'e', 'k', 's', 'x'], true)) {
+			$zephyrMore[] = 'zephyr' . $ch;
+		}
+	}
+	$platform->indexDocument(doc('A3_A_SPELL_DIST25', 'alice', 'Dist 25', implode(' ', $zephyrMore), [], 'a3'));
+	same(['A3_B_SPELL_DIST'], search($platform, 'bob', 'zephyrx', $a3)['ids'], 'A3: >20 closer 1-edit private variants do not crowd out Bob 2-edit zephyrkl');
+
+	// 4. 4+ letter stopwords must not trigger bogus spelling corrections in english or turkish,english.
+	foreach (['with', 'that', 'from', 'have'] as $stopword) {
+		same([], search($platform, 'bob', $stopword, $a3)['ids'], "A3: stopword '$stopword' does not trigger spelling correction in english");
+	}
+	$config->setConfig(['language' => 'turkish']);
+	$platform->indexDocument(doc('A3_B_STOP_TR', 'bob', 'TR Decoys', 'wish chat form hate', [], 'a3'));
+	$config->setConfig(['language' => 'turkish,english']);
+	foreach (['with', 'that', 'from', 'have'] as $stopword) {
+		same([], search($platform, 'bob', $stopword, $a3)['ids'], "A3: stopword '$stopword' does not trigger spelling correction in turkish,english");
+	}
+	$config->setConfig(['language' => 'english']);
+
+	// 5. Contingent < size gating: spelling waits for < size uncorrected hits; accent variants stay unconditional.
+	$platform->indexDocument(doc('A3_G_1', 'bob', 'Gate 1', 'gatekeeper alpha', [], 'a3'));
+	$platform->indexDocument(doc('A3_G_2', 'bob', 'Gate 2', 'gatekeeper beta', [], 'a3'));
+	$gatePageFull = search($platform, 'bob', 'gatekeeper kryptonx', $a3 + ['size' => 2]);
+	same(2, $gatePageFull['total'], 'A3: spelling correction skipped when uncorrected first page reaches size');
+	$gatePagePartial = search($platform, 'bob', 'gatekeeper kryptonx', $a3 + ['size' => 5]);
+	same(3, $gatePagePartial['total'], 'A3: spelling correction runs when uncorrected first page has < size hits');
+	$gateAccentFull = search($platform, 'bob', 'gatekeeper cozum', $a3 + ['size' => 2]);
+	same(3, $gateAccentFull['total'], 'A3: accent variants remain active even when uncorrected hits reach size');
+	$platform->resetIndex('a3');
+
+	// 6. Stemmed-candidate, prefix-candidate, and typed-word prefix oracles must remain invariant.
+	$savedOracleWords = $conn->executeQuery("SELECT word FROM ftspg_oc_words WHERE word LIKE 'receiv%' OR word LIKE 'zephyr%'")->fetchAll(PDO::FETCH_COLUMN);
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word LIKE 'receiv%' OR word LIKE 'zephyr%'");
+	$platform->indexDocument(doc('A3_B_RECVING', 'bob', 'Shipments', 'We are receiving shipments today.', [], 'a3'));
+	same([], search($platform, 'bob', 'receivex', $a3)['ids'], 'A3: Bob gets no match for receivex on receiving before Alice indexes receive');
+	$platform->indexDocument(doc('A3_A_RECV_SECRET', 'alice', 'Secret', 'We will receive the secret merger.', [], 'a3'));
+	same([], search($platform, 'bob', 'receivex', $a3)['ids'], 'A3: stemmed-candidate oracle does not leak Alice receive via Bob receiving');
+
+	$platform->indexDocument(doc('A3_B_ZKL', 'bob', 'Bait', 'zephyrklmno', [], 'a3'));
+	same([], search($platform, 'bob', 'zephyrx', $a3)['ids'], 'A3: Bob gets no match for zephyrx on zephyrklmno before Alice indexes zephyre');
+	$platform->indexDocument(doc('A3_A_ZEPHYRE', 'alice', 'Secret Z', 'zephyre', [], 'a3'));
+	same([], search($platform, 'bob', 'zephyrx', $a3)['ids'], 'A3: prefix-candidate oracle does not leak Alice zephyre via Bob zephyrklmno');
+
+	$platform->resetIndex('a3');
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word LIKE 'receiv%'");
+	$platform->indexDocument(doc('A3_B_RECVING2', 'bob', 'Shipments', 'We are receiving shipments', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_DECEIVE', 'bob', 'Clients', 'Do not deceive clients', [], 'a3'));
+	$beforeTyped = search($platform, 'bob', 'receive', $a3);
+	check(in_array('A3_B_DECEIVE', $beforeTyped['ids'], true), 'A3: typed-word prefix baseline includes deceive correction before Alice indexes receivexyz');
+	$platform->indexDocument(doc('A3_A_RECVXYZ', 'alice', 'Secret R', 'receivexyz', [], 'a3'));
+	$afterTyped = search($platform, 'bob', 'receive', $a3);
+	same($beforeTyped['ids'], $afterTyped['ids'], 'A3: typed-word prefix oracle keeps Bob ids for receive identical');
+	same($beforeTyped['total'], $afterTyped['total'], 'A3: typed-word prefix oracle keeps Bob total for receive identical');
+	$platform->resetIndex('a3');
+	// 7. limitFields stem isolation, Turkish I/İ surface verification, and 32+ duplicate tokens.
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word LIKE 'receiv%'");
+	$platform->indexDocument(doc('A3_B_LIM', 'bob', 'Receive in title', 'We are receiving shipments.', [], 'a3'));
+	$platform->indexDocument(doc('A3_A_LIM', 'alice', 'Private', 'We will receive secret.', [], 'a3'));
+	same([], search($platform, 'bob', 'receivex', $a3 + ['limit' => ['content']])['ids'], 'A3: limitFields=[content] does not leak Alice content receive via Bob content receiving or title receive');
+	same(['A3_B_LIM'], search($platform, 'bob', 'receivex', $a3 + ['limit' => ['title']])['ids'], 'A3: limitFields=[title] still finds Bob own title receive');
+
+	$platform->resetIndex('a3');
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word IN ('ısık', 'isik', 'ısıklar')");
+	$config->setConfig(['language' => 'turkish']);
+	$platform->indexDocument(doc('A3_TR_B_ISIKLAR', 'bob', 'Rapor', 'ISIKLAR YANDI', [], 'a3'));
+	same([], search($platform, 'bob', 'ISIKX', $a3)['ids'], 'A3: Turkish ISIKX does not match ISIKLAR before Alice indexes ISIK');
+	$platform->indexDocument(doc('A3_TR_A_ISIK', 'alice', 'Gizli', 'ISIK', [], 'a3'));
+	same([], search($platform, 'bob', 'ISIKX', $a3)['ids'], 'A3: Turkish surface verification prevents Alice ISIK leak via Bob ISIKLAR');
+	$platform->indexDocument(doc('A3_TR_B_ISIK', 'bob', 'Acik', 'ISIK', [], 'a3'));
+	same(['A3_TR_B_ISIK', 'A3_TR_B_ISIKLAR'], sorted(search($platform, 'bob', 'ISIKX', $a3)['ids']), 'A3: Turkish ISIKX finds Bob own uppercase ISIK via surface I->ı');
+	$config->setConfig(['language' => 'english']);
+
+	same([], search($platform, 'bob', str_repeat('qqmissing ', 32) . 'kryptonx', $a3)['ids'], 'A3: 32+ duplicate missing tokens execute cleanly');
+	$platform->resetIndex('a3');
+
+	// 8. Non-alpha 'simple' tokens (host, file, email, numword, >40 chars) must not leak via typed-word prefix probe.
+	$nonAlphaCases = [
+		'host content' => ['content' => 'See receive.pdf here.', 'limit' => []],
+		'host tags' => ['tags' => ['receive.pdf'], 'limit' => ['tags']],
+		'host parts' => ['parts' => ['comments' => 'See receive.pdf'], 'limit' => ['parts']],
+		'file content' => ['content' => 'Open receive/draft today.', 'limit' => ['content']],
+		'numword content' => ['content' => 'Ticket receive123 closed.', 'limit' => ['content']],
+		'email content' => ['content' => 'Mail receive@example.com now.', 'limit' => ['content']],
+		'>40-char content' => ['content' => 'Long receivereceivereceivereceivereceivereceive token.', 'limit' => ['content']],
+	];
+	foreach ($nonAlphaCases as $label => $case) {
+		$platform->resetIndex('a3');
+		$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word LIKE 'receiv%'");
+		$platform->indexDocument(doc('A3_B_COMP', 'bob', 'Neutral Doc', $case['content'] ?? 'Neutral body', [
+			'tags' => $case['tags'] ?? [],
+			'parts' => $case['parts'] ?? [],
+		], 'a3'));
+		$platform->indexDocument(doc('A3_B_DEC', 'bob', 'Clients', 'Do not deceive clients', [
+			'tags' => ['deceive'],
+			'parts' => ['comments' => 'Do not deceive clients'],
+		], 'a3'));
+		$opts = $a3 + ($case['limit'] !== [] ? ['limit' => $case['limit']] : []);
+		$before2b = search($platform, 'bob', 'receive', $opts);
+		check(in_array('A3_B_DEC', $before2b['ids'], true), "A3: 2b ($label) baseline includes deceive before Alice");
+		$platform->indexDocument(doc('A3_A_RECVXYZ_2B', 'alice', 'Private', 'receivexyz', [], 'a3'));
+		$after2b = search($platform, 'bob', 'receive', $opts);
+		same($before2b['ids'], $after2b['ids'], "A3: 2b ($label) keeps Bob ids identical");
+		same($before2b['total'], $after2b['total'], "A3: 2b ($label) keeps Bob total identical");
+	}
+	$platform->resetIndex('a3');
+	foreach ($savedOracleWords as $savedWord) {
+		$conn->executeStatement('INSERT INTO ftspg_oc_words (word) VALUES (?) ON CONFLICT (word) DO NOTHING', [(string)$savedWord]);
+	}
 
 	section('vocabulary maintenance');
 	check($vocabulary->count() > 20, 'words collected while indexing (' . $vocabulary->count() . ')');

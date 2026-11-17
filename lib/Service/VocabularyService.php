@@ -18,10 +18,9 @@ use OCP\IDBConnection;
  *    searches "rapor". Trigram similarity shortlists candidates; an edit distance that counts
  *    swapped letters as one edit decides ("recieve" -> "receive").
  *
- * The vocabulary is instance-wide, but alternatives only widen a search that is still
- * filtered by access control, so results never include documents the user cannot see.
- * Words are added as documents are indexed and never removed individually; rebuild()
- * drops words that no longer occur.
+ * The vocabulary is instance-wide, while candidate visibility is probed against the viewer's
+ * filtered documents before dedup, distance selection, or slicing. Words are added as documents
+ * are indexed and never removed individually; rebuild() drops words that no longer occur.
  */
 class VocabularyService {
 
@@ -31,9 +30,10 @@ class VocabularyService {
 	private const MIN_TYPO_LENGTH = 4;
 	private const MAX_VARIANTS = 3;
 	private const MAX_CORRECTIONS = 2;
+	private const ACCENT_LIMIT = 50;
 	/** Loose on purpose: transpositions score low. The edit distance is the real filter. */
 	public const TRIGRAM_THRESHOLD = 0.2;
-	private const SHORTLIST = 20;
+	private const SHORTLIST = 50;
 
 	public function __construct(
 		private IDBConnection $db,
@@ -90,102 +90,203 @@ class VocabularyService {
 	/**
 	 * @param list<string> $words lowercase search words (already Turkish-normalised)
 	 * @param bool $spelling also correct misspellings (needs pg_trgm); accents work without it
+	 * @param callable(list<string>, bool=): list<string> $visible returns the subset visible to the viewer (prefix=false for exact surface candidates, prefix=true for typed words)
+	 * @param (callable(list<string>): list<string>)|null $stopwords returns stopwords to exclude from spelling correction
 	 * @return array<string, list<string>> word => alternative words to OR into the query
 	 */
-	public function alternatives(array $words, bool $spelling): array {
-		$alternatives = [];
+	public function alternatives(array $words, bool $spelling, callable $visible, ?callable $stopwords = null): array {
+		/** @var list<string> $validWords */
+		$validWords = [];
 		foreach (array_unique($words) as $word) {
 			$length = mb_strlen($word);
-			if ($length < self::MIN_LENGTH || $length > self::MAX_LENGTH || !preg_match('/^\p{L}+$/u', $word)) {
-				continue;
-			}
-
-			$found = $this->accentVariants($word);
-			if ($spelling && $length >= self::MIN_TYPO_LENGTH && $found === [] && !$this->isKnownPrefix($word)) {
-				$found = $this->spellingCorrections($word);
-			}
-			if ($found !== []) {
-				$alternatives[$word] = $found;
+			if ($length >= self::MIN_LENGTH && $length <= self::MAX_LENGTH && preg_match('/^\p{L}+$/u', $word) === 1) {
+				$validWords[] = $word;
 			}
 		}
-		return $alternatives;
-	}
+		if ($validWords === []) {
+			return [];
+		}
 
-	/**
-	 * Words that fold to the same letters, or (for 4+ letters) start with them, in either
-	 * direction: "calis" -> "çalış", and "çalışma" -> "calisma" for text typed without
-	 * diacritics. Shortest first, since alternatives are prefix-matched and the shortest
-	 * covers the longer forms. Words starting with what was typed already match and are skipped.
-	 *
-	 * @return list<string>
-	 */
-	private function accentVariants(string $word): array {
-		$folded = Fold::fold($word);
 		$w = $this->schemaService->getWordsTableName();
-		$prefix = mb_strlen($word) >= self::MIN_TYPO_LENGTH;
-		$result = $this->db->executeQuery(
-			"SELECT word FROM $w WHERE " . ($prefix ? 'folded LIKE ?' : 'folded = ?')
-			. ' AND word NOT LIKE ? ORDER BY length(word), word LIMIT ' . (self::MAX_VARIANTS * 4),
-			[$prefix ? $this->likePrefix($folded) : $folded, $this->likePrefix($word)]
-		);
-		$candidates = array_map('strval', $result->fetchAll(\PDO::FETCH_COLUMN));
+		$branches = [];
+		$params = [];
+		foreach ($validWords as $idx => $word) {
+			$folded = Fold::fold($word);
+			$prefix = mb_strlen($word) >= self::MIN_TYPO_LENGTH;
+			$branches[] = "(SELECT $idx AS idx, word FROM $w WHERE "
+				. ($prefix ? 'folded LIKE ?' : 'folded = ?')
+				. ' AND word NOT LIKE ? ORDER BY length(word), word LIMIT ' . self::ACCENT_LIMIT . ')';
+			$params[] = $prefix ? $this->likePrefix($folded) : $folded;
+			$params[] = $this->likePrefix($word);
+
+			if ($spelling && $prefix) {
+				// Skip probing ftspg_oc_index when no vocabulary word starts with this prefix.
+				$branches[] = "(SELECT $idx AS idx, ''::text AS word FROM $w WHERE word LIKE ? LIMIT 1)";
+				$params[] = $this->likePrefix($word);
+			}
+		}
+
+		$result = $this->db->executeQuery(implode(' UNION ALL ', $branches), $params);
+		$phase1Rows = $result->fetchAll(\PDO::FETCH_NUM);
 		$result->closeCursor();
 
-		// Drop variants already covered by a shorter one ("çalış" covers "çalışma").
-		$variants = [];
-		foreach ($candidates as $candidate) {
-			foreach ($variants as $kept) {
-				if (str_starts_with($candidate, $kept)) {
-					continue 2;
+		/** @var array<int, list<string>> $accentCandidates */
+		$accentCandidates = [];
+		/** @var array<int, bool> $hasVocabPrefix */
+		$hasVocabPrefix = [];
+		foreach ($phase1Rows as $row) {
+			$idx = (int)$row[0];
+			$candidate = (string)$row[1];
+			if ($candidate === '') {
+				$hasVocabPrefix[$idx] = true;
+			} else {
+				$accentCandidates[$idx][] = $candidate;
+			}
+		}
+
+		/** @var list<string> $accentProbe */
+		$accentProbe = [];
+		/** @var list<string> $typedProbe */
+		$typedProbe = [];
+		foreach ($validWords as $idx => $word) {
+			if (isset($accentCandidates[$idx])) {
+				usort(
+					$accentCandidates[$idx],
+					static fn (string $a, string $b): int => (mb_strlen($a) <=> mb_strlen($b)) ?: strcmp($a, $b)
+				);
+				array_push($accentProbe, ...$accentCandidates[$idx]);
+			}
+			if ($spelling && mb_strlen($word) >= self::MIN_TYPO_LENGTH && ($hasVocabPrefix[$idx] ?? false)) {
+				$typedProbe[] = $word;
+			}
+		}
+
+		/** @var array<string, true> $accentVisibleMap */
+		$accentVisibleMap = [];
+		if ($accentProbe !== []) {
+			foreach ($visible(array_values(array_unique($accentProbe)), false) as $v) {
+				$accentVisibleMap[$v] = true;
+			}
+		}
+
+		/** @var array<string, true> $typedVisibleMap */
+		$typedVisibleMap = [];
+		if ($typedProbe !== []) {
+			foreach ($visible(array_values(array_unique($typedProbe)), true) as $v) {
+				$typedVisibleMap[$v] = true;
+			}
+		}
+
+		$alternatives = [];
+		/** @var list<string> $needSpelling */
+		$needSpelling = [];
+		foreach ($validWords as $idx => $word) {
+			$variants = [];
+			foreach ($accentCandidates[$idx] ?? [] as $candidate) {
+				if (!isset($accentVisibleMap[$candidate])) {
+					continue;
+				}
+				// Drop variants already covered by a shorter visible one ("çalış" covers "çalışma").
+				foreach ($variants as $kept) {
+					if (str_starts_with($candidate, $kept)) {
+						continue 2;
+					}
+				}
+				$variants[] = $candidate;
+				if (count($variants) >= self::MAX_VARIANTS) {
+					break;
 				}
 			}
-			$variants[] = $candidate;
-			if (count($variants) >= self::MAX_VARIANTS) {
-				break;
+
+			if ($variants !== []) {
+				$alternatives[$word] = $variants;
+			} elseif ($spelling && mb_strlen($word) >= self::MIN_TYPO_LENGTH && !isset($typedVisibleMap[$word])) {
+				$needSpelling[] = $word;
 			}
 		}
-		return $variants;
-	}
 
-	/** Some indexed word starts with this one, so it is a valid (possibly partial) word. */
-	private function isKnownPrefix(string $word): bool {
-		$result = $this->db->executeQuery(
-			'SELECT 1 FROM ' . $this->schemaService->getWordsTableName() . ' WHERE word LIKE ? LIMIT 1',
-			[$this->likePrefix($word)]
-		);
-		$known = $result->fetchOne() !== false;
+		if ($needSpelling !== [] && $stopwords !== null) {
+			$stopMap = array_flip($stopwords($needSpelling));
+			$needSpelling = array_values(array_filter(
+				$needSpelling,
+				static fn (string $word): bool => !isset($stopMap[$word])
+			));
+		}
+
+		if ($needSpelling === []) {
+			return $alternatives;
+		}
+
+		$spellingBranches = [];
+		$spellingParams = [];
+		$foldedInputs = [];
+		$maxDistances = [];
+		foreach ($needSpelling as $idx => $word) {
+			$folded = Fold::fold($word);
+			$length = mb_strlen($folded);
+			$maxDistance = $length >= 7 ? 2 : 1;
+			$foldedInputs[$idx] = $folded;
+			$maxDistances[$idx] = $maxDistance;
+			$spellingBranches[] = "(SELECT $idx AS idx, word, folded, similarity(folded, ?) AS score
+				FROM $w
+				WHERE folded % ? AND length(folded) BETWEEN ? AND ?
+				ORDER BY score DESC, word
+				LIMIT " . self::SHORTLIST . ')';
+			array_push(
+				$spellingParams,
+				$folded,
+				$folded,
+				(string)($length - $maxDistance),
+				(string)($length + $maxDistance)
+			);
+		}
+
+		$result = $this->db->executeQuery(implode(' UNION ALL ', $spellingBranches), $spellingParams);
+		$phase2Rows = $result->fetchAll(\PDO::FETCH_NUM);
 		$result->closeCursor();
-		return $known;
-	}
 
-	/** @return list<string> */
-	private function spellingCorrections(string $word): array {
-		$folded = Fold::fold($word);
-		$w = $this->schemaService->getWordsTableName();
-		$length = mb_strlen($folded);
-		$maxDistance = $length >= 7 ? 2 : 1;
-
-		$result = $this->db->executeQuery(
-			"SELECT word, folded, similarity(folded, ?) AS score FROM $w
-			 WHERE folded % ? AND length(folded) BETWEEN ? AND ?
-			 ORDER BY score DESC, word LIMIT " . self::SHORTLIST,
-			[$folded, $folded, (string)($length - $maxDistance), (string)($length + $maxDistance)]
-		);
-		$rows = $result->fetchAll();
-		$result->closeCursor();
-
-		$scored = [];
-		foreach ($rows as $row) {
-			$distance = self::editDistance($folded, (string)$row['folded']);
-			if ($distance <= $maxDistance) {
-				$scored[] = [$distance, -(float)$row['score'], (string)$row['word']];
+		/** @var array<int, list<array{0: int, 1: float, 2: string}>> $scoredByIdx */
+		$scoredByIdx = [];
+		/** @var list<string> $probePhase2 */
+		$probePhase2 = [];
+		foreach ($phase2Rows as $row) {
+			$idx = (int)$row[0];
+			$candidate = (string)$row[1];
+			$distance = self::editDistance($foldedInputs[$idx], (string)$row[2]);
+			if ($distance <= $maxDistances[$idx]) {
+				$scoredByIdx[$idx][] = [$distance, -(float)$row[3], $candidate];
+				$probePhase2[] = $candidate;
 			}
 		}
-		sort($scored);
-		// Keep only the closest candidates: "invoice" (1 edit) but not also "jniocie" (2).
-		$best = $scored[0][0] ?? null;
-		$closest = array_filter($scored, fn (array $c): bool => $c[0] === $best);
-		return array_slice(array_column($closest, 2), 0, self::MAX_CORRECTIONS);
+
+		if ($probePhase2 === []) {
+			return $alternatives;
+		}
+
+		/** @var array<string, true> $visibleMap2 */
+		$visibleMap2 = [];
+		foreach ($visible(array_values(array_unique($probePhase2)), false) as $v) {
+			$visibleMap2[$v] = true;
+		}
+
+		foreach ($needSpelling as $idx => $word) {
+			$visibleScored = array_values(array_filter(
+				$scoredByIdx[$idx] ?? [],
+				static fn (array $c): bool => isset($visibleMap2[$c[2]])
+			));
+			if ($visibleScored === []) {
+				continue;
+			}
+			usort(
+				$visibleScored,
+				static fn (array $a, array $b): int => ($a[0] <=> $b[0]) ?: ($a[1] <=> $b[1]) ?: strcmp($a[2], $b[2])
+			);
+			$best = $visibleScored[0][0];
+			$closest = array_filter($visibleScored, static fn (array $c): bool => $c[0] === $best);
+			$alternatives[$word] = array_slice(array_column($closest, 2), 0, self::MAX_CORRECTIONS);
+		}
+
+		return $alternatives;
 	}
 
 	/**

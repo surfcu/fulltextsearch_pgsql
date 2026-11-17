@@ -212,52 +212,85 @@ class SearchService {
 		$providerId = $result->getProvider()->getId();
 
 		$viewerTokens = AccessTokens::forViewer($access);
+		$weights = $this->limitWeights($request->getLimitFields());
+		if ($weights === '' || $viewerTokens === []) {
+			// No access tokens, or limited to fields this platform does not index.
+			$result->setTotal(0);
+			return;
+		}
+
 		$languages = $this->configService->getLanguages();
 		$search = $request->getSearch();
-		$weights = $this->limitWeights($request->getLimitFields());
-		if ($weights === '') {
-			// Limited to fields this platform does not index.
-			$result->setTotal(0);
-			return;
+		// Words as each language tokenizes them (Turkish lowercases I to ı), reused for alternatives and excerpts.
+		$words = [];
+		foreach ($languages as $language) {
+			array_push($words, ...$this->queryBuilder->searchWords($search, $language));
 		}
+		$words = array_values(array_unique($words));
+
+		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
 
 		$alternatives = [];
-		if ($this->configService->useTypoCorrection()) {
-			// Words as each language tokenizes them (Turkish lowercases I to ı), looked up once.
-			$words = [];
-			foreach ($languages as $language) {
-				array_push($words, ...$this->queryBuilder->searchWords($search, $language));
-			}
-			$alternatives = $this->vocabulary->alternatives(array_values(array_unique($words)), $this->fuzzyAvailable());
+		$typoOn = $this->configService->useTypoCorrection() && $words !== [];
+		$visible = null;
+		$stopwords = null;
+		if ($typoOn) {
+			[$visible, $stopwords] = $this->vocabularyProbes($languages, $weights, $filterConditions, $filterParams);
+			$alternatives = $this->vocabulary->alternatives($words, false, $visible, $stopwords);
 		}
 
-		/** @var array<string, ParsedQuery> $queries */
-		$queries = [];
-		foreach ($languages as $language) {
-			$query = $this->queryBuilder->build($search, $language, $this->fuzzyAvailable(), $alternatives, $weights);
-			if ($query === null) {
-				break;
-			}
-			$queries[$language] = $query;
-		}
-		if ($viewerTokens === [] || count($queries) !== count($languages)) {
+		$queries = $this->buildQueries($search, $languages, $alternatives, $weights);
+		if ($queries === null) {
 			$result->setTotal(0);
 			return;
 		}
-		/** @var non-empty-array<string, ParsedQuery> $queries one per configured language, at least one */
 		$query = $queries[$languages[0]];
 
 		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
 		$page = max(1, $request->getPage());
-		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
 		$filtersFirst = $this->startFromFilters($queries, $filterConditions, $filterParams);
 		$filterSql = self::renderFilters($filterConditions, !$filtersFirst);
 
-		$excerptWords = [];
-		foreach ($languages as $language) {
-			array_push($excerptWords, ...$this->queryBuilder->searchWords($search, $language));
+		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, ($page - 1) * $size, $words);
+
+		// Gate spelling correction to first-page searches with fewer than $size uncorrected hits.
+		if ($typoOn && $this->fuzzyAvailable() && $visible !== null && $stopwords !== null && $page === 1 && count($rows) < $size) {
+			$pass2Visible = $visible;
+			if ($rows === [] && $query->plainWordsOnly && $alternatives === []) {
+				// Pass 1 already proved none of the words tested in $queries match under the active filters.
+				$tested = [];
+				foreach ($queries as $q) {
+					if ($q->plainText !== '') {
+						foreach (explode(' ', mb_strtolower($q->plainText, 'UTF-8')) as $tw) {
+							$tested[$tw] = true;
+						}
+					}
+				}
+				$knownInvisible = array_intersect_key($tested, array_flip($words));
+				if ($knownInvisible !== []) {
+					$pass2Visible = static function (array $probeWords, bool $prefix = false) use ($visible, $knownInvisible): array {
+						$toProbe = array_values(array_filter(
+							$probeWords,
+							static fn (string $w): bool => !isset($knownInvisible[$w])
+						));
+						return $toProbe === [] ? [] : $visible($toProbe, $prefix);
+					};
+				}
+			}
+			$withSpelling = $this->vocabulary->alternatives($words, true, $pass2Visible, $stopwords);
+			if ($withSpelling !== $alternatives) {
+				$queries = $this->buildQueries($search, $languages, $withSpelling, $weights);
+				if ($queries === null) {
+					$result->setTotal(0);
+					return;
+				}
+				$query = $queries[$languages[0]];
+				$filtersFirst = $this->startFromFilters($queries, $filterConditions, $filterParams);
+				$filterSql = self::renderFilters($filterConditions, !$filtersFirst);
+				$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, 0, $words);
+			}
 		}
-		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, ($page - 1) * $size, array_values(array_unique($excerptWords)));
+
 		$titlesSearched = $weights === null || str_contains($weights, 'A');
 		if ($rows === [] && $page === 1 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '' && $query->plainWordsOnly) {
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
@@ -275,6 +308,188 @@ class SearchService {
 		$result->setMaxScore($maxScore);
 		$result->setTime((int)round((microtime(true) - $start) * 1000.0));
 		$result->setTimedOut(false);
+	}
+
+	/**
+	 * @param non-empty-list<string> $languages
+	 * @param array<string, list<string>> $alternatives
+	 * @return non-empty-array<string, ParsedQuery>|null
+	 */
+	private function buildQueries(string $search, array $languages, array $alternatives, ?string $weights): ?array {
+		/** @var array<string, ParsedQuery> $queries */
+		$queries = [];
+		$substring = $this->fuzzyAvailable();
+		foreach ($languages as $language) {
+			$query = $this->queryBuilder->build($search, $language, $substring, $alternatives, $weights);
+			if ($query === null) {
+				return null;
+			}
+			$queries[$language] = $query;
+		}
+		return $queries === [] ? null : $queries;
+	}
+
+	/**
+	 * Batched EXISTS visibility and stopword probes under the search's active filters.
+	 *
+	 * @param non-empty-list<string> $languages
+	 * @param list<string> $filterConditions
+	 * @param list<string> $filterParams
+	 * @return array{0: callable(list<string>, bool=): list<string>, 1: callable(list<string>): list<string>}
+	 */
+	private function vocabularyProbes(array $languages, ?string $weights, array $filterConditions, array $filterParams): array {
+		$t = $this->schemaService->getTableName();
+		$langConditions = self::languageConditions($languages);
+		// Hide provider_id from the planner so EXISTS uses GIN (tsv/access) instead of scanning every row via doc_uniq.
+		$probeConditions = $filterConditions;
+		if ($probeConditions !== []) {
+			$probeConditions[0] = "({$probeConditions[0]}) IS TRUE";
+		}
+		$probeFilterSql = self::renderFilters($probeConditions, false);
+		$hasA = $weights === null || str_contains($weights, 'A');
+		$hasB = $weights === null || str_contains($weights, 'B');
+		$hasC = $weights === null || str_contains($weights, 'C');
+		$hasD = $weights === null || str_contains($weights, 'D');
+		$titleNorm = $hasA ? $this->schemaService->normalized('d.title') : '';
+		$titleExpr = $hasA ? $titleNorm . " || ' ' || " . $this->schemaService->splitWords($titleNorm) : '';
+		$tagsNorm = $hasB ? $this->schemaService->normalized('d.tags_text') : '';
+		$partsNorm = $hasC ? $this->schemaService->normalized('d.parts_text') : '';
+		$contentNorm = $hasD ? $this->schemaService->normalized('d.content') : '';
+		/** @var array<string, bool> $stopwordCache */
+		$stopwordCache = [];
+
+		$visible = function (array $probeWords, bool $prefix = false) use (
+			$t,
+			$languages,
+			$langConditions,
+			$weights,
+			$probeFilterSql,
+			$filterParams,
+			$hasA,
+			$hasB,
+			$hasC,
+			$hasD,
+			$titleExpr,
+			$tagsNorm,
+			$partsNorm,
+			$contentNorm,
+			&$stopwordCache
+		): array {
+			$unique = array_values(array_unique($probeWords));
+			if ($unique === []) {
+				return [];
+			}
+			$visibleWords = [];
+			foreach (array_chunk($unique, 200) as $chunk) {
+				$selects = [];
+				$params = [];
+				foreach ($chunk as $word) {
+					$branches = [];
+					$branchParams = [];
+					$stopChecks = [];
+					$stopParams = [];
+					foreach ($languages as $langIdx => $language) {
+						[$langCond, $langCondParams] = $langConditions[$langIdx];
+						[$tsSql, $tsParams] = $this->queryBuilder->wordTsQuery($word, $language, $weights);
+						$branches[] = "(numnode($tsSql) > 0 AND $langCond AND d.tsv @@ $tsSql)";
+						array_push($branchParams, ...$tsParams, ...$langCondParams, ...$tsParams);
+						$stopChecks[] = "numnode($tsSql) = 0";
+						array_push($stopParams, ...$tsParams);
+					}
+					$matchSql = count($branches) === 1 ? $branches[0] : '(' . implode(' OR ', $branches) . ')';
+
+					// Verify unstemmed surface occurrence ('simple') across active weighted fields so stemmed/prefix neighbors cannot leak.
+					// When $prefix is true, match only ^[[:alpha:]]{3,40}$ lexemes like VocabularyService::insertSql().
+					$needle = mb_strtolower($word, 'UTF-8');
+					$simpleTsSql = '';
+					$simpleTsParams = [];
+					if (!$prefix) {
+						[$simpleTsSql, $simpleTsParams] = $this->queryBuilder->wordTsQuery($word, 'simple', null, false);
+					}
+					$surfaceMatch = static function (string $expr) use ($prefix, $needle, $simpleTsSql, $simpleTsParams): array {
+						if ($prefix) {
+							return [
+								"EXISTS (SELECT 1 FROM unnest(to_tsvector('simple', $expr)) AS w WHERE w.lexeme ~ '^[[:alpha:]]{3,40}$' AND starts_with(w.lexeme, ?))",
+								[$needle],
+							];
+						}
+						return ["to_tsvector('simple', $expr) @@ $simpleTsSql", $simpleTsParams];
+					};
+					$surfaceBranches = [];
+					$surfaceParams = [];
+					if ($hasA) {
+						[$exprSql, $exprParams] = $surfaceMatch($titleExpr);
+						$surfaceBranches[] = "((d.title <> '') IS TRUE AND $exprSql)";
+						array_push($surfaceParams, ...$exprParams);
+					}
+					if ($hasB) {
+						[$exprSql, $exprParams] = $surfaceMatch($tagsNorm);
+						$surfaceBranches[] = "((d.tags_text <> '') IS TRUE AND $exprSql)";
+						array_push($surfaceParams, ...$exprParams);
+					}
+					if ($hasC) {
+						[$exprSql, $exprParams] = $surfaceMatch($partsNorm);
+						$surfaceBranches[] = "((d.parts_text <> '') IS TRUE AND strpos(lower($partsNorm), ?) > 0 AND $exprSql)";
+						$surfaceParams[] = $needle;
+						array_push($surfaceParams, ...$exprParams);
+					}
+					if ($hasD) {
+						[$exprSql, $exprParams] = $surfaceMatch($contentNorm);
+						$surfaceBranches[] = "((d.content <> '') IS TRUE AND strpos(lower($contentNorm), ?) > 0 AND $exprSql)";
+						$surfaceParams[] = $needle;
+						array_push($surfaceParams, ...$exprParams);
+					}
+					$surfaceSql = $surfaceBranches === [] ? 'FALSE' : (count($surfaceBranches) === 1 ? $surfaceBranches[0] : '(' . implode(' OR ', $surfaceBranches) . ')');
+
+					$selects[] = "EXISTS (SELECT 1 FROM $t d WHERE $matchSql AND $surfaceSql AND $probeFilterSql)";
+					array_push($params, ...$branchParams, ...$surfaceParams, ...$filterParams);
+					$selects[] = '(' . implode(' OR ', $stopChecks) . ')';
+					array_push($params, ...$stopParams);
+				}
+				$result = $this->db->executeQuery('SELECT ' . implode(', ', $selects), $params);
+				$row = $result->fetch(\PDO::FETCH_NUM);
+				$result->closeCursor();
+				if (!is_array($row)) {
+					continue;
+				}
+				foreach ($chunk as $i => $word) {
+					$stopwordCache[$word] = in_array($row[$i * 2 + 1] ?? false, [true, 1, '1', 't'], true);
+					if (in_array($row[$i * 2] ?? false, [true, 1, '1', 't'], true)) {
+						$visibleWords[] = $word;
+					}
+				}
+			}
+			return $visibleWords;
+		};
+
+		$stopwords = function (array $checkWords) use ($languages, $weights, &$stopwordCache): array {
+			$unique = array_values(array_unique($checkWords));
+			$missing = array_values(array_filter($unique, static fn (string $w): bool => !array_key_exists($w, $stopwordCache)));
+			foreach (array_chunk($missing, 200) as $chunk) {
+				$selects = [];
+				$params = [];
+				foreach ($chunk as $word) {
+					$stopChecks = [];
+					foreach ($languages as $language) {
+						[$tsSql, $tsParams] = $this->queryBuilder->wordTsQuery($word, $language, $weights);
+						$stopChecks[] = "numnode($tsSql) = 0";
+						array_push($params, ...$tsParams);
+					}
+					$selects[] = '(' . implode(' OR ', $stopChecks) . ')';
+				}
+				$result = $this->db->executeQuery('SELECT ' . implode(', ', $selects), $params);
+				$row = $result->fetch(\PDO::FETCH_NUM);
+				$result->closeCursor();
+				if (is_array($row)) {
+					foreach ($chunk as $i => $word) {
+						$stopwordCache[$word] = in_array($row[$i] ?? false, [true, 1, '1', 't'], true);
+					}
+				}
+			}
+			return array_values(array_filter($unique, static fn (string $w): bool => $stopwordCache[$w] ?? false));
+		};
+
+		return [$visible, $stopwords];
 	}
 
 	/**

@@ -64,6 +64,22 @@ class TsQueryBuilder {
 	}
 
 	/**
+	 * Parameterised tsquery for one word in a given language, matching build().
+	 *
+	 * @return array{0: string, 1: list<string>}
+	 */
+	public function wordTsQuery(string $word, string $language, ?string $weights = null, bool $prefix = true): array {
+		$word = str_replace("\0", '', mb_scrub($word, 'UTF-8'));
+		if ($language === 'turkish') {
+			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
+			$word = strtr($word, ['I' => 'ı', 'İ' => 'i']);
+		}
+		$word = $this->trimTerm($word);
+		$query = $word === '' ? '' : $this->wordQuery($word, $prefix, [], $weights ?? '');
+		return ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $query]];
+	}
+
+	/**
 	 * @param bool $substring also match words inside titles (title_search LIKE '%word%')
 	 * @param array<string, list<string>> $alternatives lowercase word => words ORed in for it
 	 * @param string|null $weights only match in these fields, as tsvector weight labels ("A", "AD");
