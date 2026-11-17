@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Update documentation (`README.md`, `docs/MIGRATION.md`, `docs/ARCHITECTURE.md`, `docs/RELEASING.md`) with PostgreSQL upgrade instructions prior to 1.6.0, database locale requirements, ignored search-request fields under limitations, viewer-scoped typo correction behavior, and current extraction/ranking capabilities.
+
 ### Fixed
 - Include document parts (such as comments) in search excerpts alongside content without detoasting non-page rows, strip NUL and non-whitespace control characters during query tokenization, roll back search-planning transactions if reading or applying planner settings fails, preserve accurate `total` counts on past-end result pages, and paginate the trigram title-similarity fallback across pages; no re-indexing is needed.
 - Scope vocabulary typo and accent-variant lookups to documents visible to the searching viewer under the active search filters, gating spelling corrections to searches whose uncorrected first page returns fewer than the requested page size; no re-indexing is needed.

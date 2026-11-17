@@ -4,8 +4,8 @@ Switching platforms means rebuilding the index; nothing is copied from Elasticse
 
 ## Before you start
 
-- Nextcloud's own database must be PostgreSQL 12+.
-- Install `poppler-utils` if you want PDF content indexed. Elasticsearch extracted it with its ingest-attachment plugin; this platform uses `pdftotext`.
+- Nextcloud's own database must be PostgreSQL 13+ (with a UTF-8 locale for non-ASCII case folding and accent matching).
+- A bundled pure-PHP parser ([smalot/pdfparser](https://github.com/smalot/pdfparser)) indexes PDFs out of the box up to 64 MB; installing `poppler-utils` (`pdftotext`) is recommended for faster extraction and larger or complex PDFs. Install `catdoc` if you want Office 97–2003 (`.doc`, `.xls`, `.ppt`) content indexed.
 - Expect the index to take roughly 1–2× the size of the extracted text in your database, and plan backups accordingly.
 
 ## Steps
@@ -34,13 +34,13 @@ Searching keeps working on the Elasticsearch index until you switch the platform
 |---|---|---|
 | Query syntax | `word`, `+word`, `-word`, `"phrase"` | Same |
 | Partial words | Depends on analyzer | Words always match as prefixes |
-| Ranking | BM25 | `ts_rank_cd` with title > tags > parts > content weights; all-word matches first |
-| Typos | Fuzzy queries | Trigram similarity on titles, when nothing matches exactly |
-| Languages | Analyzer per index | One PostgreSQL text search configuration per instance |
-| File formats | Anything Apache Tika reads | Text, ODF, OOXML, PDF (via `pdftotext`) |
+| Ranking | BM25 | `ts_rank_cd` with title > tags > parts > content weights, BM25 inverse-document-frequency (rarity) weighting across visible documents on multi-word searches, and all-word matches first |
+| Typos | Fuzzy queries | Viewer-scoped accent variants and vocabulary spelling corrections (`pg_trgm`), plus trigram title similarity when nothing matches |
+| Languages | Analyzer per index | Up to 5 PostgreSQL text search configurations, auto-detected per document |
+| File formats | Anything Apache Tika reads | Text, ODF, OOXML, Office 97–2003 (with `catdoc`), PDF (`pdftotext` or bundled `smalot/pdfparser`) |
 | Scaling | Cluster | Shares your database server |
 
-Legacy binary Office formats (`.doc`, `.xls`, `.ppt`) and OCR are not supported; those files are still found by name, tags and comments.
+Office 97–2003 formats (`.doc`, `.xls`, `.ppt`) require `catdoc`; OCR for scanned images and PDFs is not supported. Files without extractable text are still found by name, tags and comments.
 
 ## Going back
 
