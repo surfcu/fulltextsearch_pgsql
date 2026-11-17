@@ -1404,6 +1404,8 @@ try {
 	$platform->indexDocument(doc('P1', 'alice', 'Shared later', 'new text about dolphins', [], 'files', IIndex::INDEX_CONTENT));
 	same([], search($platform, 'alice', 'narwhals')['ids'], 'content update replaces old content');
 	same(['P1'], search($platform, 'alice', 'dolphins')['ids'], 'content update indexes new content');
+	$platform->indexDocument(doc('P1', 'alice', 'Shared later', '', ['users' => ['carol']], 'files', IIndex::INDEX_OK));
+	same(['P1'], search($platform, 'carol', 'dolphins')['ids'], 'INDEX_OK refresh updates access and keeps stored content');
 
 	section('parts and tags');
 	$platform->indexDocument(doc('G1', 'alice', 'Discussed file', '', ['parts' => ['comments' => 'Please review the flamingo section'], 'tags' => ['urgent']]));

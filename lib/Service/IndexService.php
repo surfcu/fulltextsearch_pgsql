@@ -40,7 +40,8 @@ class IndexService {
 	 */
 	public function indexDocument(IIndexDocument $document): array {
 		$index = $document->getIndex();
-		$updateAll = !$index->isStatus(IIndex::INDEX_META)
+		$updateAll = !$index->isStatus(IIndex::INDEX_OK)
+			&& !$index->isStatus(IIndex::INDEX_META)
 			&& !$index->isStatus(IIndex::INDEX_CONTENT)
 			&& !$index->isStatus(IIndex::INDEX_PARTS);
 		$updateContent = $updateAll || $index->isStatus(IIndex::INDEX_CONTENT);

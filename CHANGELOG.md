@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Atomic transaction-local trigram similarity threshold in search planning without post-execution resets interfering with aborted transactions.
 - Preserve angle brackets in plain text and prevent word fusion across HTML block tags. Re-indexing of text files is needed to benefit.
 - Safe upsert retry and size caps: restrict degradation strictly to tsvector limits (SQLSTATE 54000) with savepoint isolation in transactions, gracefully degrade oversized documents in five bounded steps, enforce pre-flight size limits on parts and tags, and sanitize NUL bytes from metadata.
+- Preserve stored content and parts when an already-indexed document is refreshed with `INDEX_OK` only (such as after `occ files:scan` when `files_fulltextsearch` omits unchanged file bytes).
 - Restrict pdftotext_path configuration to CLI/occ with strict binary name, executable, and version validation, removing editable path from admin web settings and rejecting web updates with HTTP 400.
 - Validate language and max_results settings when read: drop uninstalled text search configurations with a warning, fall back to simple if none remain, clamp max_results to 1..10000, eliminate spurious language change notices on extra language order differences, and expose database locale case-folding diagnostics.
 

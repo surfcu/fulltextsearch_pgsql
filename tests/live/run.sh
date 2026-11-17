@@ -170,6 +170,7 @@ if ! occ fulltextsearch:index --no-readline > /tmp/ftspg-index-unshare.log 2>&1;
 	failures=$((failures + 1))
 fi
 expect bob 'hippopotamus' ''
+expect admin 'hippopotamus' 'rapor_2025_final.docx'
 
 step "PDF fallback: bundled parser instead of pdftotext"
 occ fulltextsearch_pgsql:configure '{"pdf_extractor":"pdfparser"}' >/dev/null
@@ -243,7 +244,7 @@ occ maintenance:repair >/dev/null
 expect admin 'hippopotamus' 'rapor_2025_final.docx'
 
 step "Nextcloud log (warnings and errors from this app)"
-if grep -h 'fulltextsearch_pgsql\|FullTextSearch_PgSql' data/nextcloud.log 2>/dev/null | grep -E '"level":[2-4]'; then
+if grep -hE '"app":"fulltextsearch_pgsql"|apps/fulltextsearch_pgsql|FullTextSearch_PgSql' data/nextcloud.log 2>/dev/null | grep -E '"level":[2-4]'; then
 	echo "FAIL  warnings or errors logged"
 	failures=$((failures + 1))
 else
