@@ -167,6 +167,9 @@ class IndexService {
 						break;
 
 					case 4:
+						if (!$updateParts) {
+							continue 2;
+						}
 						if ($content !== '') {
 							$curContent = '';
 							$curUpdateContent = true;
@@ -179,9 +182,11 @@ class IndexService {
 						break;
 
 					case 5:
-						$curPartsText = mb_strcut($partsText, 0, self::STEP4_PARTS_BYTES);
-						$curPartsJson = $this->truncatePartsJson($parts, self::STEP4_PARTS_BYTES);
-						$curUpdateParts = true;
+						if ($updateParts) {
+							$curPartsText = mb_strcut($partsText, 0, self::STEP4_PARTS_BYTES);
+							$curPartsJson = $this->truncatePartsJson($parts, self::STEP4_PARTS_BYTES);
+						}
+						$curUpdateParts = $updateParts;
 						$curTagsText = mb_strcut($tagsText, 0, self::STEP5_TAGS_BYTES);
 						$curTitle = mb_substr($title, 0, self::STEP5_TITLE_CHARS);
 						$curContent = $content;

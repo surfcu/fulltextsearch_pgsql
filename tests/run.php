@@ -246,6 +246,12 @@ try {
 		search($platform, 'alice', $nasty);
 	}
 	check($schema->tableExists(), 'hostile queries do not error or inject');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "bud\0get")['ids']), 'NUL byte inside search word is stripped');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "+bud\0get")['ids']), 'NUL byte inside required search word is stripped');
+	same([], search($platform, 'alice', "foo\0bar")['ids'], 'NUL byte inside unmatched search word does not throw 42601');
+	same([], search($platform, 'alice', "+foo\0bar")['ids'], 'NUL byte inside required unmatched word does not throw 42601');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "budget -foo\0bar")['ids']), 'NUL byte inside excluded word does not throw 42601');
+	same(['Q1'], search($platform, 'alice', "\"bud\0get review\"")['ids'], 'NUL byte inside phrase is stripped');
 	same(['Q1', 'Q3'], search($platform, 'alice', '(budget), review!')['ids'], 'edge punctuation ignored; doc with both words first');
 	same(['Q1'], search($platform, 'alice', '+budget +review')['ids'], '+ makes words required');
 	same(['Q1'], search($platform, 'alice', '+budg +revi')['ids'], 'required words still match as prefixes');
@@ -488,6 +494,79 @@ try {
 	check(microtime(true) - $startT < 1.0, 'backreference regex filter returns in under a second');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => 'a{300}.*']]]])['ids'], 'repetition quantifier exceeding 255 returns nothing without SQL error');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => 'a{1,300}.*']]]])['ids'], 'repetition range quantifier exceeding 255 returns nothing without SQL error');
+	foreach ([
+		'quantified lookahead *' => '(?=a)*.*',
+		'quantified lookahead +' => '(?=a)+.*',
+		'quantified lookahead ?' => '(?=a)?.*',
+		'quantified lookahead {1,2}' => '(?=a){1,2}.*',
+		'quantified negative lookahead *' => '(?!b)*.*',
+		'quantified negative lookahead +' => '(?!b)+.*',
+		'quantified negative lookahead ?' => '(?!b)?.*',
+		'quantified negative lookahead {1,2}' => '(?!b){1,2}.*',
+		'quantified nested lookahead' => '(?=(a|b))+.*',
+		'PCRE control verb UTF8' => '(*UTF8).*',
+		'PCRE control verb ANYCRLF' => '(*ANYCRLF).*',
+		'PCRE control verb FAIL' => '(*FAIL).*',
+		'stacked repetitions (a{255}){255}' => '(a{255}){255}',
+		'stacked repetitions (?:a{255}){255}' => '(?:a{255}){255}',
+		'stacked repetitions (a{200}){200}' => '(a{200}){200}',
+		'PCRE \\p{L}' => '\p{L}.*',
+		'PCRE \\P{N}' => '\P{N}.*',
+		'PCRE \\x{0}' => '\x{0}.*',
+		'PCRE \\x{41}' => '\x{41}.*',
+		'PCRE \\o{101}' => '\o{101}.*',
+		'PCRE \\C' => '\C.*',
+		'PCRE \\N{U+0041}' => '\N{U+0041}.*',
+		'PCRE \\p{L} in class' => '[\p{L}].*',
+		'PCRE \\P{N} in class' => '[\P{N}].*',
+		'PCRE \\x{0} in class' => '[\x{0}].*',
+		'PCRE \\x{41} in class' => '[\x{41}].*',
+		'PCRE \\o{101} in class' => '[\o{101}].*',
+		'PCRE \\C in class' => '[\C].*',
+		'PCRE \\N{U+0041} in class' => '[\N{U+0041}].*',
+	] as $label => $badRegex) {
+		same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => $badRegex]]]])['ids'], "unportable regex rejected without SQL error ($label)");
+	}
+	same(['E1', 'E2'], sorted(search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '(?=.*plan).*\.pdf']]]])['ids']), 'unquantified lookahead regex remains portable');
+	same(['E1', 'E2'], sorted(search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '[[:alpha:]]+\s+\d+\x2e(?:pdf|PDF)']]]])['ids']), 'POSIX class and \\xHH escape remain portable');
+	// Fallback catch for SQLSTATE 2201B in SearchService::searchRequest()
+	$regexErrProxy = new class($conn) implements \OCP\IDBConnection {
+		public function __construct(
+			private \OCP\IDBConnection $inner,
+		) {
+		}
+		public function executeStatement($sql, array $params = [], array $types = []): int {
+			return $this->inner->executeStatement($sql, $params, $types);
+		}
+		public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+			if (str_contains($sql, 'WITH q AS') || str_contains($sql, 'EXPLAIN (FORMAT JSON)')) {
+				$e = new \PDOException('SQLSTATE[2201B]: Invalid regular expression: regular expression is too complex', 2201);
+				$e->errorInfo = ['2201B', 7, 'invalid regular expression: regular expression is too complex'];
+				throw $e;
+			}
+			return $this->inner->executeQuery($sql, $params, $types);
+		}
+		public function inTransaction(): bool {
+			return $this->inner->inTransaction();
+		}
+		public function beginTransaction(): void {
+			$this->inner->beginTransaction();
+		}
+		public function commit(): void {
+			$this->inner->commit();
+		}
+		public function rollBack(): void {
+			$this->inner->rollBack();
+		}
+		public function getDatabaseProvider(): string {
+			return $this->inner->getDatabaseProvider();
+		}
+	};
+	$regexErrSearch = new SearchService($regexErrProxy, $schema, $config, new TsQueryBuilder(), $vocabulary);
+	$regexErrPlatform = new PostgreSQLPlatform($config, $schema, $indexService, $regexErrSearch, $logger, $extractor);
+	$regexErrRes = search($regexErrPlatform, 'alice', 'harbour', $f);
+	same(0, $regexErrRes['total'], 'SQLSTATE 2201B in searchRequest returns total 0 instead of throwing');
+	same(false, $regexErrRes['timedOut'], 'SQLSTATE 2201B does not set timedOut');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => "plan\0pdf.*"]]]])['ids'], 'pattern with NUL byte is safely skipped');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => "plan\xff\xfepdf.*"]]]])['ids'], 'pattern with invalid UTF-8 is safely skipped');
 	same([], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => "plan\0*"]]]])['ids'], 'wildcard with NUL byte is safely skipped');
@@ -1125,6 +1204,40 @@ try {
 	same(false, $conn->inTransaction(), 'B1: caller transaction rolled back');
 	same([], search($platform, 'alice', '"Rollback Target Doc"')['ids'], 'B1: rolled back document is absent from index');
 
+	// -------------------------------------------------------------------------
+	// 7. Partial updates (INDEX_META / INDEX_CONTENT) under 54000 preserve parts
+	// -------------------------------------------------------------------------
+	$platform->indexDocument(doc('B1_PARTIAL_PARTS', 'alice', 'Initial Partial Title', 'initial durable content', [
+		'parts' => ['comments' => 'precious comment text'],
+	]));
+	$storedPartsBefore = (string)$conn->executeQuery("SELECT parts_text FROM ftspg_oc_index WHERE document_id = 'B1_PARTIAL_PARTS'")->fetchOne();
+	same('precious comment text', $storedPartsBefore, 'B1: partial update baseline parts_text stored');
+
+	// INDEX_META update with oversized title triggering SQLSTATE 54000 -> Step 5
+	mt_srand(505);
+	$metaTitleWords = [];
+	for ($i = 0; $i < 70000; $i++) {
+		$metaTitleWords[] = 'm' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$hugeMetaTitle = 'HugeMetaTitle ' . implode(' ', $metaTitleWords);
+	$runnerLog = [];
+	$platform->indexDocument(doc('B1_PARTIAL_PARTS', 'alice', $hugeMetaTitle, '', ['users' => ['bob']], 'files', IIndex::INDEX_META));
+	same('warning', $runnerLog['B1_PARTIAL_PARTS'][0] ?? '', 'B1: INDEX_META under 54000 degrades with warning');
+	$partialMetaRow = $conn->executeQuery("SELECT parts::text AS parts, parts_text, content FROM ftspg_oc_index WHERE document_id = 'B1_PARTIAL_PARTS'")->fetch(\PDO::FETCH_ASSOC);
+	same(['comments' => 'precious comment text'], json_decode((string)$partialMetaRow['parts'], true), 'B1: INDEX_META under 54000 preserves parts jsonb');
+	same('precious comment text', (string)$partialMetaRow['parts_text'], 'B1: INDEX_META under 54000 preserves parts_text');
+	same('initial durable content', (string)$partialMetaRow['content'], 'B1: INDEX_META under 54000 preserves content');
+	same(['B1_PARTIAL_PARTS'], search($platform, 'bob', 'precious')['ids'], 'B1: INDEX_META share grants access and existing parts remain searchable');
+
+	// INDEX_CONTENT update with oversized content + title triggering SQLSTATE 54000 -> Step 5/5b
+	$runnerLog = [];
+	$platform->indexDocument(doc('B1_PARTIAL_PARTS', 'alice', $hugeMetaTitle, 'fresh content payload', [], 'files', IIndex::INDEX_CONTENT));
+	same('warning', $runnerLog['B1_PARTIAL_PARTS'][0] ?? '', 'B1: INDEX_CONTENT under 54000 degrades with warning');
+	$partialContentRow = $conn->executeQuery("SELECT parts::text AS parts, parts_text, content FROM ftspg_oc_index WHERE document_id = 'B1_PARTIAL_PARTS'")->fetch(\PDO::FETCH_ASSOC);
+	same(['comments' => 'precious comment text'], json_decode((string)$partialContentRow['parts'], true), 'B1: INDEX_CONTENT under 54000 preserves parts jsonb');
+	same('precious comment text', (string)$partialContentRow['parts_text'], 'B1: INDEX_CONTENT under 54000 preserves parts_text');
+	same('fresh content payload', (string)$partialContentRow['content'], 'B1: INDEX_CONTENT under 54000 updates content');
+
 	$config->setConfig(['max_content_size' => 512000]);
 
 	section('pdftotext_path lockdown & validation (B3)');
@@ -1654,8 +1767,9 @@ try {
 	same(false, $conn->inTransaction(), 'and its transaction is closed');
 	$conn->beginTransaction();
 	$conn->executeStatement('SET LOCAL random_page_cost = 0.9');
+	$conn->executeStatement('SET LOCAL pg_trgm.similarity_threshold = 0.55');
 	search($platform, 'alice', 'lantern', ['provider' => 'plan']);
-	same(['on', '0.9'], array_values($conn->executeQuery("SELECT current_setting('enable_seqscan'), current_setting('random_page_cost')")->fetch(PDO::FETCH_NUM)), 'inside a caller\'s transaction, its settings are put back');
+	same(['on', '0.9', '0.55'], array_values($conn->executeQuery("SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('pg_trgm.similarity_threshold')")->fetch(PDO::FETCH_NUM)), 'inside a caller\'s transaction, its settings including pg_trgm.similarity_threshold are put back');
 	same(true, $conn->inTransaction(), 'and the transaction is left open');
 	$conn->rollBack();
 	// A provider with a few documents, searched for a word hundreds of others contain: testing

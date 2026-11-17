@@ -61,8 +61,42 @@ class SearchService {
 				$result->setTotal(0);
 				return;
 			}
+			if (self::isInvalidRegexException($e)) {
+				$result->setTotal(0);
+				return;
+			}
 			throw $e;
 		}
+	}
+
+	/**
+	 * Detect whether an exception represents PostgreSQL SQLSTATE 2201B
+	 * (ERRCODE_INVALID_REGULAR_EXPRESSION).
+	 */
+	private static function isInvalidRegexException(\Throwable $e): bool {
+		for ($curr = $e; $curr !== null; $curr = $curr->getPrevious()) {
+			if (method_exists($curr, 'getSQLState')) {
+				/** @var mixed $sqlState */
+				$sqlState = call_user_func([$curr, 'getSQLState']);
+				if ($sqlState === '2201B') {
+					return true;
+				}
+			}
+			if ((string)$curr->getCode() === '2201B') {
+				return true;
+			}
+			if ($curr instanceof \PDOException && isset($curr->errorInfo[0]) && (string)$curr->errorInfo[0] === '2201B') {
+				return true;
+			}
+			$msg = $curr->getMessage();
+			if (stripos($msg, 'invalid regular expression') !== false) {
+				return true;
+			}
+			if (preg_match('/(?:SQLSTATE\[2201B\]|\bSQLSTATE\s+2201B\b|invalid_regular_expression)/i', $msg) === 1) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -123,19 +157,23 @@ class SearchService {
 			$this->db->beginTransaction();
 		}
 		$timeout = $ownTransaction ? $this->configService->getSearchTimeout() : 0;
+		$hasTrigram = $this->schemaService->hasTrigram();
 		$selectCols = [
 			"current_setting('enable_seqscan')",
 			"current_setting('random_page_cost')",
 			"current_setting('jit')",
+			"current_setting('pg_trgm.similarity_threshold', true)",
 			"set_config('enable_seqscan', 'off', true)",
 			"set_config('random_page_cost', least(current_setting('random_page_cost')::float8, CAST(? AS float8))::text, true)",
 			"set_config('jit', 'off', true)",
-			"set_config('pg_trgm.similarity_threshold', CAST(? AS text), true)",
 		];
 		$params = [
 			(string)self::SEARCH_RANDOM_PAGE_COST,
-			(string)VocabularyService::TRIGRAM_THRESHOLD,
 		];
+		if ($hasTrigram) {
+			$selectCols[] = "set_config('pg_trgm.similarity_threshold', CAST(? AS text), true)";
+			$params[] = (string)VocabularyService::TRIGRAM_THRESHOLD;
+		}
 		if ($timeout > 0) {
 			$selectCols[] = "set_config('statement_timeout', CAST(? AS text), true)";
 			$params[] = ($timeout * 1000) . 'ms';
@@ -156,10 +194,17 @@ class SearchService {
 				// Inside someone else's transaction: put the settings back for the rest of it. After
 				// an error that transaction is aborted, and its rollback discards them anyway.
 				if (!$failed && is_array($previous)) {
-					$this->db->executeQuery(
-						"SELECT set_config('enable_seqscan', ?, true), set_config('random_page_cost', ?, true), set_config('jit', ?, true)",
-						[(string)$previous[0], (string)$previous[1], (string)$previous[2]]
-					)->closeCursor();
+					$restoreCols = [
+						"set_config('enable_seqscan', ?, true)",
+						"set_config('random_page_cost', ?, true)",
+						"set_config('jit', ?, true)",
+					];
+					$restoreParams = [(string)$previous[0], (string)$previous[1], (string)$previous[2]];
+					if ($hasTrigram && $previous[3] !== null) {
+						$restoreCols[] = "set_config('pg_trgm.similarity_threshold', ?, true)";
+						$restoreParams[] = (string)$previous[3];
+					}
+					$this->db->executeQuery('SELECT ' . implode(', ', $restoreCols), $restoreParams)->closeCursor();
 				}
 			} elseif ($failed) {
 				$this->db->rollBack();
@@ -456,32 +501,207 @@ class SearchService {
 
 	/** A regex both PCRE and PostgreSQL accept with the same meaning, as far as can be told cheaply. */
 	private static function isPortableRegex(string $pattern): bool {
-		/*
-		 * Rejected: \K, \Q…\E, \R, \h, \v, \X, \A, \z, \Z, \G, and \b, \B (a backspace in PostgreSQL,
-		 * not a word boundary) – missing or different there;
-		 * backreferences \1–\9, \k, \g;
-		 * groups starting with "(?" other than (?:, (?= and (?! (named and atomic groups, branch
-		 * reset, inline flags); possessive quantifiers such as a++.
-		 */
-		if (preg_match('/(?<!\\\\)(?:\\\\\\\\)*\\\\[1-9kgKGKXRhHvVQEGAzZbB]|\\(\\?[^:=!]|[*+?}]\\+/', $pattern)) {
-			return false;
-		}
-		if (preg_match_all('/(?<!\\\\)(?:\\\\\\\\)*\\{(\\d+)?(?:,(\\d*))?\\}/', $pattern, $matches, PREG_SET_ORDER)) {
-			foreach ($matches as $match) {
-				$n1 = isset($match[1]) && $match[1] !== '' ? $match[1] : null;
-				$n2 = isset($match[2]) && $match[2] !== '' ? $match[2] : null;
-				if ($n1 === null && $n2 === null) {
+		$len = strlen($pattern);
+		$inClass = false;
+		$classStart = false;
+		/** @var list<array{lookahead: bool, branchCost: int, totalCost: int, lastAtomCost: int}> $stack */
+		$stack = [['lookahead' => false, 'branchCost' => 0, 'totalCost' => 0, 'lastAtomCost' => 0]];
+		$maxCost = 4096;
+
+		for ($i = 0; $i < $len; $i++) {
+			$ch = $pattern[$i];
+
+			if ($ch === '\\') {
+				$advance = self::portableEscapeLength($pattern, $i, $len);
+				if ($advance === 0) {
+					return false;
+				}
+				$i += $advance - 1;
+				if ($inClass) {
+					$classStart = false;
+				} else {
+					$topIdx = count($stack) - 1;
+					$stack[$topIdx]['branchCost'] += 1;
+					$stack[$topIdx]['lastAtomCost'] = 1;
+				}
+				continue;
+			}
+
+			if ($inClass) {
+				if ($ch === '[' && $i + 1 < $len && ($pattern[$i + 1] === ':' || $pattern[$i + 1] === '.' || $pattern[$i + 1] === '=')) {
+					$close = strpos($pattern, $pattern[$i + 1] . ']', $i + 2);
+					if ($close === false) {
+						return false;
+					}
+					$i = $close + 1;
+					$classStart = false;
 					continue;
 				}
-				if ($n1 !== null && (strlen($n1) > 3 || (int)$n1 > 255)) {
+				if ($ch === ']' && !$classStart) {
+					$inClass = false;
+					$topIdx = count($stack) - 1;
+					$stack[$topIdx]['branchCost'] += 1;
+					$stack[$topIdx]['lastAtomCost'] = 1;
+					continue;
+				}
+				$classStart = false;
+				continue;
+			}
+
+			if ($ch === '[') {
+				$inClass = true;
+				$classStart = true;
+				if ($i + 1 < $len && $pattern[$i + 1] === '^') {
+					$i++;
+				}
+				continue;
+			}
+
+			if ($ch === '(') {
+				if ($i + 1 >= $len) {
 					return false;
 				}
-				if ($n2 !== null && (strlen($n2) > 3 || (int)$n2 > 255)) {
+				$next = $pattern[$i + 1];
+				if ($next === '*') {
+					return false; // PCRE control verbs like (*UTF8), (*ANYCRLF), etc.
+				}
+				$isLookahead = false;
+				if ($next === '?') {
+					if ($i + 2 >= $len) {
+						return false;
+					}
+					$type = $pattern[$i + 2];
+					if ($type !== ':' && $type !== '=' && $type !== '!') {
+						return false;
+					}
+					$isLookahead = ($type === '=' || $type === '!');
+					$i += 2;
+				}
+				$stack[] = ['lookahead' => $isLookahead, 'branchCost' => 0, 'totalCost' => 0, 'lastAtomCost' => 0];
+				continue;
+			}
+
+			if ($ch === '|') {
+				$topIdx = count($stack) - 1;
+				$stack[$topIdx]['totalCost'] += $stack[$topIdx]['branchCost'];
+				if ($stack[$topIdx]['totalCost'] > $maxCost) {
 					return false;
+				}
+				$stack[$topIdx]['branchCost'] = 0;
+				$stack[$topIdx]['lastAtomCost'] = 0;
+				continue;
+			}
+
+			if ($ch === ')') {
+				if (count($stack) <= 1) {
+					return false;
+				}
+				$frame = array_pop($stack);
+				$groupCost = max(1, $frame['totalCost'] + $frame['branchCost']);
+				if ($groupCost > $maxCost) {
+					return false;
+				}
+				if ($frame['lookahead'] && $i + 1 < $len) {
+					$after = $pattern[$i + 1];
+					if ($after === '*' || $after === '+' || $after === '?') {
+						return false;
+					}
+					if ($after === '{' && preg_match('/^\\{(?:\\d+(?:,\\d*)?|,\\d+)\\}/', substr($pattern, $i + 1)) === 1) {
+						return false;
+					}
+				}
+				$topIdx = count($stack) - 1;
+				$stack[$topIdx]['branchCost'] += $groupCost;
+				$stack[$topIdx]['lastAtomCost'] = $groupCost;
+				continue;
+			}
+
+			if ($ch === '*' || $ch === '+' || $ch === '?') {
+				if ($i + 1 < $len) {
+					$mod = $pattern[$i + 1];
+					if ($mod === '+') {
+						return false;
+					}
+					if ($mod === '?') {
+						$i++;
+					}
+				}
+				continue;
+			}
+
+			if ($ch === '{' && preg_match('/^\\{(\\d+)?(?:,(\\d*))?\\}/', substr($pattern, $i), $m) === 1) {
+				$n1 = isset($m[1]) && $m[1] !== '' ? $m[1] : null;
+				$n2 = isset($m[2]) && $m[2] !== '' ? $m[2] : null;
+				if ($n1 !== null || $n2 !== null) {
+					if ($n1 !== null && (strlen($n1) > 3 || (int)$n1 > 255)) {
+						return false;
+					}
+					if ($n2 !== null && (strlen($n2) > 3 || (int)$n2 > 255)) {
+						return false;
+					}
+					$repeat = max(1, (int)($n2 ?? $n1));
+					$topIdx = count($stack) - 1;
+					$atomCost = max(1, $stack[$topIdx]['lastAtomCost']);
+					$newAtomCost = $atomCost * $repeat;
+					$stack[$topIdx]['branchCost'] += $newAtomCost - $atomCost;
+					$stack[$topIdx]['lastAtomCost'] = $newAtomCost;
+					if ($stack[$topIdx]['totalCost'] + $stack[$topIdx]['branchCost'] > $maxCost) {
+						return false;
+					}
+					$i += strlen($m[0]) - 1;
+					if ($i + 1 < $len) {
+						$mod = $pattern[$i + 1];
+						if ($mod === '+') {
+							return false;
+						}
+						if ($mod === '?') {
+							$i++;
+						}
+					}
+					continue;
 				}
 			}
+
+			$topIdx = count($stack) - 1;
+			$stack[$topIdx]['branchCost'] += 1;
+			$stack[$topIdx]['lastAtomCost'] = 1;
+			if ($stack[$topIdx]['totalCost'] + $stack[$topIdx]['branchCost'] > $maxCost) {
+				return false;
+			}
 		}
-		return @preg_match('/' . str_replace('/', '\\/', $pattern) . '/u', '') !== false;
+
+		if ($inClass || count($stack) !== 1) {
+			return false;
+		}
+		if ($stack[0]['totalCost'] + $stack[0]['branchCost'] > $maxCost) {
+			return false;
+		}
+		$escaped = (string)preg_replace('/(?<!\\\\)((?:\\\\\\\\)*)\//', '$1\\/', $pattern);
+		return @preg_match('/' . $escaped . '/u', '') !== false;
+	}
+
+	/** Byte length of an escape sequence at $offset, or 0 when unportable/invalid. */
+	private static function portableEscapeLength(string $pattern, int $offset, int $len): int {
+		if ($offset + 1 >= $len) {
+			return 0;
+		}
+		$next = $pattern[$offset + 1];
+		if (ord($next) >= 0x80 || ($next >= '0' && $next <= '9')) {
+			return 0;
+		}
+		if (($next >= 'a' && $next <= 'z') || ($next >= 'A' && $next <= 'Z')) {
+			if ($next === 'x') {
+				if ($offset + 3 < $len && ctype_xdigit($pattern[$offset + 2]) && ctype_xdigit($pattern[$offset + 3])) {
+					return 4;
+				}
+				return 0;
+			}
+			return match ($next) {
+				'd', 'D', 's', 'S', 'w', 'W', 'n', 'r', 't', 'f', 'a', 'e' => 2,
+				default => 0,
+			};
+		}
+		return 2;
 	}
 
 	/**
