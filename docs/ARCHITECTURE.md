@@ -18,7 +18,7 @@ The framework calls the platform through `OCP\FullTextSearch\IFullTextSearchPlat
 
 | Method | What happens here |
 |---|---|
-| `loadPlatform()` | Creates the table if it is missing. |
+| `loadPlatform()` | Creates the table if it is missing; never rebuilds an existing table, and throws an error directing to `occ upgrade` or `occ maintenance:repair` if an existing table uses an older schema. |
 | `testPlatform()` | Checks the database is PostgreSQL and the schema is in place. |
 | `initializeIndex()` | Creates table and indexes (idempotent). |
 | `indexDocument()` | Extracts text, then upserts one row. Reports warnings to the runner. |
@@ -32,7 +32,7 @@ The framework calls the platform through `OCP\FullTextSearch\IFullTextSearchPlat
 | Class | Role |
 |---|---|
 | `Platform\PostgreSQLPlatform` | The interface implementation; thin, delegates to services and maps results to index statuses. |
-| `Service\SchemaService` | Creates/drops the table, detects `pg_trgm` and installed text search configurations. |
+| `Service\SchemaService` | Creates/drops `ftspg_<prefix>index`, `ftspg_<prefix>words`, and `ftspg_<prefix>regconfig(text)`, upgrades schemas atomically under an advisory lock, resolves schemas for empty `search_path`, and detects `pg_trgm`, installed text search configurations, and locale case folding. |
 | `Service\IndexService` | Builds the row and runs the upsert. |
 | `Service\ContentExtractor` | base64 decoding and text extraction (plain text, ODF, OOXML, Office 97–2003 via `catdoc`/`xls2csv`/`catppt`, PDF via `pdftotext` or the bundled parser). |
 | `Service\StatusService` | Probes shown by the admin panel: PostgreSQL, `pg_trgm`, PDF tools, `catdoc`, locale case folding, index size. |
@@ -54,29 +54,31 @@ The framework calls the platform through `OCP\FullTextSearch\IFullTextSearchPlat
 ```sql
 CREATE TABLE ftspg_oc_index (
   id            bigserial PRIMARY KEY,
-  provider_id   varchar(64)  NOT NULL,
-  document_id   varchar(254) NOT NULL,
-  owner_id      varchar(64)  NOT NULL DEFAULT '',
+  provider_id   text         NOT NULL,
+  document_id   text         NOT NULL,
+  owner_id      text         NOT NULL DEFAULT '',
   access        text[]       NOT NULL DEFAULT '{}',   -- u:alice, g:sales, c:<circle>, u:__all
   links         text[]       NOT NULL DEFAULT '{}',
   tags, metatags, subtags     text[],
-  source, hash, modified_time, indexed_at,
-  config        regconfig    NOT NULL,                -- language the row was indexed with
+  source, hash (text), modified_time, indexed_at (bigint),
+  config        text         NOT NULL,                -- language name the row was indexed with
   title, tags_text, parts (jsonb), parts_text, content, info (jsonb),
   tsv tsvector GENERATED ALWAYS AS (
-        setweight(to_tsvector(config, title),      'A')
-     || setweight(to_tsvector(config, split(title)), 'A')   -- file name parts, see below
-     || setweight(to_tsvector(config, tags_text),  'B')
-     || setweight(to_tsvector(config, parts_text), 'C')
-     || setweight(to_tsvector(config, content),    'D')
+        setweight(to_tsvector(ftspg_oc_regconfig(config), title),      'A')
+     || setweight(to_tsvector(ftspg_oc_regconfig(config), split(title)), 'A')   -- file name parts, see below
+     || setweight(to_tsvector(ftspg_oc_regconfig(config), tags_text),  'B')
+     || setweight(to_tsvector(ftspg_oc_regconfig(config), parts_text), 'C')
+     || setweight(to_tsvector(ftspg_oc_regconfig(config), content),    'D')
   ) STORED,
   title_search text GENERATED ALWAYS AS (lower(title)) STORED,   -- for substring and typo matching
-  UNIQUE (provider_id, document_id)
+  CONSTRAINT ftspg_oc_index_doc_uniq UNIQUE (provider_id, document_id)
 );
 -- GIN indexes on tsv, access, metatags, subtags; trigram GIN index on title_search when pg_trgm exists
 ```
 
-(For Turkish rows each column is first passed through `translate(col, 'Iİ', 'ıi')`; see below.)
+(For Turkish rows each column—including `title_search`—is first passed through `CASE WHEN config = 'turkish' THEN translate(col, 'Iİ', 'ıi') ELSE col END`; see below.)
+
+`config` (and `provider_id`, `document_id`, `owner_id`, `source`, `hash`) are stored as `text` rather than `regconfig` or `varchar(n)` so `pg_upgrade` never rejects the table over `reg*` OID-backed types. Because stored generated columns require `IMMUTABLE` expressions while `text::regconfig` is `STABLE`, `SchemaService` installs an `IMMUTABLE PARALLEL SAFE` SQL wrapper `ftspg_<prefix>regconfig(text) RETURNS pg_catalog.regconfig` (`SELECT $1::pg_catalog.regconfig`), which `DropIndexTable` removes on uninstall after dropping the tables. Every table, wrapper function, `pg_catalog` check, and `pg_trgm` operator/opclass (`<schema>.gin_trgm_ops`, `OPERATOR(<schema>.%)`, `OPERATOR(<schema>.<%)`) is resolved via `pg_catalog` and schema-qualified so queries and `pg_dump` / `pg_restore` work even under `SET search_path = ''` or custom schemas.
 
 ### File names
 
@@ -84,11 +86,13 @@ PostgreSQL's text parser reads `rapor_2025_final.pdf` as a single "host" token, 
 
 ### Schema versions
 
-The generated columns' definition version is stored as a comment on `tsv` (`ftspg schema 2`). When the repair step or `loadPlatform()` finds an older marker, it drops and re-adds the generated columns, and PostgreSQL recomputes them for every row. That rewrite locks the table while it runs; on large indexes, upgrade during a quiet period.
+The generated columns' definition version is stored as a comment on `tsv` (`ftspg schema 3`). `loadPlatform()` creates a missing table on first load, but refuses to rebuild an existing table with an older marker—throwing an error directing the administrator to run `occ upgrade` or `occ maintenance:repair`. When `CreateIndexTable` sees an outdated existing table, it prints the indexed document count and a table-lock notice before calling `SchemaService::ensureSchema()`.
+
+`ensureSchema()` keeps `CREATE EXTENSION IF NOT EXISTS pg_trgm` outside any transaction (so a permission error never aborts the rebuild), then opens a transaction (or a `SAVEPOINT` inside a caller transaction), takes `pg_advisory_xact_lock(hashtext('fulltextsearch_pgsql'), hashtext(<table>))`, and re-checks `isCurrent()` once the lock is held so concurrent callers never rebuild twice. When outdated, it drops `tsv` and `title_search`, alters any non-`text` identifier/config columns and re-adds the generated columns in a single `ALTER TABLE`, updates the comment, recreates the indexes and `ftspg_<prefix>words`, and runs `ANALYZE` atomically; if anything fails, the transaction rolls back with existing columns and rows intact. If the marker is already current, it still restores any missing `ftspg_<prefix>regconfig(text)` function, indexes, or words table without rewriting `tsv`. Recomputing `tsv` locks the table while it runs (about 52 s on the 100,000-document synthetic index) and requires no re-indexing; on large indexes, upgrade during a quiet period.
 
 ### Why raw SQL and an unprefixed table name
 
-Nextcloud manages schemas through Doctrine, and Doctrine has no mapping for `tsvector`, `text[]` or `regconfig`. Nextcloud introspects **every** table that starts with its table prefix whenever any app runs a migration. A prefixed table with these columns would make all of those migrations fail with *"Unknown database type tsvector requested"*.
+Nextcloud manages schemas through Doctrine, and Doctrine has no mapping for `tsvector` or `text[]`. Nextcloud introspects **every** table that starts with its table prefix whenever any app runs a migration. A prefixed table with these columns would make all of those migrations fail with *"Unknown database type tsvector requested"*.
 
 So the table is created with raw SQL by a repair step and named `ftspg_` + prefix + `index`, which Nextcloud's schema filter skips. The app also drops `oc_fts_pgsql_index`, the table version 1.0.0 tried to create, for the same reason.
 
@@ -100,7 +104,7 @@ The search vector is always consistent with the stored text, a single `INSERT �
 
 `IndexService` asks `LanguageDetector` for the language whenever content is indexed, and leaves `config` unchanged on metadata-only updates. The detector runs one statement: `ts_debug(cfg, sample)` for each configured `cfg` over the first 2,000 characters, counting word tokens whose dictionary returned no lexeme (stop words). The winner needs at least 2 and 1.5× the runner-up; otherwise the first language is used.
 
-`SearchService` compiles the query once per language with `TsQueryBuilder` and ORs the branches, each guarded by the rows' language: `d.config = 'english' AND d.tsv @@ to_tsquery('english', …)`; the first language's branch takes `d.config <> ALL (other languages)`, which includes rows indexed in a language no longer configured. Rank queries are computed once in the `q` CTE and picked per row with a `CASE` on `d.config`, which also feeds `ts_headline`. Each branch is a GIN-indexable `@@`, so PostgreSQL combines them with a BitmapOr. With one language the SQL is the same as before.
+`SearchService` compiles the query once per language with `TsQueryBuilder` and ORs the branches, each guarded by the rows' `text` language name: `d.config = 'english' AND d.tsv @@ to_tsquery('english', …)`; the first language's branch takes `d.config <> ALL (other languages)`, which includes rows indexed in a language no longer configured. Rank queries are computed once in the `q` CTE and picked per row with a `CASE` on `d.config`, and `ts_headline` receives `m.config::pg_catalog.regconfig`. Each branch is a GIN-indexable `@@`, so PostgreSQL combines them with a BitmapOr. With one language the SQL is the same as before.
 
 ## Indexing
 
@@ -225,4 +229,4 @@ PostgreSQL lowercases with the database's `LC_CTYPE`. Unless that is `tr_TR`, `I
 
 ## Tests
 
-`tests/run.php` runs against a real PostgreSQL database: schema creation, access control, Turkish handling, query syntax including the framework's own test searches and a query fuzzer, extraction of every supported format, size limits, tool timeouts, partial updates, `getDocument` round trips, deletes and resets, viewer-scoped vocabulary isolation, and that the GIN indexes are used. `tests/bench/run.php` benchmarks search latency on the 100,000-document synthetic set, and Psalm checks the code against the real `nextcloud/ocp` interfaces.
+`tests/run.php` runs against a real PostgreSQL database: schema creation, atomic/advisory-locked rebuilds and rollback recovery, `1.4.2`/`1.5.x` → schema v3 upgrade fixtures, a `pg_catalog` assertion forbidding `reg*` columns on `ftspg_*` tables, `pg_dump` / `pg_restore` verification under `SET search_path = ''`, access control, Turkish handling, query syntax including the framework's own test searches and a query fuzzer, extraction of every supported format, size limits, tool timeouts, partial updates, `getDocument` round trips, deletes and resets, viewer-scoped vocabulary isolation, and that the GIN indexes are used. `tests/bench/run.php` benchmarks search latency on the 100,000-document synthetic set, Psalm checks the code against the real `nextcloud/ocp` interfaces, and CI's `pg_upgrade` job runs the suite on PostgreSQL 17 and verifies `pg_upgrade --check` compatibility to PostgreSQL 18.
