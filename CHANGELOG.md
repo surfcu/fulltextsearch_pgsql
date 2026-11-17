@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-17
+
 ### Added
 - Search timeout setting (`search_timeout`, default 10 seconds, 0 to 300) in administration settings and CLI, cancelling long-running search statements transaction-locally and flagging the result as timed out.
 - Synthetic benchmark harness (`tests/bench/run.php`) measuring search throughput and planning costs against a 100,000-document corpus.
