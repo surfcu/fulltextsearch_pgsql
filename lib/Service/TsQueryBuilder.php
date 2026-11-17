@@ -80,6 +80,7 @@ class TsQueryBuilder {
 		/** @var array<string, list<array{ts: array{0: string, 1: list<string>}, pred: array{0: string, 1: list<string>}, phrase: bool}>> $terms */
 		$terms = ['optional' => [], 'required' => [], 'excluded' => []];
 		$words = [];
+		$plainWordsOnly = true;
 		$count = 0;
 
 		foreach ($matches as $m) {
@@ -99,6 +100,9 @@ class TsQueryBuilder {
 				'-' => 'excluded',
 				default => 'optional',
 			};
+			if ($isPhrase || $kind !== 'optional') {
+				$plainWordsOnly = false;
+			}
 
 			if ($isPhrase) {
 				$ts = ['phraseto_tsquery(CAST(? AS regconfig), ?)', [$language, $text]];
@@ -172,7 +176,7 @@ class TsQueryBuilder {
 		$rank = $this->join($positiveTs, '||');
 		$all = $this->join($positivePreds, 'AND');
 
-		return new ParsedQuery($match[0], $match[1], $rank[0], $rank[1], $all[0], $all[1], implode(' ', $words), $positiveTs);
+		return new ParsedQuery($match[0], $match[1], $rank[0], $rank[1], $all[0], $all[1], implode(' ', $words), $positiveTs, $plainWordsOnly);
 	}
 
 	/**
