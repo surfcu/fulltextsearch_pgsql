@@ -40,7 +40,7 @@ Create an API token at [apps.nextcloud.com/account/token](https://apps.nextcloud
 
 1. Set the new version in `appinfo/info.xml` and add a matching `## [x.y.z]` section to `CHANGELOG.md`. The App Store shows that section as the release notes.
 2. Commit and push to `main`.
-3. On GitHub, **Releases → Draft a new release**, create the tag `vx.y.z` (for example `v1.3.0`), and publish it. Mark it as a pre-release to upload it to the App Store as a nightly.
+3. On GitHub, **Releases → Draft a new release**, create the tag `x.y.z` (for example `1.5.0`; tags are written `1.2.3` in practice, and both `1.2.3` and `v1.2.3` work), and publish it. Mark it as a pre-release to upload it to the App Store as a nightly.
 
 The [Release workflow](../.github/workflows/release.yml) then:
 

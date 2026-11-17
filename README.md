@@ -21,7 +21,7 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 
 ## Requirements
 
-- Nextcloud 30–35 running on **PostgreSQL 13 or newer**
+- Nextcloud 30–35 running on **PostgreSQL 13 or newer** with a UTF-8 database locale (`LC_CTYPE` other than `C`/`POSIX`) for non-ASCII case folding and accent matching; the admin panel and `occ fulltextsearch:check` warn if it is inactive
 - The **Full Text Search** app plus at least one content provider, e.g. **Full Text Search - Files**
 - The PHP version your Nextcloud release requires (8.1+ for Nextcloud 30, 8.3+ for 35), with `zip` for office documents
 - Optional: `catdoc` for Office 97–2003 files (`apt install catdoc`; it provides `catdoc`, `xls2csv` and `catppt`). Without it, `.doc`, `.xls` and `.ppt` files are indexed by name only.
@@ -99,7 +99,7 @@ The configure command and the admin panel validate every value before saving any
 
 ### Typo correction vocabulary
 
-Words are collected as documents are indexed. Indexes built before version 1.3.0 have no vocabulary yet: on upgrade it is filled automatically for up to 10,000 documents; for larger indexes, or to drop words from deleted documents, run:
+Words are collected as documents are indexed (when `typo_correction` is enabled). Indexes built before version 1.3.0 have no vocabulary yet: on upgrade it is filled automatically for up to 10,000 documents when `typo_correction` is on; for larger indexes, or to drop words from deleted documents, run:
 
 ```bash
 occ fulltextsearch_pgsql:vocabulary            # show the number of words
@@ -123,7 +123,7 @@ occ fulltextsearch:reset && occ fulltextsearch:index
 Nextcloud runs the app's repair step on upgrade; the index table and its documents are kept. Some improvements only apply to documents indexed after them:
 
 - **Plain text angle brackets and HTML block spacing** — re-index plain text files so `<email>`, `<url>` and code generics are preserved.
-- **Office text extraction** (words split across formatting runs, spreadsheet numbers, comments, text boxes) and **Office 97–2003 files** — re-index office documents.
+- **Office text extraction** (words split across formatting runs, spreadsheet numbers, comments, text boxes, OpenDocument notes and `styles.xml` headers/footers) and **Office 97–2003 files** — re-index office documents.
 - **Several languages** — documents keep the language they were indexed in until re-indexed.
 
 To re-index everything:
@@ -134,9 +134,19 @@ occ fulltextsearch:reset && occ fulltextsearch:index
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
+## Upgrading PostgreSQL
+
+Until version 1.6.0, the index table uses PostgreSQL's `regconfig` column type, which `pg_upgrade` refuses to carry across major PostgreSQL versions. Before running `pg_upgrade`, drop the app's two tables (adjust `oc_` if your Nextcloud `dbtableprefix` differs) and rebuild the index afterwards:
+
+```sql
+DROP TABLE IF EXISTS ftspg_oc_index, ftspg_oc_words;
+```
+
+After `pg_upgrade`, run `occ fulltextsearch:test && occ fulltextsearch:index` to recreate the tables and rebuild the index. Alternatively, upgrade PostgreSQL with `pg_dump` / `pg_restore`, which preserves the tables without re-indexing.
+
 ## Turkish
 
-PostgreSQL lowercases text using the database's locale, which is rarely `tr_TR`. Under any other locale `I` becomes `i` instead of `ı`, so `ISPARTA` would never match `ısparta` and uppercase words would miss their lowercase forms. When `language` is `turkish`, the app maps `I→ı` and `İ→i` before stemming, both when indexing and when searching, so it works regardless of the database locale.
+PostgreSQL lowercases text using the database's locale, which is rarely `tr_TR`. Under any other locale `I` becomes `i` instead of `ı`, so `ISPARTA` would never match `ısparta` and uppercase words would miss their lowercase forms. When `language` is `turkish`, the app maps `I→ı` and `İ→i` before stemming, both when indexing and when searching, so `I` and `İ` work regardless of the database locale. Only `I` and `İ` are locale-independent: other uppercase Turkish letters (`Ç`, `Ş`, `Ğ`, `Ö`, `Ü`) still rely on a UTF-8 database `LC_CTYPE` locale for lowercasing.
 
 A Turkish-language guide is in [docs/TURKISH.md](docs/TURKISH.md).
 
@@ -145,8 +155,8 @@ A Turkish-language guide is in [docs/TURKISH.md](docs/TURKISH.md).
 | Content | How |
 |---|---|
 | Text files (txt, md, csv, code, …) | Decoded directly; UTF-8, UTF-16 with BOM, or Windows-1254 |
-| OpenDocument (odt, ods, odp) | `content.xml`: text, tables, notes, comments; deleted tracked changes left out |
-| Office Open XML (docx, xlsx, pptx) | Word: body, headers and footers, footnotes, comments, text boxes. Excel: cell text and numbers, formula results, sheet names, comments, text boxes. PowerPoint: slides, speaker notes, comments. SmartArt in all three. Deleted tracked changes, field codes and formulas are left out; a word split across formatting runs stays one word. At most 32 MB of each part is read. |
+| OpenDocument (odt, ods, odp) | `content.xml` (text, tables, notes, comments; deleted tracked changes left out) and `styles.xml` (headers and footers). At most 32 MB per part, 128 MB uncompressed XML in total, and 2,000 entries are read per office file. |
+| Office Open XML (docx, xlsx, pptx) | Word: body, headers and footers, footnotes, comments, text boxes. Excel: cell text and numbers, formula results, sheet names, comments, text boxes. PowerPoint: slides, speaker notes, comments. SmartArt in all three. Deleted tracked changes, field codes and formulas are left out; a word split across formatting runs stays one word. At most 32 MB per part, 128 MB uncompressed XML in total, and 2,000 entries are read. |
 | Office 97–2003 (doc, xls, ppt) | `catdoc`, `xls2csv` or `catppt` if installed. Recent PowerPoint versions save `.ppt` files `catppt` cannot always read. Password-protected files are indexed by name only. |
 | PDF | `pdftotext` if installed (60 s timeout per file), otherwise the bundled parser (files up to 64 MB, and only when `memory_limit` leaves about 12× the file size free) |
 | Scanned PDFs, images, other binaries | Title, tags and comments only; logged as a warning |
@@ -160,7 +170,8 @@ Which files are sent for indexing at all (size limits, external storage, etc.) i
 - No OCR. Office 97–2003 files need `catdoc`.
 - Excerpts are generated from at most `max_content_size` bytes of each document.
 - Corrections are applied silently: the Full Text Search interface has no place for a "did you mean …" hint.
-- Only words of three letters or more get accent variants, and four or more get spelling corrections. Spelling correction only kicks in for words that appear nowhere in the index.
+- Only words of three letters or more get accent variants, and four or more get spelling corrections. Both only suggest words present in documents the searching user can open under the active filters, and spelling correction runs on page 1 when the uncorrected search returns fewer results than the requested page size (and the word does not already match a visible document).
+- Ignored `ISearchRequest` fields: `getSimpleQueries()` (planned for `1.6.x`), and `getFields()`, `getParts()`, and `getWildcardFields()` (left unimplemented because every document part is already indexed and title substring matching is always active when `use_trigram` is on).
 - Everything lives in your Nextcloud database, so index size counts toward its storage and backups (roughly 1–2× the extracted text).
 
 ## How it works
