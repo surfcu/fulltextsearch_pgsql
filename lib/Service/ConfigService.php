@@ -7,6 +7,7 @@ namespace OCA\FullTextSearch_PgSql\Service;
 use InvalidArgumentException;
 use OCA\FullTextSearch_PgSql\AppInfo\Application;
 use OCP\IAppConfig;
+use Psr\Log\LoggerInterface;
 
 /**
  * Typed access to the app's settings.
@@ -45,9 +46,14 @@ class ConfigService {
 		self::PDF_EXTRACTOR => 'auto',
 	];
 
+	/** @var non-empty-list<string>|null */
+	private ?array $cachedLanguages = null;
+	private ?string $lastRawLanguage = null;
+
 	public function __construct(
 		private IAppConfig $appConfig,
 		private SchemaService $schemaService,
+		private ?LoggerInterface $logger = null,
 	) {
 	}
 
@@ -97,7 +103,17 @@ class ConfigService {
 				);
 			}
 			$value = implode(',', $languages);
-			$languageChanged = $languages !== $this->getLanguages();
+
+			$current = $this->getLanguages();
+			$currentPrimary = $current[0];
+			$currentExtras = array_slice($current, 1);
+			sort($currentExtras);
+
+			$newPrimary = $languages[0];
+			$newExtras = array_slice($languages, 1);
+			sort($newExtras);
+
+			$languageChanged = ($newPrimary !== $currentPrimary) || ($newExtras !== $currentExtras);
 			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::LANGUAGE, $value);
 		}
 
@@ -150,6 +166,8 @@ class ConfigService {
 		foreach ($writes as $write) {
 			$write();
 		}
+		$this->cachedLanguages = null;
+		$this->lastRawLanguage = null;
 		return $languageChanged;
 	}
 
@@ -163,12 +181,42 @@ class ConfigService {
 
 	/**
 	 * Every configured language, fallback first. Search tries each of them.
+	 * Invalid or uninstalled languages are dropped with a warning; falls back to ['simple']
+	 * if all configured languages are invalid.
 	 *
 	 * @return non-empty-list<string>
 	 */
 	public function getLanguages(): array {
-		$languages = $this->parseLanguages($this->appConfig->getValueString(Application::APP_ID, self::LANGUAGE, self::DEFAULTS[self::LANGUAGE]));
-		return $languages === [] ? [self::DEFAULTS[self::LANGUAGE]] : $languages;
+		$raw = $this->appConfig->getValueString(Application::APP_ID, self::LANGUAGE, self::DEFAULTS[self::LANGUAGE]);
+		if ($raw === $this->lastRawLanguage && $this->cachedLanguages !== null) {
+			return $this->cachedLanguages;
+		}
+
+		$languages = $this->parseLanguages($raw);
+		if ($languages === []) {
+			$languages = [self::DEFAULTS[self::LANGUAGE]];
+		}
+
+		$installed = $this->schemaService->getTextSearchConfigs();
+		if ($installed !== []) {
+			$valid = [];
+			$dropped = [];
+			foreach ($languages as $lang) {
+				if (in_array($lang, $installed, true)) {
+					$valid[] = $lang;
+				} else {
+					$dropped[] = $lang;
+				}
+			}
+			if ($dropped !== []) {
+				$this->logger?->warning('Configured language(s) not installed in PostgreSQL, dropping: ' . implode(', ', $dropped));
+			}
+			$languages = $valid !== [] ? $valid : ['simple'];
+		}
+
+		$this->lastRawLanguage = $raw;
+		$this->cachedLanguages = $languages;
+		return $this->cachedLanguages;
 	}
 
 	/**
@@ -198,7 +246,8 @@ class ConfigService {
 	}
 
 	public function getMaxResults(): int {
-		return max(1, $this->appConfig->getValueInt(Application::APP_ID, self::MAX_RESULTS, self::DEFAULTS[self::MAX_RESULTS]));
+		$value = $this->appConfig->getValueInt(Application::APP_ID, self::MAX_RESULTS, self::DEFAULTS[self::MAX_RESULTS]);
+		return max(1, min(10000, $value));
 	}
 
 	public function getMaxContentSize(): int {

@@ -1193,6 +1193,77 @@ try {
 	// Restore clean config
 	$appConfig->setValueString('fulltextsearch_pgsql', 'pdftotext_path', '');
 
+	section('validate settings when read & locale diagnostics (B4)');
+
+	// 1. Stored invalid language with valid fallback: klingon,english -> ['english']
+	$appConfig->setValueString('fulltextsearch_pgsql', 'language', 'klingon,english');
+	same(['english'], $config->getLanguages(), 'B4: stored klingon,english drops klingon and returns [english]');
+	same('english', $config->getLanguage(), 'B4: fallback language is english');
+
+	$docInvalidLang = doc('B4_LANG1', 'alice', 'Invalid Language Doc', 'content indexed with dropped klingon');
+	$platform->indexDocument($docInvalidLang);
+	$storedConfig1 = (string)$conn->executeQuery("SELECT config::text FROM ftspg_oc_index WHERE document_id = 'B4_LANG1'")->fetchOne();
+	same('english', $storedConfig1, 'B4: document indexed under english regconfig');
+	same(['B4_LANG1'], search($platform, 'alice', '"Invalid Language Doc"')['ids'], 'B4: document with dropped language is searchable');
+
+	// 2. Stored all-invalid language: klingon -> fallback to ['simple']
+	$appConfig->setValueString('fulltextsearch_pgsql', 'language', 'klingon');
+	same(['simple'], $config->getLanguages(), 'B4: stored klingon alone falls back to [simple]');
+	same('simple', $config->getLanguage(), 'B4: fallback language is simple when all configured are invalid');
+
+	$docSimpleLang = doc('B4_LANG2', 'alice', 'Simple Fallback Doc', 'content indexed under simple fallback config');
+	$platform->indexDocument($docSimpleLang);
+	$storedConfig2 = (string)$conn->executeQuery("SELECT config::text FROM ftspg_oc_index WHERE document_id = 'B4_LANG2'")->fetchOne();
+	same('simple', $storedConfig2, 'B4: document indexed under simple regconfig');
+	same(['B4_LANG2'], search($platform, 'alice', '"Simple Fallback Doc"')['ids'], 'B4: document with simple fallback is searchable');
+
+	// 3. Stored max_results clamped to [1, 10000]
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', 50000);
+	same(10000, $config->getMaxResults(), 'B4: stored max_results 50000 clamped to 10000');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', 0);
+	same(1, $config->getMaxResults(), 'B4: stored max_results 0 clamped to 1');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', -50);
+	same(1, $config->getMaxResults(), 'B4: stored max_results -50 clamped to 1');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', 500);
+	same(500, $config->getMaxResults(), 'B4: valid max_results 500 preserved');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', 100);
+
+	// 4. Database locale diagnostics (SELECT lower('Ç') = 'ç')
+	same(true, $schema->hasLocaleCaseFolding(), 'B4: PostgreSQL hasLocaleCaseFolding returns true for UTF-8 test DB');
+	$statusB4 = $statusService->getStatus();
+	same(true, $statusB4['locale_folding'] ?? null, 'B4: StatusService exposes locale_folding');
+	$platformConfig = $platform->getConfiguration();
+	same(true, $platformConfig['locale_folding'] ?? null, 'B4: PostgreSQLPlatform::getConfiguration exposes locale_folding');
+	same('ok', $platformConfig['database_locale'] ?? null, 'B4: PostgreSQLPlatform::getConfiguration exposes database_locale ok');
+
+	// Diagnostic reports disabled message when locale folding is false
+	$mockSchemaNoFolding = new class($conn, new ArrayConfig(['dbtableprefix' => 'oc_']), $logger) extends SchemaService {
+		public function hasLocaleCaseFolding(): bool {
+			return false;
+		}
+	};
+	$mockStatusNoFolding = new StatusService($mockSchemaNoFolding, $vocabulary, $extractor);
+	same(false, $mockStatusNoFolding->getStatus()['locale_folding'], 'B4: StatusService reports false when locale folding disabled');
+
+	$mockPlatformNoFolding = new PostgreSQLPlatform($config, $mockSchemaNoFolding, $indexService, $searchService, $logger, $extractor);
+	$mockPlatformConfig = $mockPlatformNoFolding->getConfiguration();
+	same(false, $mockPlatformConfig['locale_folding'], 'B4: Platform reports false locale_folding');
+	check(str_contains($mockPlatformConfig['database_locale'], 'disabled'), 'B4: Platform reports disabled message in database_locale');
+
+	// 5. Language changed precision (order-independent comparison for extras)
+	$config->setConfig(['language' => 'english,turkish,french']);
+	$changedSameExtrasDiffOrder = $config->setConfig(['language' => 'english,french,turkish']);
+	same(false, $changedSameExtrasDiffOrder, 'B4: reordering extra languages does not falsely mark languageChanged');
+
+	$changedNewExtras = $config->setConfig(['language' => 'english,turkish,german']);
+	same(true, $changedNewExtras, 'B4: changing extra languages set marks languageChanged');
+
+	$changedPrimary = $config->setConfig(['language' => 'turkish,english,german']);
+	same(true, $changedPrimary, 'B4: changing primary language marks languageChanged');
+
+	// Restore clean language config
+	$config->setConfig(['language' => 'english']);
+
 	section('partial updates');
 	$platform->indexDocument(doc('P1', 'alice', 'Shared later', 'secret content about narwhals'));
 	$meta = doc('P1', 'alice', 'Shared later', '', ['users' => ['bob']], 'files', IIndex::INDEX_META);

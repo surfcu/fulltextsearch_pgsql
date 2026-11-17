@@ -16,6 +16,7 @@
 		const unknown = tr('unknown')
 		const rows = [
 			[tr('Database'), status.postgres ? tr('PostgreSQL') : tr('Not PostgreSQL: this platform cannot work'), status.postgres],
+			[tr('Database locale'), status.locale_folding !== false ? tr('supports non-ASCII case folding') : tr('case folding and non-ASCII accent matching are disabled due to database locale (LC_CTYPE)'), status.locale_folding !== false],
 			[tr('Indexed documents'), status.documents === null ? unknown : String(status.documents), status.documents !== null],
 			[tr('Documents per language'), status.by_language && Object.keys(status.by_language).length
 				? Object.entries(status.by_language).map(([language, count]) => language + ' ' + count).join(' · ')
@@ -46,6 +47,7 @@
 	/**
 	 * The "language" setting is the main language followed by the ticked extra languages.
 	 * The main language is never offered as an extra, and at most data-max extras can be on.
+	 * Preserves the stored order of extra languages, appending newly checked languages.
 	 */
 	function syncLanguages(form) {
 		const primary = form.querySelector('[data-role="primary-language"]')
@@ -65,7 +67,19 @@
 		for (const box of boxes) {
 			box.disabled = box.value === primary.value || (!box.checked && checked.length >= max)
 		}
-		hidden.value = [primary.value, ...checked.map((box) => box.value)].join(',')
+
+		// Keep the stored order of extra languages, appending newly checked languages
+		const currentSelected = hidden.value.split(',').map((s) => s.trim()).filter(Boolean)
+		const currentExtras = currentSelected.slice(1)
+		const checkedValues = new Set(checked.map((box) => box.value))
+		const orderedExtras = currentExtras.filter((lang) => checkedValues.has(lang))
+		for (const box of checked) {
+			if (!orderedExtras.includes(box.value)) {
+				orderedExtras.push(box.value)
+			}
+		}
+
+		hidden.value = [primary.value, ...orderedExtras].join(',')
 	}
 
 	function collect(form) {

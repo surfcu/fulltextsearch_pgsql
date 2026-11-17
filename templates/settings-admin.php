@@ -16,7 +16,14 @@ $config = $_['config'];
 	</p>
 
 	<h3><?php p($l->t('Status')); ?></h3>
-	<ul class="ftspg-status" aria-live="polite"></ul>
+	<ul class="ftspg-status" aria-live="polite">
+		<?php if (isset($_['status']['locale_folding']) && $_['status']['locale_folding'] === false): ?>
+			<li class="ftspg-warn">
+				<span class="ftspg-status-label"><?php p($l->t('Database locale')); ?></span>
+				<span><?php p($l->t('case folding and non-ASCII accent matching are disabled due to database locale (LC_CTYPE)')); ?></span>
+			</li>
+		<?php endif; ?>
+	</ul>
 
 	<form class="ftspg-form">
 		<h3><?php p($l->t('Languages')); ?></h3>
