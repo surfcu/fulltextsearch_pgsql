@@ -45,14 +45,13 @@ jobs:
       - name: Install pdftotext, catdoc, xmllint and PostgreSQL client
         run: |
           sudo apt-get update
-          if [ "${{ matrix.postgres }}" = "17" ] || [ "${{ matrix.postgres }}" = "18" ]; then
+          sudo apt-get install -y poppler-utils catdoc libxml2-utils
+          if [ ! -x "/usr/lib/postgresql/${{ matrix.postgres }}/bin/pg_dump" ]; then
             sudo apt-get install -y postgresql-common ca-certificates curl
-            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-            sudo apt-get update
-            sudo apt-get install -y poppler-utils catdoc libxml2-utils postgresql-client-18
-          else
-            sudo apt-get install -y poppler-utils catdoc libxml2-utils postgresql-client-16
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -c "${{ matrix.postgres }}" -y
+            sudo apt-get install -y --no-upgrade -o Dpkg::Options::="--force-overwrite" "postgresql-client-${{ matrix.postgres }}"
           fi
+          echo "/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_PATH"
       - name: Select Nextcloud API version
         run: |
           composer require --dev --no-update "nextcloud/ocp:dev-stable${{ matrix.nextcloud }}"
@@ -112,18 +111,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y poppler-utils catdoc postgresql-common ca-certificates curl
+          sudo install -d /etc/postgresql-common/createcluster.d
           echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
-          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get update
-          sudo apt-get install -y postgresql-17 postgresql-18
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -c 17 -y
+          pkgs="postgresql-17"
+          if [ ! -x /usr/lib/postgresql/18/bin/pg_upgrade ]; then
+            pkgs="$pkgs postgresql-18"
+          fi
+          sudo apt-get install -y --no-upgrade -o Dpkg::Options::="--force-overwrite" $pkgs
       - name: Install Composer dependencies
         run: composer install --no-interaction --no-progress
       - name: Initialize PG 17 cluster, run suite, and verify pg_upgrade --check to PG 18
         run: |
-          sudo install -d -o postgres -g postgres /tmp/pg17 /tmp/pg18 /tmp/pg_upgrade_work
+          sudo install -d -o postgres -g postgres /var/run/postgresql /tmp/pg17 /tmp/pg18 /tmp/pg_upgrade_work
 
           sudo -u postgres /usr/lib/postgresql/17/bin/initdb \
-            -D /tmp/pg17 -U postgres --encoding=UTF8 --locale=C.UTF-8 --data-checksums --auth=trust
+            -D /tmp/pg17 -U postgres --encoding=UTF8 --locale-provider=libc --locale=C.UTF-8 --data-checksums --auth=trust
           sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl \
             -D /tmp/pg17 -l /tmp/pg17.log -o "-h 127.0.0.1 -p 55432 -k /tmp/pg17" start
           sudo -u postgres /usr/lib/postgresql/17/bin/createdb \
@@ -145,7 +148,7 @@ jobs:
 
           sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl -D /tmp/pg17 -m fast stop
           sudo -u postgres /usr/lib/postgresql/18/bin/initdb \
-            -D /tmp/pg18 -U postgres --encoding=UTF8 --locale=C.UTF-8 --data-checksums --auth=trust
+            -D /tmp/pg18 -U postgres --encoding=UTF8 --locale-provider=libc --locale=C.UTF-8 --data-checksums --auth=trust
 
           set -o pipefail
           sudo -u postgres bash -c '
@@ -158,6 +161,7 @@ jobs:
               --new-datadir=/tmp/pg18 \
               --old-port=55432 \
               --new-port=55432 \
+              --socketdir=/tmp/pg_upgrade_work \
               --username=postgres \
               --check
           ' | tee /tmp/pg_upgrade_check.log
