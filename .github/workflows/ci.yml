@@ -125,18 +125,18 @@ jobs:
           sudo -u postgres /usr/lib/postgresql/17/bin/initdb \
             -D /tmp/pg17 -U postgres --encoding=UTF8 --locale=C.UTF-8 --data-checksums --auth=trust
           sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl \
-            -D /tmp/pg17 -l /tmp/pg17.log -o "-h 127.0.0.1 -p 5432 -k /tmp/pg17" start
+            -D /tmp/pg17 -l /tmp/pg17.log -o "-h 127.0.0.1 -p 55432 -k /tmp/pg17" start
           sudo -u postgres /usr/lib/postgresql/17/bin/createdb \
-            -h 127.0.0.1 -p 5432 -U postgres fts_test
+            -h 127.0.0.1 -p 55432 -U postgres fts_test
 
           PATH="/usr/lib/postgresql/17/bin:$PATH" \
-            FTSPG_TEST_DSN='pgsql:host=127.0.0.1;port=5432;dbname=fts_test;user=postgres' \
+            FTSPG_TEST_DSN='pgsql:host=127.0.0.1;port=55432;dbname=fts_test;user=postgres' \
             composer test
 
-          index_rows=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 5432 -U postgres -d fts_test -tAc "SELECT count(*) FROM ftspg_oc_index")
-          words_rows=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 5432 -U postgres -d fts_test -tAc "SELECT count(*) FROM ftspg_oc_words")
-          marker=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 5432 -U postgres -d fts_test -tAc "SELECT col_description(to_regclass('ftspg_oc_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_oc_index') AND attname = 'tsv' AND NOT attisdropped")
-          fn_exists=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 5432 -U postgres -d fts_test -tAc "SELECT to_regprocedure('ftspg_oc_regconfig(text)') IS NOT NULL")
+          index_rows=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 55432 -U postgres -d fts_test -tAc "SELECT count(*) FROM ftspg_oc_index")
+          words_rows=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 55432 -U postgres -d fts_test -tAc "SELECT count(*) FROM ftspg_oc_words")
+          marker=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 55432 -U postgres -d fts_test -tAc "SELECT col_description(to_regclass('ftspg_oc_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_oc_index') AND attname = 'tsv' AND NOT attisdropped")
+          fn_exists=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 55432 -U postgres -d fts_test -tAc "SELECT to_regprocedure('ftspg_oc_regconfig(text)') IS NOT NULL")
           echo "Live PG 17 state: ftspg_oc_index=$index_rows, ftspg_oc_words=$words_rows, marker=$marker, fn=$fn_exists"
           test "$index_rows" -gt 0
           test "$words_rows" -gt 0
@@ -147,6 +147,7 @@ jobs:
           sudo -u postgres /usr/lib/postgresql/18/bin/initdb \
             -D /tmp/pg18 -U postgres --encoding=UTF8 --locale=C.UTF-8 --data-checksums --auth=trust
 
+          set -o pipefail
           sudo -u postgres bash -c '
             set -euo pipefail
             cd /tmp/pg_upgrade_work
@@ -155,6 +156,8 @@ jobs:
               --new-bindir=/usr/lib/postgresql/18/bin \
               --old-datadir=/tmp/pg17 \
               --new-datadir=/tmp/pg18 \
+              --old-port=55432 \
+              --new-port=55432 \
               --username=postgres \
               --check
           ' | tee /tmp/pg_upgrade_check.log
