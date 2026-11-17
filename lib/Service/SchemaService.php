@@ -17,14 +17,14 @@ use Throwable;
  *
  * The table is created with raw SQL and deliberately named so it does NOT start with
  * Nextcloud's table prefix. Nextcloud only introspects tables matching its prefix, and
- * Doctrine cannot map tsvector / text[] / regconfig columns: if this table carried the
+ * Doctrine cannot map tsvector / text[] columns: if this table carried the
  * prefix, every later migration of every app on the instance would fail with
  * "Unknown database type tsvector requested".
  */
 class SchemaService {
 
 	/** Version of the generated column definitions; bump when they change. */
-	private const SCHEMA_MARKER = 'ftspg schema 2';
+	private const SCHEMA_MARKER = 'ftspg schema 3';
 
 	private ?bool $trigram = null;
 	/** @var string[]|null */
@@ -57,6 +57,11 @@ class SchemaService {
 	 */
 	public function getWordsTableName(): string {
 		return substr($this->getTableName(), 0, -strlen('index')) . 'words';
+	}
+
+	/** IMMUTABLE PARALLEL SAFE SQL wrapper casting text config names to pg_catalog.regconfig. */
+	public function getRegconfigFunctionName(): string {
+		return substr($this->getTableName(), 0, -strlen('index')) . 'regconfig';
 	}
 
 	/** True when the table exists and its generated columns match this version of the app. */
@@ -109,10 +114,13 @@ class SchemaService {
 			if (!$this->isCurrent()) {
 				$this->dropLegacyTable();
 				$this->createIndexTable($t);
+				$this->ensureRegconfigFunction($this->getRegconfigFunctionName());
 				$this->ensureGeneratedColumns();
 				$this->ensureIndexTableIndexes($t);
 				$this->ensureWordsTable();
+				$this->db->executeStatement("ANALYZE $t");
 			} elseif (!$this->hasAllIndexesAndWords($t, $w)) {
+				$this->ensureRegconfigFunction($this->getRegconfigFunctionName());
 				$this->ensureIndexTableIndexes($t);
 				$this->ensureWordsTable();
 			}
@@ -141,23 +149,29 @@ class SchemaService {
 		}
 	}
 
+	private function ensureRegconfigFunction(string $fn): void {
+		$this->db->executeStatement(
+			"CREATE OR REPLACE FUNCTION {$fn}(text) RETURNS pg_catalog.regconfig LANGUAGE sql IMMUTABLE PARALLEL SAFE AS \$\$SELECT \$1::pg_catalog.regconfig\$\$"
+		);
+	}
+
 	private function createIndexTable(string $t): void {
 		$this->db->executeStatement(<<<SQL
 			CREATE TABLE IF NOT EXISTS $t (
 				id            bigserial    PRIMARY KEY,
-				provider_id   varchar(64)  NOT NULL,
-				document_id   varchar(254) NOT NULL,
-				owner_id      varchar(64)  NOT NULL DEFAULT '',
+				provider_id   text         NOT NULL,
+				document_id   text         NOT NULL,
+				owner_id      text         NOT NULL DEFAULT '',
 				access        text[]       NOT NULL DEFAULT '{}',
 				links         text[]       NOT NULL DEFAULT '{}',
 				tags          text[]       NOT NULL DEFAULT '{}',
 				metatags      text[]       NOT NULL DEFAULT '{}',
 				subtags       text[]       NOT NULL DEFAULT '{}',
-				source        varchar(64)  NOT NULL DEFAULT '',
-				hash          varchar(128) NOT NULL DEFAULT '',
+				source        text         NOT NULL DEFAULT '',
+				hash          text         NOT NULL DEFAULT '',
 				modified_time bigint       NOT NULL DEFAULT 0,
 				indexed_at    bigint       NOT NULL DEFAULT 0,
-				config        regconfig    NOT NULL,
+				config        text         NOT NULL,
 				title         text         NOT NULL DEFAULT '',
 				tags_text     text         NOT NULL DEFAULT '',
 				parts         jsonb        NOT NULL DEFAULT '{}',
@@ -196,8 +210,8 @@ class SchemaService {
 			$relations[] = "{$w}_folded_trgm_idx";
 		}
 		$result = $this->db->executeQuery(
-			'SELECT bool_and(to_regclass(name) IS NOT NULL) FROM unnest(CAST(? AS text[])) AS name',
-			[PgArray::toLiteral($relations)]
+			'SELECT bool_and(to_regclass(name) IS NOT NULL) AND to_regprocedure(?) IS NOT NULL FROM unnest(CAST(? AS text[])) AS name',
+			[$this->getRegconfigFunctionName() . '(text)', PgArray::toLiteral($relations)]
 		);
 		$allPresent = (bool)$result->fetchOne();
 		$result->closeCursor();
@@ -232,24 +246,49 @@ class SchemaService {
 			return;
 		}
 		$t = $this->getTableName();
+		$fn = $this->getRegconfigFunctionName();
+		$this->ensureRegconfigFunction($fn);
 
 		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_tsv_idx");
 		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_title_trgm_idx");
 		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_title_search_trgm_idx");
 		$this->db->executeStatement("ALTER TABLE $t DROP COLUMN IF EXISTS tsv, DROP COLUMN IF EXISTS title_search");
 
+		$columns = ['provider_id', 'document_id', 'owner_id', 'source', 'hash', 'config'];
+		$typeResult = $this->db->executeQuery(
+			'SELECT attname, format_type(atttypid, atttypmod) AS type'
+			. ' FROM pg_attribute'
+			. ' WHERE attrelid = to_regclass(?) AND attnum > 0 AND NOT attisdropped AND attname = ANY (CAST(? AS text[]))',
+			[$t, PgArray::toLiteral($columns)]
+		);
+		$currentTypes = [];
+		foreach ($typeResult->fetchAll() as $row) {
+			$currentTypes[(string)$row['attname']] = (string)$row['type'];
+		}
+		$typeResult->closeCursor();
+
+		$alterClauses = [];
+		foreach ($columns as $col) {
+			if (($currentTypes[$col] ?? '') !== 'text') {
+				$alterClauses[] = $col === 'config'
+					? 'ALTER COLUMN config TYPE text USING config::text'
+					: "ALTER COLUMN $col TYPE text";
+			}
+		}
+
 		$title = $this->normalized('title');
-		$this->db->executeStatement(<<<SQL
-			ALTER TABLE $t
+		$alterClauses[] = <<<SQL
 			ADD COLUMN tsv tsvector GENERATED ALWAYS AS (
-				setweight(to_tsvector(config, $title), 'A')
-				|| setweight(to_tsvector(config, {$this->splitWords($title)}), 'A')
-				|| setweight(to_tsvector(config, {$this->normalized('tags_text')}), 'B')
-				|| setweight(to_tsvector(config, {$this->normalized('parts_text')}), 'C')
-				|| setweight(to_tsvector(config, {$this->normalized('content')}), 'D')
-			) STORED,
-			ADD COLUMN title_search text GENERATED ALWAYS AS (lower($title)) STORED
-			SQL);
+				setweight(to_tsvector({$fn}(config), $title), 'A')
+				|| setweight(to_tsvector({$fn}(config), {$this->splitWords($title)}), 'A')
+				|| setweight(to_tsvector({$fn}(config), {$this->normalized('tags_text')}), 'B')
+				|| setweight(to_tsvector({$fn}(config), {$this->normalized('parts_text')}), 'C')
+				|| setweight(to_tsvector({$fn}(config), {$this->normalized('content')}), 'D')
+			) STORED
+			SQL;
+		$alterClauses[] = "ADD COLUMN title_search text GENERATED ALWAYS AS (lower($title)) STORED";
+
+		$this->db->executeStatement("ALTER TABLE $t\n" . implode(",\n", $alterClauses));
 		$this->db->executeStatement("COMMENT ON COLUMN $t.tsv IS '" . self::SCHEMA_MARKER . "'");
 	}
 
@@ -259,7 +298,7 @@ class SchemaService {
 	 * Map I->ı and İ->i first for Turkish rows; TsQueryBuilder does the same to search terms.
 	 */
 	public function normalized(string $column): string {
-		return "CASE WHEN config = 'turkish'::regconfig THEN translate($column, 'Iİ', 'ıi') ELSE $column END";
+		return "CASE WHEN config = 'turkish' THEN translate($column, 'Iİ', 'ıi') ELSE $column END";
 	}
 
 	/**
@@ -278,6 +317,7 @@ class SchemaService {
 	public function dropSchema(): void {
 		$this->db->executeStatement('DROP TABLE IF EXISTS ' . $this->getTableName());
 		$this->db->executeStatement('DROP TABLE IF EXISTS ' . $this->getWordsTableName());
+		$this->db->executeStatement('DROP FUNCTION IF EXISTS ' . $this->getRegconfigFunctionName() . '(text)');
 	}
 
 	/** Remove every indexed document and the vocabulary, keeping the tables. */
@@ -285,9 +325,9 @@ class SchemaService {
 		$this->db->executeStatement('TRUNCATE ' . $this->getTableName() . ', ' . $this->getWordsTableName());
 	}
 
-	/** @return array<string, int> language (regconfig) => documents indexed in it */
+	/** @return array<string, int> language => documents indexed in it */
 	public function countDocumentsByLanguage(): array {
-		$result = $this->db->executeQuery('SELECT config::text AS language, count(*) AS documents FROM ' . $this->getTableName() . ' GROUP BY config ORDER BY count(*) DESC');
+		$result = $this->db->executeQuery('SELECT config AS language, count(*) AS documents FROM ' . $this->getTableName() . ' GROUP BY config ORDER BY count(*) DESC');
 		$counts = [];
 		foreach ($result->fetchAll() as $row) {
 			$counts[(string)$row['language']] = (int)$row['documents'];

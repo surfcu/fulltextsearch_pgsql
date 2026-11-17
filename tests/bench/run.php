@@ -216,7 +216,7 @@ if ($forceGenerate || $currentDocs < $targetDocs) {
 			$ownerId = 'bench_user';
 			$access = '{u:__all,u:bench_user}';
 
-			$placeholders[] = "(?, ?, ?, ?::text[], 'english'::regconfig, ?, ?)";
+			$placeholders[] = "(?, ?, ?, ?::text[], 'english', ?, ?)";
 			array_push($params, $providerId, $documentId, $ownerId, $access, $title, $content);
 			$docId++;
 		}
@@ -282,7 +282,7 @@ function ensureExtraDocs(
 			$params = [];
 			for ($i = 0; $i < $currentBatchSize; $i++) {
 				$content = ($docNum === 1 ? 'privatetokem ' : '') . $privContent;
-				$placeholders[] = "(?, ?, ?, ?::text[], 'english'::regconfig, ?, ?)";
+				$placeholders[] = "(?, ?, ?, ?::text[], 'english', ?, ?)";
 				array_push($params, 'files', "bench_priv_$docNum", 'other_user', '{u:other_user}', "Private $docNum", $content);
 				$docNum++;
 			}
@@ -315,7 +315,7 @@ function ensureExtraDocs(
 				for ($w = 0; $w < 160000; $w++) {
 					$words[] = ($w === 120000) ? 'excerptneedle' : $fillerPool[$a4Prng->nextInt() & 255];
 				}
-				$placeholders[] = "(?, ?, ?, ?::text[], 'english'::regconfig, ?, ?)";
+				$placeholders[] = "(?, ?, ?, ?::text[], 'english', ?, ?)";
 				array_push($params, 'bench_a4', "bench_a4_$docNum", 'bench_user', '{u:__all,u:bench_user}', "Excerpt Benchmark Document $docNum", implode(' ', $words));
 				$docNum++;
 			}

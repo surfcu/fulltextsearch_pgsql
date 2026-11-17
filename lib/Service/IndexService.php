@@ -343,7 +343,7 @@ class IndexService {
 				title, tags_text, parts, parts_text, content, info
 			) VALUES (
 				?, ?, ?, CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]),
-				?, ?, ?, ?, CAST(? AS regconfig),
+				?, ?, ?, ?, ?,
 				?, ?, CAST(? AS jsonb), ?, ?, CAST(? AS jsonb)
 			)
 			ON CONFLICT (provider_id, document_id) DO UPDATE SET
