@@ -214,7 +214,7 @@ if ($forceGenerate || $currentDocs < $targetDocs) {
 			$providerId = 'files';
 			$documentId = "bench_$docId";
 			$ownerId = 'bench_user';
-			$access = '{__all,bench_user}';
+			$access = '{u:__all,u:bench_user}';
 
 			$placeholders[] = "(?, ?, ?, ?::text[], 'english'::regconfig, ?, ?)";
 			array_push($params, $providerId, $documentId, $ownerId, $access, $title, $content);
