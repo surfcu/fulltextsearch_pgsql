@@ -486,6 +486,60 @@ try {
 		same(false, $qb->build($constrainedQuery, 'english')?->plainWordsOnly, "A2 unit: plainWordsOnly is false for '$constrainedQuery'");
 	}
 
+	section('stopwords in multi-word searches (A5)');
+	$platform->indexDocument(doc('A5_BOTH', 'alice', 'Summary', 'The quarterly budget for 2025 is ready.', [], 'a5'));
+	$platform->indexDocument(doc('A5_BUDGET_ONLY', 'alice', 'Budget notes', 'budget budget budget budget budget', [], 'a5'));
+	$platform->indexDocument(doc('A5_2025_ONLY', 'alice', 'Year review', 'Overview for 2025.', [], 'a5'));
+	$platform->indexDocument(doc('A5_TO_BE', 'alice', 'Notes', 'Notes about to be reviewed.', [], 'a5'));
+	$platform->indexDocument(doc('A5_STOP_ONLY', 'alice', 'The of and', 'for to be', [], 'a5'));
+	$platform->indexDocument(doc('A5_UNRELATED', 'alice', 'Recipes', 'Simple soup recipe with carrots.', [], 'a5'));
+	$a5 = ['provider' => 'a5'];
+	$a5Rank = search($platform, 'alice', 'budget for 2025', $a5);
+	same('A5_BOTH', $a5Rank['ids'][0] ?? '', 'A5: budget for 2025 ranks the document containing both non-stopword terms first');
+	same(['A5_2025_ONLY', 'A5_BOTH', 'A5_BUDGET_ONLY'], sorted($a5Rank['ids']), 'A5: budget for 2025 returns partial matches after full match');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+the +budget', $a5)['ids']), 'A5: +the +budget ignores required stopword');
+	same(['A5_BOTH'], search($platform, 'alice', '+budget +for +2025', $a5)['ids'], 'A5: +budget +for +2025 finds document matching all non-stopword terms');
+	$a5AllStop = search($platform, 'alice', '+the +of', $a5);
+	same([], $a5AllStop['ids'], 'A5: +the +of returns nothing');
+	same(0, $a5AllStop['total'], 'A5: +the +of has total 0');
+	$a5StopPhrase = search($platform, 'alice', '+"to be"', $a5);
+	same([], $a5StopPhrase['ids'], 'A5: +"to be" returns nothing');
+	same(0, $a5StopPhrase['total'], 'A5: +"to be" has total 0');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+"to be" +budget', $a5)['ids']), 'A5: +"to be" +budget ignores stopword phrase');
+	$a5PhraseOpt = search($platform, 'alice', '"to be" budget 2025', $a5);
+	same('A5_BOTH', $a5PhraseOpt['ids'][0] ?? '', 'A5: "to be" budget 2025 ranks document with both content words first');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+the budget', $a5)['ids']), 'A5: +the budget falls back to optional content word');
+	same(['A5_BOTH'], search($platform, 'alice', '"budget for 2025"', $a5)['ids'], 'A5: "budget for 2025" matches phrase containing stopword');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+the +budget', $a5 + ['limit' => ['content']])['ids']), 'A5: +the +budget limited to content');
+	same(['A5_BUDGET_ONLY'], search($platform, 'alice', '+the +budget', $a5 + ['limit' => ['title']])['ids'], 'A5: +the +budget limited to title');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+"to be" +budget', $a5 + ['limit' => ['content']])['ids']), 'A5: +"to be" +budget limited to content');
+	same([], search($platform, 'alice', '+"to be" +summary', $a5 + ['limit' => ['content']])['ids'], 'A5: +"to be" +summary limited to content excludes title-only hit');
+
+	// Accented homographs of stopwords (e.g. "thé" -> "the", "çan" -> "can") must not
+	// turn stopwords into required non-stopword terms when typo_correction is enabled.
+	$platform->indexDocument(doc('A5_ACCENT', 'bob', 'Cafe', 'Freshly brewed thé and çan.', [], 'a5'));
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+the +budget', $a5)['ids']), 'A5: +the +budget ignores stopword with accented homograph in vocabulary');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+can +budget', $a5)['ids']), 'A5: +can +budget ignores stopword with accented homograph in vocabulary');
+	same([], search($platform, 'alice', '+the +of', $a5)['ids'], 'A5: +the +of returns nothing with accented homograph in vocabulary');
+	$a5AccentOpt = search($platform, 'alice', 'budget +the 2025', $a5);
+	same('A5_BOTH', $a5AccentOpt['ids'][0] ?? '', 'A5: budget +the 2025 ranks A5_BOTH first with accented homograph in vocabulary');
+	same(['A5_2025_ONLY', 'A5_BOTH', 'A5_BUDGET_ONLY'], sorted($a5AccentOpt['ids']), 'A5: budget +the 2025 returns expected matches with accented homograph in vocabulary');
+	$a5AccentReq = search($platform, 'alice', '+budget +the 2025', $a5);
+	same('A5_BOTH', $a5AccentReq['ids'][0] ?? '', 'A5: +budget +the 2025 ranks A5_BOTH first with accented homograph in vocabulary');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted($a5AccentReq['ids']), 'A5: +budget +the 2025 returns expected matches with accented homograph in vocabulary');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+"to be" +budget', $a5)['ids']), 'A5: +"to be" +budget works with accented homograph in vocabulary');
+	same(['A5_ACCENT'], search($platform, 'bob', 'thé', $a5)['ids'], 'A5: literal accented word matching stopword still matches itself');
+	same(['A5_ACCENT'], search($platform, 'bob', 'çan', $a5)['ids'], 'A5: literal accented word çan still matches itself');
+
+	$platform->resetIndex('a5');
+	$config->setConfig(['language' => 'turkish,english']);
+	$platform->indexDocument(doc('A5_EN', 'alice', 'English report', 'The budget for the year was approved by the board and they are all in the office.', [], 'a5'));
+	$platform->indexDocument(doc('A5_TR', 'alice', 'Türkçe rapor', 'Bu yıl için bütçe ve budget verileri ile tüm raporlar burada.', [], 'a5'));
+	same(['A5_EN'], search($platform, 'alice', '+the +budget', $a5)['ids'], 'A5 multi-language: +the +budget skips English stopword in English branch');
+	same(['A5_TR'], search($platform, 'alice', '+ve +budget', $a5)['ids'], 'A5 multi-language: +ve +budget skips Turkish stopword in Turkish branch');
+	$config->setConfig(['language' => 'english']);
+	$platform->resetIndex('a5');
+
 	section('filters and paging');
 	$platform->indexDocument(doc('F1', 'alice', 'Invoice one', 'invoice', ['metatags' => ['pdf'], 'subtags' => ['files' => 'local'], 'mtime' => 1000]));
 	$platform->indexDocument(doc('F2', 'alice', 'Invoice two', 'invoice', ['metatags' => ['doc'], 'subtags' => ['files' => 'external'], 'mtime' => 2000]));
@@ -1799,6 +1853,32 @@ try {
 	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'the search uses the GIN index, not a scan of every visible row');
 	$plan = $planOf('SELECT (SELECT count(*)');
 	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'so do the IDF frequency counts');
+
+	$conn->log = [];
+	$a5Plan1 = search($platform, 'alice', '+the +lantern', ['provider' => 'plan']);
+	same(400, $a5Plan1['total'], 'A5 planner: +the +lantern finds all 400 lantern docs');
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'A5 planner: +the +lantern uses the GIN index');
+
+	$conn->log = [];
+	$a5Plan2 = search($platform, 'alice', 'lantern for meadow', ['provider' => 'plan']);
+	same(677, $a5Plan2['total'], 'A5 planner: lantern for meadow finds all 677 docs');
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'A5 planner: lantern for meadow uses the GIN index');
+
+	$conn->log = [];
+	$a5Plan3 = search($platform, 'alice', '+lantern +for +meadow', ['provider' => 'plan']);
+	same(30, $a5Plan3['total'], 'A5 planner: +lantern +for +meadow finds all 30 docs with both words');
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'A5 planner: +lantern +for +meadow uses the GIN index');
+
+	$conn->executeStatement("INSERT INTO ftspg_oc_words (word) VALUES ('thé') ON CONFLICT (word) DO NOTHING");
+	$conn->log = [];
+	$a5Plan4 = search($platform, 'alice', '+the +lantern', ['provider' => 'plan']);
+	same(400, $a5Plan4['total'], 'A5 planner: +the +lantern finds all 400 lantern docs with accented stopword homograph in vocabulary');
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'A5 planner: +the +lantern uses the GIN index with accented stopword homograph in vocabulary');
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word = 'thé'");
 	same(['on', '4', 'on'], array_values($conn->executeQuery("SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit')")->fetch(PDO::FETCH_NUM)), 'the settings only applied to the search');
 	same(false, $conn->inTransaction(), 'and its transaction is closed');
 	$conn->beginTransaction();
