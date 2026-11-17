@@ -16,6 +16,7 @@ use OC\FullTextSearch\Model\DocumentAccess;
 use OC\FullTextSearch\Model\IndexDocument;
 use OCA\FullTextSearch_PgSql\Controller\SettingsController;
 use OCA\FullTextSearch_PgSql\Migration\CreateIndexTable;
+use OCA\FullTextSearch_PgSql\Migration\DropIndexTable;
 use OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform;
 use OCA\FullTextSearch_PgSql\Service\ConfigService;
 use OCA\FullTextSearch_PgSql\Service\ContentExtractor;
@@ -169,8 +170,20 @@ function sorted(array $a): array {
 // ---------------------------------------------------------------- tests
 try {
 	section('schema');
-	$conn->executeStatement('DROP TABLE IF EXISTS ftspg_oc_index');
+	$conn->executeStatement('DROP TABLE IF EXISTS ftspg_oc_index, ftspg_oc_words');
 	$conn->executeStatement('DROP TABLE IF EXISTS oc_fts_pgsql_index');
+	same(false, $schema->tableExists(), 'index table missing before loadPlatform');
+	$platform->loadPlatform();
+	same(true, $schema->tableExists(), 'loadPlatform creates missing index table');
+	same(true, $schema->isCurrent(), 'loadPlatform creates current schema when table is missing');
+	$conn->statements = [];
+	$platform->loadPlatform();
+	$loadDdl = array_values(array_filter(
+		$conn->statements,
+		static fn (string $sql): bool => preg_match('/\b(CREATE TABLE|ALTER TABLE|CREATE INDEX|COMMENT ON)\b/i', $sql) === 1
+	));
+	same([], $loadDdl, 'loadPlatform issues no DDL when schema is already current');
+	$conn->executeStatement('DROP TABLE IF EXISTS ftspg_oc_index, ftspg_oc_words');
 	$conn->executeStatement('CREATE TABLE oc_fts_pgsql_index (id int, content_tsv tsvector)');
 	same(true, $platform->testPlatform(), 'testPlatform creates the schema and succeeds');
 	same('ftspg_oc_index', $schema->getTableName(), 'table name does not start with the Nextcloud prefix');
@@ -252,6 +265,22 @@ try {
 	same([], search($platform, 'alice', "+foo\0bar")['ids'], 'NUL byte inside required unmatched word does not throw 42601');
 	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "budget -foo\0bar")['ids']), 'NUL byte inside excluded word does not throw 42601');
 	same(['Q1'], search($platform, 'alice', "\"bud\0get review\"")['ids'], 'NUL byte inside phrase is stripped');
+	same([], search($platform, 'alice', "foo\x01bar")['ids'], 'A4: C0 control char inside unmatched search word does not throw');
+	same([], search($platform, 'alice', "foo\x7fbar")['ids'], 'A4: DEL control char inside unmatched search word does not throw');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "bud\x07get")['ids']), 'A4: BEL control char inside search word is stripped');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "\"bud\x07get\"")['ids']), 'A4: BEL control char inside single-word phrase is stripped');
+	same(['Q1'], search($platform, 'alice', "\"bud\x07get review\"")['ids'], 'A4: BEL control char inside multi-word phrase is stripped');
+	$qbCtrl = new TsQueryBuilder();
+	same(['foobar'], $qbCtrl->searchWords("foo\0bar", 'english'), 'A4: tokenize strips NUL inside word');
+	same(['foobar'], $qbCtrl->searchWords("foo\x01bar", 'english'), 'A4: tokenize strips C0 control char inside word');
+	same(['foobar'], $qbCtrl->searchWords("foo\x7fbar", 'english'), 'A4: tokenize strips DEL control char inside word');
+	same(['budget'], $qbCtrl->searchWords("bud\x07get", 'english'), 'A4: tokenize strips BEL inside word');
+	same(['foo', 'bar'], $qbCtrl->searchWords("foo\tbar", 'english'), 'A4: tab still separates tokens');
+	same(['foo', 'bar'], $qbCtrl->searchWords("foo\nbar", 'english'), 'A4: newline still separates tokens');
+	same(['foo', 'bar'], $qbCtrl->searchWords("foo\rbar", 'english'), 'A4: carriage return still separates tokens');
+	same(['Q1', 'Q3'], search($platform, 'alice', "budget\treview")['ids'], 'A4: tab-separated search matches both words');
+	same(['Q1', 'Q3'], search($platform, 'alice', "budget\nreview")['ids'], 'A4: newline-separated search matches both words');
+	same(['Q1', 'Q3'], search($platform, 'alice', "budget\rreview")['ids'], 'A4: CR-separated search matches both words');
 	same(['Q1', 'Q3'], search($platform, 'alice', '(budget), review!')['ids'], 'edge punctuation ignored; doc with both words first');
 	same(['Q1'], search($platform, 'alice', '+budget +review')['ids'], '+ makes words required');
 	same(['Q1'], search($platform, 'alice', '+budg +revi')['ids'], 'required words still match as prefixes');
@@ -452,6 +481,94 @@ try {
 	same([], search($platform, 'alice', 'markting plann')['ids'], 'fallback disabled by use_trigram=false');
 	$config->setConfig(['use_trigram' => true]);
 
+	section('title fallback respects exclusions, required terms and phrases (A2)');
+	$platform->indexDocument(doc('A2_DRAFT', 'alice', 'budgets_draft.txt', '', [], 'a2'));
+	$platform->indexDocument(doc('A2_PLAN', 'alice', 'marketing_plan.txt', '', [], 'a2'));
+	$a2 = ['provider' => 'a2'];
+	same(['A2_DRAFT'], search($platform, 'alice', 'budget', $a2)['ids'], 'A2 baseline: plain word finds document');
+	same([], search($platform, 'alice', 'budget -draft', $a2)['ids'], 'A2: title fallback suppressed when exclusion is present');
+	same([], search($platform, 'alice', '+budget -draft', $a2)['ids'], 'A2: title fallback suppressed when required and excluded terms are present');
+	same([], search($platform, 'alice', '"draft budgets"', $a2)['ids'], 'A2: title fallback suppressed for phrase query');
+	$config->setConfig(['typo_correction' => false]);
+	same([], search($platform, 'alice', '+budgt +draft', $a2)['ids'], 'A2: title fallback suppressed when required terms (+) are present');
+	same([], search($platform, 'alice', '+"draft budgets"', $a2)['ids'], 'A2: title fallback suppressed for required phrase query');
+	same(['A2_PLAN'], search($platform, 'alice', 'markting OR plann', $a2)['ids'], 'A2: plain-word fallback works with OR');
+	same(['A2_PLAN'], search($platform, 'alice', 'markting AND plann', $a2)['ids'], 'A2: plain-word fallback works with AND');
+	$config->setConfig(['typo_correction' => true]);
+	$platform->resetIndex('a2');
+
+	$qb = new TsQueryBuilder();
+	foreach (['budget', 'markting OR plann', 'markting AND plann', 'e-mail', 'budget -'] as $plainQuery) {
+		same(true, $qb->build($plainQuery, 'english')?->plainWordsOnly, "A2 unit: plainWordsOnly is true for '$plainQuery'");
+	}
+	foreach ([
+		'budget -draft',
+		'+budget -draft',
+		'+budget',
+		'"budgets draft"',
+		'+"draft budgets"',
+		'budget -"draft"',
+		'budget -OR',
+		'budget +AND',
+		'budget "OR"',
+	] as $constrainedQuery) {
+		same(false, $qb->build($constrainedQuery, 'english')?->plainWordsOnly, "A2 unit: plainWordsOnly is false for '$constrainedQuery'");
+	}
+
+	section('stopwords in multi-word searches (A5)');
+	$platform->indexDocument(doc('A5_BOTH', 'alice', 'Summary', 'The quarterly budget for 2025 is ready.', [], 'a5'));
+	$platform->indexDocument(doc('A5_BUDGET_ONLY', 'alice', 'Budget notes', 'budget budget budget budget budget', [], 'a5'));
+	$platform->indexDocument(doc('A5_2025_ONLY', 'alice', 'Year review', 'Overview for 2025.', [], 'a5'));
+	$platform->indexDocument(doc('A5_TO_BE', 'alice', 'Notes', 'Notes about to be reviewed.', [], 'a5'));
+	$platform->indexDocument(doc('A5_STOP_ONLY', 'alice', 'The of and', 'for to be', [], 'a5'));
+	$platform->indexDocument(doc('A5_UNRELATED', 'alice', 'Recipes', 'Simple soup recipe with carrots.', [], 'a5'));
+	$a5 = ['provider' => 'a5'];
+	$a5Rank = search($platform, 'alice', 'budget for 2025', $a5);
+	same('A5_BOTH', $a5Rank['ids'][0] ?? '', 'A5: budget for 2025 ranks the document containing both non-stopword terms first');
+	same(['A5_2025_ONLY', 'A5_BOTH', 'A5_BUDGET_ONLY'], sorted($a5Rank['ids']), 'A5: budget for 2025 returns partial matches after full match');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+the +budget', $a5)['ids']), 'A5: +the +budget ignores required stopword');
+	same(['A5_BOTH'], search($platform, 'alice', '+budget +for +2025', $a5)['ids'], 'A5: +budget +for +2025 finds document matching all non-stopword terms');
+	$a5AllStop = search($platform, 'alice', '+the +of', $a5);
+	same([], $a5AllStop['ids'], 'A5: +the +of returns nothing');
+	same(0, $a5AllStop['total'], 'A5: +the +of has total 0');
+	$a5StopPhrase = search($platform, 'alice', '+"to be"', $a5);
+	same([], $a5StopPhrase['ids'], 'A5: +"to be" returns nothing');
+	same(0, $a5StopPhrase['total'], 'A5: +"to be" has total 0');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+"to be" +budget', $a5)['ids']), 'A5: +"to be" +budget ignores stopword phrase');
+	$a5PhraseOpt = search($platform, 'alice', '"to be" budget 2025', $a5);
+	same('A5_BOTH', $a5PhraseOpt['ids'][0] ?? '', 'A5: "to be" budget 2025 ranks document with both content words first');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+the budget', $a5)['ids']), 'A5: +the budget falls back to optional content word');
+	same(['A5_BOTH'], search($platform, 'alice', '"budget for 2025"', $a5)['ids'], 'A5: "budget for 2025" matches phrase containing stopword');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+the +budget', $a5 + ['limit' => ['content']])['ids']), 'A5: +the +budget limited to content');
+	same(['A5_BUDGET_ONLY'], search($platform, 'alice', '+the +budget', $a5 + ['limit' => ['title']])['ids'], 'A5: +the +budget limited to title');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+"to be" +budget', $a5 + ['limit' => ['content']])['ids']), 'A5: +"to be" +budget limited to content');
+	same([], search($platform, 'alice', '+"to be" +summary', $a5 + ['limit' => ['content']])['ids'], 'A5: +"to be" +summary limited to content excludes title-only hit');
+
+	// Accented homographs of stopwords (e.g. "thé" -> "the", "çan" -> "can") must not
+	// turn stopwords into required non-stopword terms when typo_correction is enabled.
+	$platform->indexDocument(doc('A5_ACCENT', 'bob', 'Cafe', 'Freshly brewed thé and çan.', [], 'a5'));
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+the +budget', $a5)['ids']), 'A5: +the +budget ignores stopword with accented homograph in vocabulary');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+can +budget', $a5)['ids']), 'A5: +can +budget ignores stopword with accented homograph in vocabulary');
+	same([], search($platform, 'alice', '+the +of', $a5)['ids'], 'A5: +the +of returns nothing with accented homograph in vocabulary');
+	$a5AccentOpt = search($platform, 'alice', 'budget +the 2025', $a5);
+	same('A5_BOTH', $a5AccentOpt['ids'][0] ?? '', 'A5: budget +the 2025 ranks A5_BOTH first with accented homograph in vocabulary');
+	same(['A5_2025_ONLY', 'A5_BOTH', 'A5_BUDGET_ONLY'], sorted($a5AccentOpt['ids']), 'A5: budget +the 2025 returns expected matches with accented homograph in vocabulary');
+	$a5AccentReq = search($platform, 'alice', '+budget +the 2025', $a5);
+	same('A5_BOTH', $a5AccentReq['ids'][0] ?? '', 'A5: +budget +the 2025 ranks A5_BOTH first with accented homograph in vocabulary');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted($a5AccentReq['ids']), 'A5: +budget +the 2025 returns expected matches with accented homograph in vocabulary');
+	same(['A5_BOTH', 'A5_BUDGET_ONLY'], sorted(search($platform, 'alice', '+"to be" +budget', $a5)['ids']), 'A5: +"to be" +budget works with accented homograph in vocabulary');
+	same(['A5_ACCENT'], search($platform, 'bob', 'thé', $a5)['ids'], 'A5: literal accented word matching stopword still matches itself');
+	same(['A5_ACCENT'], search($platform, 'bob', 'çan', $a5)['ids'], 'A5: literal accented word çan still matches itself');
+
+	$platform->resetIndex('a5');
+	$config->setConfig(['language' => 'turkish,english']);
+	$platform->indexDocument(doc('A5_EN', 'alice', 'English report', 'The budget for the year was approved by the board and they are all in the office.', [], 'a5'));
+	$platform->indexDocument(doc('A5_TR', 'alice', 'Türkçe rapor', 'Bu yıl için bütçe ve budget verileri ile tüm raporlar burada.', [], 'a5'));
+	same(['A5_EN'], search($platform, 'alice', '+the +budget', $a5)['ids'], 'A5 multi-language: +the +budget skips English stopword in English branch');
+	same(['A5_TR'], search($platform, 'alice', '+ve +budget', $a5)['ids'], 'A5 multi-language: +ve +budget skips Turkish stopword in Turkish branch');
+	$config->setConfig(['language' => 'english']);
+	$platform->resetIndex('a5');
+
 	section('filters and paging');
 	$platform->indexDocument(doc('F1', 'alice', 'Invoice one', 'invoice', ['metatags' => ['pdf'], 'subtags' => ['files' => 'local'], 'mtime' => 1000]));
 	$platform->indexDocument(doc('F2', 'alice', 'Invoice two', 'invoice', ['metatags' => ['doc'], 'subtags' => ['files' => 'external'], 'mtime' => 2000]));
@@ -617,6 +734,24 @@ try {
 	$excerpt = (string)(search($platform, 'alice', 'ışık', ['provider' => 'exc'])['docs'][0]?->getExcerpts()[0]['excerpt'] ?? '');
 	check(str_contains($excerpt, 'İSTANBUL ofisinde IŞIK sorunu'), 'Turkish uppercase words are shown as written in excerpts: ' . $excerpt);
 	$config->setConfig(['language' => 'english']);
+	$platform->indexDocument(doc('X_PART_SHORT', 'alice', 'Short note', 'Daily meeting summary without the keyword.', ['parts' => ['comments' => 'Please review the platypus attachment before Friday.']], 'exc'));
+	$rPartShort = search($platform, 'alice', 'platypus', ['provider' => 'exc']);
+	same(['X_PART_SHORT'], $rPartShort['ids'], 'A4: comment match on doc with short content is found');
+	$partShortExcerpt = implode(' … ', array_column($rPartShort['docs'][0]?->getExcerpts() ?? [], 'excerpt'));
+	check(str_contains($partShortExcerpt, 'platypus attachment'), 'A4: excerpt shows matching comment when short content is present: ' . $partShortExcerpt);
+
+	$platform->indexDocument(doc('X_PART_LONG', 'alice', 'Long report', $filler . 'Closing remarks without the keyword.', ['parts' => ['comments' => 'Confirmed capybara figures in appendix three.']], 'exc'));
+	$rPartLong = search($platform, 'alice', 'capybara', ['provider' => 'exc']);
+	same(['X_PART_LONG'], $rPartLong['ids'], 'A4: comment match on doc with >10 KB content is found');
+	$partLongExcerpt = implode(' … ', array_column($rPartLong['docs'][0]?->getExcerpts() ?? [], 'excerpt'));
+	check(str_contains($partLongExcerpt, 'capybara figures'), 'A4: excerpt shows matching comment after >10 KB content: ' . $partLongExcerpt);
+
+	$platform->indexDocument(doc('X_PART_BOUNDARY', 'alice', 'Boundary report', $filler . 'tailword', ['parts' => ['comments' => 'quokka confirmed in final review.']], 'exc'));
+	$rPartBoundary = search($platform, 'alice', 'quokka', ['provider' => 'exc']);
+	same(['X_PART_BOUNDARY'], $rPartBoundary['ids'], 'A4: boundary comment match on doc with >10 KB content without trailing space is found');
+	$partBoundaryExcerpt = implode(' … ', array_column($rPartBoundary['docs'][0]?->getExcerpts() ?? [], 'excerpt'));
+	check(str_contains($partBoundaryExcerpt, 'quokka confirmed'), 'A4: excerpt shows first word of parts_text after >10 KB content without trailing space: ' . $partBoundaryExcerpt);
+
 	$platform->resetIndex('exc');
 
 	section('content extraction');
@@ -1516,7 +1651,7 @@ try {
 	same('Z1', search($platform, 'alice', 'the report zanzibar', ['provider' => 'idf'])['ids'][0] ?? null, 'a stopword among the terms gets no weight');
 	same('Z1', search($platform, 'alice', 'report zanzibar qqxyzzy', ['provider' => 'idf'])['ids'][0] ?? null, 'a word no document contains gets no weight');
 	same('Z1', search($platform, 'alice', 'report "booked to zanzibar"', ['provider' => 'idf'])['ids'][0] ?? null, 'phrases are weighted like words');
-	same('Z1', search($platform, 'alice', 'report zanzibr', ['provider' => 'idf'])['ids'][0] ?? null, 'typo corrections count towards the term they correct');
+	same('Z1', search($platform, 'alice', 'report zanzibr', ['provider' => 'idf', 'size' => 50])['ids'][0] ?? null, 'typo corrections count towards the term they correct');
 	$many = search($platform, 'alice', 'report zanzibar a1 b2 c3 d4 e5 f6 g7', ['provider' => 'idf']);
 	same(31, $many['total'], 'more than 8 terms falls back to one combined rank');
 	$platform->resetIndex('idf');
@@ -1624,6 +1759,168 @@ try {
 	same(['V3'], $ids('calisma'), 'accent variants off too');
 	$config->setConfig(['typo_correction' => true]);
 
+	section('viewer-scoped typo correction (A3)');
+	$a3 = ['provider' => 'a3'];
+	$a3Qb = new TsQueryBuilder();
+	[$emptyTsSql, $emptyTsParams] = $a3Qb->wordTsQuery('', 'english');
+	same(0, (int)$conn->executeQuery("SELECT numnode($emptyTsSql)", $emptyTsParams)->fetchOne(), 'A3: wordTsQuery empty string has numnode 0');
+	[$punctTsSql, $punctTsParams] = $a3Qb->wordTsQuery('---', 'english');
+	same(0, (int)$conn->executeQuery("SELECT numnode($punctTsSql)", $punctTsParams)->fetchOne(), 'A3: wordTsQuery punctuation-only has numnode 0');
+	[$trTsSql, $trTsParams] = $a3Qb->wordTsQuery('İZMİR', 'turkish');
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['turkish', "'iZMiR':*"]], [$trTsSql, $trTsParams], 'A3: wordTsQuery maps Turkish İ -> i');
+	same("'izmir':*", (string)$conn->executeQuery("SELECT ($trTsSql)::text", $trTsParams)->fetchOne(), 'A3: wordTsQuery Turkish İ compiles cleanly in PostgreSQL');
+	[$trDotlessSql, $trDotlessParams] = $a3Qb->wordTsQuery('ISIK', 'turkish');
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['turkish', "'ıSıK':*"]], [$trDotlessSql, $trDotlessParams], 'A3: wordTsQuery maps Turkish I -> ı');
+	same("'ısık':*", (string)$conn->executeQuery("SELECT ($trDotlessSql)::text", $trDotlessParams)->fetchOne(), 'A3: wordTsQuery Turkish I compiles cleanly in PostgreSQL');
+	[$wTsSql, $wTsParams] = $a3Qb->wordTsQuery('budget', 'english', 'A');
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['english', "'budget':*A"]], [$wTsSql, $wTsParams], 'A3: wordTsQuery applies optional weight labels');
+	[$simpleExactSql, $simpleExactParams] = $a3Qb->wordTsQuery('receive', 'simple', null, false);
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['simple', "'receive'"]], [$simpleExactSql, $simpleExactParams], 'A3: wordTsQuery simple exact omits prefix wildcard');
+	[$simplePrefixSql, $simplePrefixParams] = $a3Qb->wordTsQuery('receive', 'simple', null, true);
+	same(['to_tsquery(CAST(? AS regconfig), ?)', ['simple', "'receive':*"]], [$simplePrefixSql, $simplePrefixParams], 'A3: wordTsQuery simple prefix keeps :*');
+
+	$platform->indexDocument(doc('A3_B_RECV', 'bob', 'Parcel', 'We will receive the parcel tomorrow.', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_ACC', 'bob', 'Rapor', 'Yeni çözümleme raporu hazırlandı.', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_SPELL_ALPHA', 'bob', 'Protocol', 'Secret kryptonw protocol.', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_SPELL_DIST', 'bob', 'Blueprint', 'Secret zephyrkl blueprint.', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_STOP_DECOYS', 'bob', 'Decoys', 'wish chat form hate budget', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_STOP_REAL', 'bob', 'Real', 'Notes with details that came from friends who have budget.', [], 'a3'));
+
+	// 1. Word-existence invariance: Alice privately indexing receivex/zeppeliny must not alter Bob's results.
+	$a3BeforeRecv = search($platform, 'bob', 'receivex', $a3);
+	$a3BeforeAbsent = search($platform, 'bob', 'zeppeliny', $a3);
+	same(['A3_B_RECV'], $a3BeforeRecv['ids'], 'A3: Bob finds receive via receivex before Alice indexes receivex');
+	same([], $a3BeforeAbsent['ids'], 'A3: Bob gets no results for zeppeliny before Alice indexes zeppeliny');
+
+	$platform->indexDocument(doc('A3_A_RECVX', 'alice', 'Private', 'Private receivex draft and zeppeliny memo.', [], 'a3'));
+	$a3AfterRecv = search($platform, 'bob', 'receivex', $a3);
+	$a3AfterAbsent = search($platform, 'bob', 'zeppeliny', $a3);
+	same($a3BeforeRecv['ids'], $a3AfterRecv['ids'], 'A3: word-existence invariance keeps Bob results for receivex identical');
+	same($a3BeforeRecv['total'], $a3AfterRecv['total'], 'A3: word-existence invariance keeps Bob total for receivex identical');
+	same($a3BeforeAbsent['ids'], $a3AfterAbsent['ids'], 'A3: word-existence invariance keeps Bob absent-word results identical');
+
+	// 2. Crowding-out invariance (accent): 3+ and >12 shorter private variants must not displace Bob's variant.
+	$platform->indexDocument(doc('A3_A_ACC3', 'alice', 'Accents 3', 'çözüma çözüme çözümü', [], 'a3'));
+	same(['A3_B_ACC'], search($platform, 'bob', 'cozum', $a3)['ids'], 'A3: 3 shorter private accent variants do not crowd out Bob çözümleme');
+	$platform->indexDocument(doc('A3_A_ACC15', 'alice', 'Accents 15', 'çözümb çözümc çözümd çözümf çözümg çözümh çözümi çözümj çözümüş çözümüşleri çözümk çözümm çözümn çözümo', [], 'a3'));
+	same(['A3_B_ACC'], search($platform, 'bob', 'cozum', $a3)['ids'], 'A3: >12 shorter private accent variants do not crowd out Bob çözümleme');
+
+	// 3. Crowding-out invariance (spelling): alphabetical & closer/20+ private variants must not displace Bob's correction.
+	$platform->indexDocument(doc('A3_A_SPELL_ALPHA', 'alice', 'Alpha', 'kryptona kryptonb', [], 'a3'));
+	same(['A3_B_SPELL_ALPHA'], search($platform, 'bob', 'kryptonx', $a3)['ids'], 'A3: alphabetically earlier private variants do not crowd out Bob kryptonw');
+	$platform->indexDocument(doc('A3_A_SPELL_DIST2', 'alice', 'Dist 2', 'zephyrb zephyrc', [], 'a3'));
+	same(['A3_B_SPELL_DIST'], search($platform, 'bob', 'zephyrx', $a3)['ids'], 'A3: closer 1-edit private variants do not crowd out Bob 2-edit zephyrkl');
+	$zephyrMore = [];
+	foreach (range('a', 'z') as $ch) {
+		if (!in_array($ch, ['b', 'c', 'e', 'k', 's', 'x'], true)) {
+			$zephyrMore[] = 'zephyr' . $ch;
+		}
+	}
+	$platform->indexDocument(doc('A3_A_SPELL_DIST25', 'alice', 'Dist 25', implode(' ', $zephyrMore), [], 'a3'));
+	same(['A3_B_SPELL_DIST'], search($platform, 'bob', 'zephyrx', $a3)['ids'], 'A3: >20 closer 1-edit private variants do not crowd out Bob 2-edit zephyrkl');
+
+	// 4. 4+ letter stopwords must not trigger bogus spelling corrections in english or turkish,english.
+	foreach (['with', 'that', 'from', 'have'] as $stopword) {
+		same([], search($platform, 'bob', $stopword, $a3)['ids'], "A3: stopword '$stopword' does not trigger spelling correction in english");
+	}
+	$config->setConfig(['language' => 'turkish']);
+	$platform->indexDocument(doc('A3_B_STOP_TR', 'bob', 'TR Decoys', 'wish chat form hate', [], 'a3'));
+	$config->setConfig(['language' => 'turkish,english']);
+	foreach (['with', 'that', 'from', 'have'] as $stopword) {
+		same([], search($platform, 'bob', $stopword, $a3)['ids'], "A3: stopword '$stopword' does not trigger spelling correction in turkish,english");
+	}
+	$config->setConfig(['language' => 'english']);
+
+	// 5. Contingent < size gating: spelling waits for < size uncorrected hits; accent variants stay unconditional.
+	$platform->indexDocument(doc('A3_G_1', 'bob', 'Gate 1', 'gatekeeper alpha', [], 'a3'));
+	$platform->indexDocument(doc('A3_G_2', 'bob', 'Gate 2', 'gatekeeper beta', [], 'a3'));
+	$gatePageFull = search($platform, 'bob', 'gatekeeper kryptonx', $a3 + ['size' => 2]);
+	same(2, $gatePageFull['total'], 'A3: spelling correction skipped when uncorrected first page reaches size');
+	$gatePagePartial = search($platform, 'bob', 'gatekeeper kryptonx', $a3 + ['size' => 5]);
+	same(3, $gatePagePartial['total'], 'A3: spelling correction runs when uncorrected first page has < size hits');
+	$gateAccentFull = search($platform, 'bob', 'gatekeeper cozum', $a3 + ['size' => 2]);
+	same(3, $gateAccentFull['total'], 'A3: accent variants remain active even when uncorrected hits reach size');
+	$platform->resetIndex('a3');
+
+	// 6. Stemmed-candidate, prefix-candidate, and typed-word prefix oracles must remain invariant.
+	$savedOracleWords = $conn->executeQuery("SELECT word FROM ftspg_oc_words WHERE word LIKE 'receiv%' OR word LIKE 'zephyr%'")->fetchAll(PDO::FETCH_COLUMN);
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word LIKE 'receiv%' OR word LIKE 'zephyr%'");
+	$platform->indexDocument(doc('A3_B_RECVING', 'bob', 'Shipments', 'We are receiving shipments today.', [], 'a3'));
+	same([], search($platform, 'bob', 'receivex', $a3)['ids'], 'A3: Bob gets no match for receivex on receiving before Alice indexes receive');
+	$platform->indexDocument(doc('A3_A_RECV_SECRET', 'alice', 'Secret', 'We will receive the secret merger.', [], 'a3'));
+	same([], search($platform, 'bob', 'receivex', $a3)['ids'], 'A3: stemmed-candidate oracle does not leak Alice receive via Bob receiving');
+
+	$platform->indexDocument(doc('A3_B_ZKL', 'bob', 'Bait', 'zephyrklmno', [], 'a3'));
+	same([], search($platform, 'bob', 'zephyrx', $a3)['ids'], 'A3: Bob gets no match for zephyrx on zephyrklmno before Alice indexes zephyre');
+	$platform->indexDocument(doc('A3_A_ZEPHYRE', 'alice', 'Secret Z', 'zephyre', [], 'a3'));
+	same([], search($platform, 'bob', 'zephyrx', $a3)['ids'], 'A3: prefix-candidate oracle does not leak Alice zephyre via Bob zephyrklmno');
+
+	$platform->resetIndex('a3');
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word LIKE 'receiv%'");
+	$platform->indexDocument(doc('A3_B_RECVING2', 'bob', 'Shipments', 'We are receiving shipments', [], 'a3'));
+	$platform->indexDocument(doc('A3_B_DECEIVE', 'bob', 'Clients', 'Do not deceive clients', [], 'a3'));
+	$beforeTyped = search($platform, 'bob', 'receive', $a3);
+	check(in_array('A3_B_DECEIVE', $beforeTyped['ids'], true), 'A3: typed-word prefix baseline includes deceive correction before Alice indexes receivexyz');
+	$platform->indexDocument(doc('A3_A_RECVXYZ', 'alice', 'Secret R', 'receivexyz', [], 'a3'));
+	$afterTyped = search($platform, 'bob', 'receive', $a3);
+	same($beforeTyped['ids'], $afterTyped['ids'], 'A3: typed-word prefix oracle keeps Bob ids for receive identical');
+	same($beforeTyped['total'], $afterTyped['total'], 'A3: typed-word prefix oracle keeps Bob total for receive identical');
+	$platform->resetIndex('a3');
+	// 7. limitFields stem isolation, Turkish I/İ surface verification, and 32+ duplicate tokens.
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word LIKE 'receiv%'");
+	$platform->indexDocument(doc('A3_B_LIM', 'bob', 'Receive in title', 'We are receiving shipments.', [], 'a3'));
+	$platform->indexDocument(doc('A3_A_LIM', 'alice', 'Private', 'We will receive secret.', [], 'a3'));
+	same([], search($platform, 'bob', 'receivex', $a3 + ['limit' => ['content']])['ids'], 'A3: limitFields=[content] does not leak Alice content receive via Bob content receiving or title receive');
+	same(['A3_B_LIM'], search($platform, 'bob', 'receivex', $a3 + ['limit' => ['title']])['ids'], 'A3: limitFields=[title] still finds Bob own title receive');
+
+	$platform->resetIndex('a3');
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word IN ('ısık', 'isik', 'ısıklar')");
+	$config->setConfig(['language' => 'turkish']);
+	$platform->indexDocument(doc('A3_TR_B_ISIKLAR', 'bob', 'Rapor', 'ISIKLAR YANDI', [], 'a3'));
+	same([], search($platform, 'bob', 'ISIKX', $a3)['ids'], 'A3: Turkish ISIKX does not match ISIKLAR before Alice indexes ISIK');
+	$platform->indexDocument(doc('A3_TR_A_ISIK', 'alice', 'Gizli', 'ISIK', [], 'a3'));
+	same([], search($platform, 'bob', 'ISIKX', $a3)['ids'], 'A3: Turkish surface verification prevents Alice ISIK leak via Bob ISIKLAR');
+	$platform->indexDocument(doc('A3_TR_B_ISIK', 'bob', 'Acik', 'ISIK', [], 'a3'));
+	same(['A3_TR_B_ISIK', 'A3_TR_B_ISIKLAR'], sorted(search($platform, 'bob', 'ISIKX', $a3)['ids']), 'A3: Turkish ISIKX finds Bob own uppercase ISIK via surface I->ı');
+	$config->setConfig(['language' => 'english']);
+
+	same([], search($platform, 'bob', str_repeat('qqmissing ', 32) . 'kryptonx', $a3)['ids'], 'A3: 32+ duplicate missing tokens execute cleanly');
+	$platform->resetIndex('a3');
+
+	// 8. Non-alpha 'simple' tokens (host, file, email, numword, >40 chars) must not leak via typed-word prefix probe.
+	$nonAlphaCases = [
+		'host content' => ['content' => 'See receive.pdf here.', 'limit' => []],
+		'host tags' => ['tags' => ['receive.pdf'], 'limit' => ['tags']],
+		'host parts' => ['parts' => ['comments' => 'See receive.pdf'], 'limit' => ['parts']],
+		'file content' => ['content' => 'Open receive/draft today.', 'limit' => ['content']],
+		'numword content' => ['content' => 'Ticket receive123 closed.', 'limit' => ['content']],
+		'email content' => ['content' => 'Mail receive@example.com now.', 'limit' => ['content']],
+		'>40-char content' => ['content' => 'Long receivereceivereceivereceivereceivereceive token.', 'limit' => ['content']],
+	];
+	foreach ($nonAlphaCases as $label => $case) {
+		$platform->resetIndex('a3');
+		$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word LIKE 'receiv%'");
+		$platform->indexDocument(doc('A3_B_COMP', 'bob', 'Neutral Doc', $case['content'] ?? 'Neutral body', [
+			'tags' => $case['tags'] ?? [],
+			'parts' => $case['parts'] ?? [],
+		], 'a3'));
+		$platform->indexDocument(doc('A3_B_DEC', 'bob', 'Clients', 'Do not deceive clients', [
+			'tags' => ['deceive'],
+			'parts' => ['comments' => 'Do not deceive clients'],
+		], 'a3'));
+		$opts = $a3 + ($case['limit'] !== [] ? ['limit' => $case['limit']] : []);
+		$before2b = search($platform, 'bob', 'receive', $opts);
+		check(in_array('A3_B_DEC', $before2b['ids'], true), "A3: 2b ($label) baseline includes deceive before Alice");
+		$platform->indexDocument(doc('A3_A_RECVXYZ_2B', 'alice', 'Private', 'receivexyz', [], 'a3'));
+		$after2b = search($platform, 'bob', 'receive', $opts);
+		same($before2b['ids'], $after2b['ids'], "A3: 2b ($label) keeps Bob ids identical");
+		same($before2b['total'], $after2b['total'], "A3: 2b ($label) keeps Bob total identical");
+	}
+	$platform->resetIndex('a3');
+	foreach ($savedOracleWords as $savedWord) {
+		$conn->executeStatement('INSERT INTO ftspg_oc_words (word) VALUES (?) ON CONFLICT (word) DO NOTHING', [(string)$savedWord]);
+	}
+
 	section('vocabulary maintenance');
 	check($vocabulary->count() > 20, 'words collected while indexing (' . $vocabulary->count() . ')');
 	$words = $conn->executeQuery('SELECT word FROM ftspg_oc_words')->fetchAll(PDO::FETCH_COLUMN);
@@ -1648,24 +1945,71 @@ try {
 	same(3, VocabularyService::editDistance('ışık', 'isik'), 'multibyte letters count once each (3 substitutions)');
 	$conn->executeStatement('TRUNCATE ftspg_oc_words');
 	$progress = 0;
-	$repairOutput = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progress) {
-		$progress += $step;
-	}]);
-	(new CreateIndexTable($schema, $vocabulary))->run($repairOutput);
+	$repairInfos = [];
+	$repairWarnings = [];
+	$repairOutput = double(\OCP\Migration\IOutput::class, [
+		'advance' => function (int $step = 1) use (&$progress) {
+			$progress += $step;
+		},
+		'info' => function (string $message) use (&$repairInfos) {
+			$repairInfos[] = $message;
+		},
+		'warning' => function (string $message) use (&$repairWarnings) {
+			$repairWarnings[] = $message;
+		},
+	]);
+	(new CreateIndexTable($schema, $vocabulary, $config))->run($repairOutput);
 	check($vocabulary->count() > 20, 'upgrade step fills an empty vocabulary on small instances');
 	same($schema->countDocuments(), $progress, 'and reports progress per document');
+	same(false, stripos(implode("\n", array_merge($repairInfos, $repairWarnings)), 'lock') !== false, 'repair step omits lock notice when schema is already current');
 
 	section('upgrading a 1.1.x table in place');
 	$t = $schema->getTableName();
 	$conn->executeStatement("DROP INDEX IF EXISTS {$t}_title_search_trgm_idx");
 	$conn->executeStatement("ALTER TABLE $t DROP COLUMN title_search, DROP COLUMN tsv");
+	$conn->executeStatement("ALTER TABLE $t ALTER COLUMN config TYPE regconfig USING config::regconfig");
 	$conn->executeStatement("ALTER TABLE $t ADD COLUMN tsv tsvector GENERATED ALWAYS AS (to_tsvector(config, title)) STORED");
 	if ($schema->hasTrigram()) {
 		$conn->executeStatement("CREATE INDEX {$t}_title_trgm_idx ON $t USING GIN (title gin_trgm_ops)");
 	}
 	same(false, $schema->isCurrent(), '1.1.x schema detected as outdated');
-	$platform->loadPlatform();
-	same(true, $schema->isCurrent(), 'loadPlatform upgrades it');
+	$expectedRowCount = $schema->countDocuments();
+	check($expectedRowCount > 0, 'existing rows present before upgrade');
+	$loadThrew = false;
+	$loadError = '';
+	try {
+		$platform->loadPlatform();
+	} catch (\RuntimeException $e) {
+		$loadThrew = true;
+		$loadError = $e->getMessage();
+	}
+	same(true, $loadThrew, 'loadPlatform refuses to upgrade an existing outdated table');
+	check(str_contains($loadError, 'occ upgrade') && str_contains($loadError, 'occ maintenance:repair'), 'loadPlatform error directs admin to occ upgrade / occ maintenance:repair');
+	same(false, $schema->isCurrent(), 'loadPlatform leaves outdated schema untouched');
+	$colsAfterLoad = $conn->executeQuery(
+		'SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?',
+		[$t]
+	)->fetchAll(PDO::FETCH_COLUMN);
+	same(false, in_array('title_search', $colsAfterLoad, true), 'loadPlatform leaves 1.1.x columns unchanged');
+	if ($schema->hasTrigram()) {
+		$idxAfterLoad = $conn->executeQuery('SELECT indexname FROM pg_indexes WHERE tablename = ?', [$t])->fetchAll(PDO::FETCH_COLUMN);
+		same(true, in_array("{$t}_title_trgm_idx", $idxAfterLoad, true), 'loadPlatform leaves 1.1.x trigram index unchanged');
+	}
+	$upgradeInfos = [];
+	$upgradeWarnings = [];
+	$upgradeOutput = double(\OCP\Migration\IOutput::class, [
+		'info' => function (string $message) use (&$upgradeInfos) {
+			$upgradeInfos[] = $message;
+		},
+		'warning' => function (string $message) use (&$upgradeWarnings) {
+			$upgradeWarnings[] = $message;
+		},
+	]);
+	(new CreateIndexTable($schema, $vocabulary, $config))->run($upgradeOutput);
+	same(true, $schema->isCurrent(), 'CreateIndexTable upgrades the 1.1.x table');
+	$upgradeNotice = implode("\n", array_merge($upgradeInfos, $upgradeWarnings));
+	check(str_contains($upgradeNotice, (string)$expectedRowCount), 'repair step prints document row count when upgrading outdated table');
+	check(stripos($upgradeNotice, 'lock') !== false, 'repair step prints index-table lock notice when upgrading outdated table');
 	same(['N1'], $ids('final'), 'after upgrade: existing rows recomputed, file name parts searchable');
 	same(['N2', 'U1'], $ids('butce'), 'after upgrade: substring matching works');
 	$indexes = $conn->executeQuery('SELECT indexname FROM pg_indexes WHERE tablename = ?', [$t])->fetchAll(PDO::FETCH_COLUMN);
@@ -1714,8 +2058,8 @@ try {
 
 	$conn->executeStatement('SET enable_seqscan = off');
 	$plan = implode("\n", array_column($conn->executeQuery(
-		"EXPLAIN SELECT id FROM ftspg_oc_index d WHERE ((d.config <> ALL ('{english}'::regconfig[]) AND d.tsv @@ to_tsquery('turkish', 'kitap:*'))"
-		. " OR (d.config = 'english'::regconfig AND d.tsv @@ to_tsquery('english', 'study:*'))) AND d.access && '{u:alice}'::text[]"
+		"EXPLAIN SELECT id FROM ftspg_oc_index d WHERE ((d.config <> ALL ('{english}'::text[]) AND d.tsv @@ to_tsquery('turkish', 'kitap:*'))"
+		. " OR (d.config = 'english' AND d.tsv @@ to_tsquery('english', 'study:*'))) AND d.access && '{u:alice}'::text[]"
 	)->fetchAll(), 'QUERY PLAN'));
 	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') || str_contains($plan, 'ftspg_oc_index_access_idx'), 'two-language search still uses the GIN index');
 	$conn->executeStatement('SET enable_seqscan = on');
@@ -1765,6 +2109,32 @@ try {
 	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'the search uses the GIN index, not a scan of every visible row');
 	$plan = $planOf('SELECT (SELECT count(*)');
 	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'so do the IDF frequency counts');
+
+	$conn->log = [];
+	$a5Plan1 = search($platform, 'alice', '+the +lantern', ['provider' => 'plan']);
+	same(400, $a5Plan1['total'], 'A5 planner: +the +lantern finds all 400 lantern docs');
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'A5 planner: +the +lantern uses the GIN index');
+
+	$conn->log = [];
+	$a5Plan2 = search($platform, 'alice', 'lantern for meadow', ['provider' => 'plan']);
+	same(677, $a5Plan2['total'], 'A5 planner: lantern for meadow finds all 677 docs');
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'A5 planner: lantern for meadow uses the GIN index');
+
+	$conn->log = [];
+	$a5Plan3 = search($platform, 'alice', '+lantern +for +meadow', ['provider' => 'plan']);
+	same(30, $a5Plan3['total'], 'A5 planner: +lantern +for +meadow finds all 30 docs with both words');
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'A5 planner: +lantern +for +meadow uses the GIN index');
+
+	$conn->executeStatement("INSERT INTO ftspg_oc_words (word) VALUES ('thé') ON CONFLICT (word) DO NOTHING");
+	$conn->log = [];
+	$a5Plan4 = search($platform, 'alice', '+the +lantern', ['provider' => 'plan']);
+	same(400, $a5Plan4['total'], 'A5 planner: +the +lantern finds all 400 lantern docs with accented stopword homograph in vocabulary');
+	$plan = $planOf('WITH q AS');
+	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') && !str_contains($plan, 'Seq Scan on ftspg_oc_index'), 'A5 planner: +the +lantern uses the GIN index with accented stopword homograph in vocabulary');
+	$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word = 'thé'");
 	same(['on', '4', 'on'], array_values($conn->executeQuery("SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit')")->fetch(PDO::FETCH_NUM)), 'the settings only applied to the search');
 	same(false, $conn->inTransaction(), 'and its transaction is closed');
 	$conn->beginTransaction();
@@ -1859,6 +2229,1357 @@ try {
 
 	// Restore normal timeout
 	$config->setConfig(['search_timeout' => 10]);
+
+	section('search robustness: planner tx safety, past-end paging, multi-page title fallback (A4)');
+	$config->setConfig(['language' => 'english', 'typo_correction' => true, 'search_timeout' => 10]);
+
+	// 1. withSearchPlanning() failure during settings read or set rolls back own transaction
+	$plannerFailState = new class {
+		public string $mode = '';
+	};
+	$plannerFailProxy = new class($conn, $plannerFailState) implements \OCP\IDBConnection {
+		public function __construct(
+			private \OCP\IDBConnection $inner,
+			private object $state,
+		) {
+		}
+		public function executeStatement($sql, array $params = [], array $types = []): int {
+			return $this->inner->executeStatement($sql, $params, $types);
+		}
+		public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+			if ($this->state->mode === 'read' && str_contains($sql, "current_setting('enable_seqscan')")) {
+				throw new \RuntimeException('injected planner settings read failure');
+			}
+			if ($this->state->mode === 'set' && str_contains($sql, "set_config('enable_seqscan', 'off', true)")) {
+				throw new \RuntimeException('injected planner settings set failure');
+			}
+			if ($this->state->mode === 'set_timeout' && str_contains($sql, "set_config('enable_seqscan', 'off', true)")) {
+				$e = new \PDOException('SQLSTATE[57014]: Query canceled: canceling statement due to statement timeout', 57014);
+				$e->errorInfo = ['57014', 7, 'canceling statement due to statement timeout'];
+				throw $e;
+			}
+			return $this->inner->executeQuery($sql, $params, $types);
+		}
+		public function inTransaction(): bool {
+			return $this->inner->inTransaction();
+		}
+		public function beginTransaction(): void {
+			$this->inner->beginTransaction();
+		}
+		public function commit(): void {
+			$this->inner->commit();
+		}
+		public function rollBack(): void {
+			$this->inner->rollBack();
+		}
+		public function getDatabaseProvider(): string {
+			return $this->inner->getDatabaseProvider();
+		}
+	};
+	$plannerFailSearch = new SearchService($plannerFailProxy, $schema, $config, new TsQueryBuilder(), $vocabulary);
+	$plannerFailPlatform = new PostgreSQLPlatform($config, $schema, $indexService, $plannerFailSearch, $logger, $extractor);
+
+	foreach (['read', 'set'] as $failMode) {
+		$plannerFailState->mode = $failMode;
+		$threw = false;
+		$txAfterFail = true;
+		try {
+			search($plannerFailPlatform, 'alice', 'budget');
+		} catch (\RuntimeException) {
+			$threw = true;
+		} finally {
+			$plannerFailState->mode = '';
+			$txAfterFail = $conn->inTransaction();
+			if ($conn->inTransaction()) {
+				$conn->rollBack();
+			}
+		}
+		check($threw, "A4: withSearchPlanning() '$failMode' failure propagates exception");
+		same(false, $txAfterFail, "A4: withSearchPlanning() '$failMode' failure rolls back own transaction");
+	}
+
+	$plannerFailState->mode = 'set_timeout';
+	$txAfterTimeoutSet = true;
+	try {
+		$setTimeoutRes = search($plannerFailPlatform, 'alice', 'budget');
+	} finally {
+		$plannerFailState->mode = '';
+		$txAfterTimeoutSet = $conn->inTransaction();
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+	}
+	same(true, $setTimeoutRes['timedOut'], 'A4: SQLSTATE 57014 on set_config reports timedOut');
+	same(0, $setTimeoutRes['total'], 'A4: SQLSTATE 57014 on set_config reports total 0');
+	same(false, $txAfterTimeoutSet, 'A4: SQLSTATE 57014 on set_config rolls back own transaction');
+	same(1, (int)$conn->executeQuery('SELECT 1')->fetchOne(), 'A4: connection remains usable after withSearchPlanning() rollback');
+
+	$conn->beginTransaction();
+	$plannerFailState->mode = 'read';
+	$callerReadThrew = false;
+	$txAfterCallerFail = false;
+	try {
+		search($plannerFailPlatform, 'alice', 'budget');
+	} catch (\RuntimeException) {
+		$callerReadThrew = true;
+	} finally {
+		$plannerFailState->mode = '';
+		$txAfterCallerFail = $conn->inTransaction();
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+	}
+	check($callerReadThrew, 'A4: withSearchPlanning() read failure inside caller tx propagates exception');
+	same(true, $txAfterCallerFail, 'A4: withSearchPlanning() read failure inside caller tx leaves caller tx open');
+
+	// 2. Past-end page of exact search preserves total
+	$platform->indexDocument(doc('A4_EXACT1', 'alice', 'Albatross report', 'albatross migration', [], 'a4'));
+	$a4PastEnd = search($platform, 'alice', 'albatross', ['provider' => 'a4', 'size' => 2, 'page' => 5]);
+	same([], $a4PastEnd['ids'], 'A4: past-end page of 1-result exact search returns empty ids');
+	same(1, $a4PastEnd['total'], 'A4: past-end page of 1-result exact search preserves total 1');
+	$a4PastEndZero = search($platform, 'alice', 'nonexistentxyz', ['provider' => 'a4', 'size' => 2, 'page' => 5]);
+	same([], $a4PastEndZero['ids'], 'A4: past-end page of 0-result search returns empty ids');
+	same(0, $a4PastEndZero['total'], 'A4: past-end page of 0-result search reports total 0');
+
+	// 3. Multi-page title fallback (including past-end and A2/limit guards)
+	$platform->indexDocument(doc('A4_TF1', 'alice', 'qxzflamengoalpha', 'unrelated alpha body', ['mtime' => 1000], 'a4'));
+	$platform->indexDocument(doc('A4_TF2', 'alice', 'qxzflamengobeta', 'unrelated beta body', ['mtime' => 2000], 'a4'));
+	$tfP1 = search($platform, 'alice', 'qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 1]);
+	$tfP2 = search($platform, 'alice', 'qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 2]);
+	$tfP5 = search($platform, 'alice', 'qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 5]);
+	same(1, count($tfP1['ids']), 'A4: title fallback page 1 returns 1 result');
+	same(2, $tfP1['total'], 'A4: title fallback page 1 reports total 2');
+	same(1, count($tfP2['ids']), 'A4: title fallback page 2 returns 1 result');
+	same(2, $tfP2['total'], 'A4: title fallback page 2 reports total 2');
+	same(['A4_TF1', 'A4_TF2'], sorted([$tfP1['ids'][0] ?? '', $tfP2['ids'][0] ?? '']), 'A4: title fallback page 1 and page 2 cover both results without overlap');
+	same([], $tfP5['ids'], 'A4: title fallback past-end page returns empty ids');
+	same(2, $tfP5['total'], 'A4: title fallback past-end page preserves total 2');
+	same(0, search($platform, 'alice', 'qxzflamenga -alpha', ['provider' => 'a4', 'size' => 1, 'page' => 2])['total'], 'A4: title fallback on page 2 respects A2 exclusion plainWordsOnly');
+	same(0, search($platform, 'alice', '+qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 2])['total'], 'A4: title fallback on page 2 respects A2 required plainWordsOnly');
+	same(0, search($platform, 'alice', '"qxzflamenga"', ['provider' => 'a4', 'size' => 1, 'page' => 2])['total'], 'A4: title fallback on page 2 respects A2 phrase plainWordsOnly');
+	same(0, search($platform, 'alice', 'qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 2, 'limit' => ['content']])['total'], 'A4: title fallback on page 2 respects limit=content ($titlesSearched)');
+	$platform->resetIndex('a4');
+	$config->setConfig(['language' => 'turkish']);
+
+	section('extraction and vocabulary limits (B5)');
+	$b5ToolDir = sys_get_temp_dir() . '/ftspg_b5_tool_' . mt_rand();
+	mkdir($b5ToolDir);
+	$b5HangDir = $b5ToolDir . '/hang';
+	$b5StderrDir = $b5ToolDir . '/stderr';
+	mkdir($b5HangDir);
+	mkdir($b5StderrDir);
+	$b5HangTool = $b5HangDir . '/pdftotext';
+	$b5StderrTool = $b5StderrDir . '/pdftotext';
+	try {
+		$config->setConfig(['language' => 'english', 'typo_correction' => true]);
+
+		// B5.1a: tool ignoring SIGTERM after hitting output limit
+		file_put_contents($b5HangTool, "#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.0\"; exit 0; fi\ntrap '' TERM\nprintf 'hangmarker '\nhead -c 2500 /dev/zero | tr '\\0' 'a'\nexec sleep 5\n");
+		chmod($b5HangTool, 0755);
+		$config->setConfig(['max_content_size' => 1000, 'pdf_extractor' => 'pdftotext', 'pdftotext_path' => $b5HangTool]);
+		$runnerLog = [];
+		$t0 = microtime(true);
+		$platform->indexDocument(doc('B5_TOOL_HANG', 'alice', 'Hang.pdf', $b64("%PDF-1.4\nfake"), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+		$elapsed = microtime(true) - $t0;
+		check($elapsed < 2.0, sprintf('B5.1a: output-capped tool ignoring SIGTERM terminated quickly (%.2fs)', $elapsed));
+		same('ok', $runnerLog['B5_TOOL_HANG'][0] ?? '', 'B5.1a: output-capped tool is not flagged as timed out');
+		same(['B5_TOOL_HANG'], search($platform, 'alice', 'hangmarker')['ids'], 'B5.1a: output before limit is indexed');
+
+		// B5.1b: >128 KB stderr flood before stdout
+		file_put_contents($b5StderrTool, "#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.0\"; exit 0; fi\nhead -c 140000 /dev/zero | tr '\\0' 'e' >&2\necho \"betaword stderr flood recovered\"\nexit 0\n");
+		chmod($b5StderrTool, 0755);
+		$config->setConfig(['max_content_size' => 512000, 'pdf_extractor' => 'pdftotext', 'pdftotext_path' => $b5StderrTool]);
+		$runnerLog = [];
+		$t0 = microtime(true);
+		$platform->indexDocument(doc('B5_STDERR_FLOOD', 'alice', 'Stderr.pdf', $b64("%PDF-1.4\nfake"), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+		$elapsed = microtime(true) - $t0;
+		check($elapsed < 2.0, sprintf('B5.1b: stderr flood (>128 KB) drained without deadlock (%.2fs)', $elapsed));
+		same('ok', $runnerLog['B5_STDERR_FLOOD'][0] ?? '', 'B5.1b: stderr flood succeeds without warning');
+		same(['B5_STDERR_FLOOD'], search($platform, 'alice', 'betaword')['ids'], 'B5.1b: stdout after stderr flood is indexed');
+
+		$config->setConfig(['max_content_size' => 512000, 'pdf_extractor' => 'auto', 'pdftotext_path' => '']);
+
+		// B5.2a: 3,000-sheet xlsx hitting 2,000-entry cap
+		$files = ['xl/workbook.xml' => "<workbook $s><sheets><sheet name=\"BigBook\" sheetId=\"1\"/></sheets></workbook>"];
+		for ($i = 1; $i <= 3000; $i++) {
+			$files["xl/worksheets/sheet{$i}.xml"] = "<worksheet $s><sheetData><row><c t=\"inlineStr\"><is><t>sheettoken{$i}marker</t></is></c></row></sheetData></worksheet>";
+		}
+		$runnerLog = [];
+		$office('B5_XLSX_ENTRIES', 'sheets3000.xlsx', $files);
+		unset($files);
+		same('warning', $runnerLog['B5_XLSX_ENTRIES'][0] ?? '', 'B5.2a: 3000-sheet xlsx emits partial-index warning');
+		check(str_contains($runnerLog['B5_XLSX_ENTRIES'][1] ?? '', 'partially indexed'), 'B5.2a: warning mentions partially indexed');
+		same(['B5_XLSX_ENTRIES'], search($platform, 'alice', 'sheettoken1marker')['ids'], 'B5.2a: sheet 1 is indexed');
+		same(['B5_XLSX_ENTRIES'], search($platform, 'alice', 'sheettoken1999marker')['ids'], 'B5.2a: sheet 1999 (2000th entry) is indexed');
+		same([], search($platform, 'alice', 'sheettoken2000marker')['ids'], 'B5.2a: sheet 2000 (2001st entry) is skipped');
+		same([], search($platform, 'alice', 'sheettoken3000marker')['ids'], 'B5.2a: sheet 3000 is skipped');
+
+		// B5.2b: >128 MB uncompressed XML docx hitting 128 MB total cap
+		$conn->log = [];
+		$conn->statements = [];
+		$b5ZipDir = $b5ToolDir . '/docx';
+		mkdir($b5ZipDir);
+		$chunk = '<w:delText>' . str_repeat('a', 100000) . '</w:delText>';
+		$writeEntry = static function (string $path, string $head, string $tail) use ($chunk): void {
+			$fh = fopen($path, 'wb');
+			if ($fh === false) {
+				throw new \RuntimeException("Cannot open $path");
+			}
+			fwrite($fh, $head);
+			for ($i = 0; $i < 315; $i++) {
+				fwrite($fh, $chunk);
+			}
+			fwrite($fh, $tail);
+			fclose($fh);
+		};
+		$entryPaths = [
+			'word/document.xml' => [$b5ZipDir . '/document.xml', "<w:document $w><w:body><w:p><w:r><w:t>docentryonemarker</w:t></w:r></w:p>", '</w:body></w:document>'],
+			'word/header1.xml' => [$b5ZipDir . '/header1.xml', "<w:hdr $w><w:p><w:r><w:t>headeronemarker</w:t></w:r></w:p>", '</w:hdr>'],
+			'word/header2.xml' => [$b5ZipDir . '/header2.xml', "<w:hdr $w><w:p><w:r><w:t>headertwomarker</w:t></w:r></w:p>", '</w:hdr>'],
+			'word/header3.xml' => [$b5ZipDir . '/header3.xml', "<w:hdr $w><w:p><w:r><w:t>headerthreemarker</w:t></w:r></w:p>", '</w:hdr>'],
+			'word/header4.xml' => [$b5ZipDir . '/header4.xml', "<w:hdr $w>", '<w:p><w:r><w:t>headerfourtailmarker</w:t></w:r></w:p></w:hdr>'],
+		];
+		$tmpDocx = $b5ZipDir . '/huge.docx';
+		$zip = new ZipArchive();
+		$zip->open($tmpDocx, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+		foreach ($entryPaths as $entryName => [$filePath, $head, $tail]) {
+			$writeEntry($filePath, $head, $tail);
+			$zip->addFile($filePath, $entryName);
+		}
+		$zip->addFromString('word/header5.xml', "<w:hdr $w><w:p><w:r><w:t>headerfivemarker</w:t></w:r></w:p></w:hdr>");
+		$zip->close();
+		$docxZip = (string)file_get_contents($tmpDocx);
+		foreach ($entryPaths as [$filePath]) {
+			@unlink($filePath);
+		}
+		@unlink($tmpDocx);
+		@rmdir($b5ZipDir);
+		unset($chunk, $entryPaths);
+		$runnerLog = [];
+		$platform->indexDocument(doc('B5_DOCX_BYTES', 'alice', 'huge.docx', $b64($docxZip), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+		unset($docxZip);
+		same('warning', $runnerLog['B5_DOCX_BYTES'][0] ?? '', 'B5.2b: >128 MB xml docx emits partial-index warning');
+		check(str_contains($runnerLog['B5_DOCX_BYTES'][1] ?? '', 'partially indexed'), 'B5.2b: warning mentions partially indexed');
+		same(['B5_DOCX_BYTES'], search($platform, 'alice', 'docentryonemarker')['ids'], 'B5.2b: first entry under 128 MB is indexed');
+		same(['B5_DOCX_BYTES'], search($platform, 'alice', 'headerthreemarker')['ids'], 'B5.2b: 4th entry under 128 MB is indexed');
+		same([], search($platform, 'alice', 'headerfourtailmarker')['ids'], 'B5.2b: entry tail past 128 MB cap is not indexed');
+		same([], search($platform, 'alice', 'headerfivemarker')['ids'], 'B5.2b: 6th entry after 128 MB cap is skipped');
+
+		// B5.3a: ODF mid-sentence annotation & note without word fusion
+		$office('B5_ODF_NOTES', 'notes.odt', [
+			'mimetype' => 'application/vnd.oasis.opendocument.text',
+			'content.xml' => "<office:document-content $o><office:body><office:text>"
+				. '<text:p>odfkitap<text:span>lık</text:span> odfkalem<office:annotation><dc:creator>ZeynepNotator</dc:creator><dc:date>1999-12-31</dc:date><text:p>odfyorum odfmartı</text:p></office:annotation>odfdefter</text:p>'
+				. '<text:p>odfelma<text:note text:note-class="footnote"><text:note-citation>odfcite</text:note-citation><text:note-body><text:p>Dipnot odfkumru</text:p></text:note-body></text:note>odfarmut</text:p>'
+				. '</office:text></office:body></office:document-content>',
+		]);
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfkitaplık')['ids'], 'B5.3a: <text:span> still leaves words joined');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfkalem')['ids'], 'B5.3a: word before mid-sentence annotation is searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfyorum')['ids'], 'B5.3a: first word inside annotation is separately searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfmartı')['ids'], 'B5.3a: annotation body is searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfdefter')['ids'], 'B5.3a: word after mid-sentence annotation is searchable');
+		same([], search($platform, 'alice', 'odfkalemodfyorum')['ids'], 'B5.3a: word before annotation does not fuse with annotation text');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfelma')['ids'], 'B5.3a: word before mid-sentence note is searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfcite')['ids'], 'B5.3a: note citation is separately searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfkumru')['ids'], 'B5.3a: note body is searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfarmut')['ids'], 'B5.3a: word after mid-sentence note is searchable');
+		same([], search($platform, 'alice', 'odfelmaodfcite')['ids'], 'B5.3a: word before note does not fuse with note citation');
+		same([], search($platform, 'alice', 'zeynepnotator')['ids'], 'B5.3a: annotation dc:creator is skipped');
+		same([], search($platform, 'alice', '1999')['ids'], 'B5.3a: annotation dc:date is skipped');
+		$odfNotesContent = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B5_ODF_NOTES'")->fetchOne();
+		check(str_contains($odfNotesContent, 'odfkitaplık'), 'B5.3a: stored content preserves span joining');
+		check(str_contains($odfNotesContent, 'odfkalem odfyorum odfmartı odfdefter'), 'B5.3a: stored content separates annotation cleanly');
+		check(str_contains($odfNotesContent, 'odfelma odfcite Dipnot odfkumru odfarmut'), 'B5.3a: stored content separates note cleanly');
+
+		// B5.3b: ODF styles.xml headers/footers without style metadata leak, ordered after content.xml
+		$office('B5_ODF_STYLES', 'headers.odt', [
+			'mimetype' => 'application/vnd.oasis.opendocument.text',
+			'content.xml' => "<office:document-content $o><office:body><office:text><text:p>OdfBodyMetni</text:p></office:text></office:body></office:document-content>",
+			'styles.xml' => "<office:document-styles $o xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\">"
+				. '<office:font-face-decls><style:font-face style:name="Sans"/></office:font-face-decls>'
+				. '<office:styles><style:style style:name="Header"><text:p>StyleLeakShouldNotIndex</text:p></style:style></office:styles>'
+				. '<office:automatic-styles><style:page-layout style:name="pm1"><text:p>AutoStyleLeakShouldNotIndex</text:p></style:page-layout></office:automatic-styles>'
+				. '<office:master-styles><style:master-page style:name="Standard">'
+				. '<style:header><text:p>Üstbilgi odfheadflamingo</text:p></style:header>'
+				. '<style:header-left><text:p>Solüstbilgi odfleftibis</text:p></style:header-left>'
+				. '<style:header-first><text:p>İlküstbilgi odffirstpelikan</text:p></style:header-first>'
+				. '<style:footer><text:p>Altbilgi odffootturna</text:p></style:footer>'
+				. '<style:footer-left><text:p>Solaltbilgi odffootleftleylek</text:p></style:footer-left>'
+				. '<style:footer-first><text:p>İlkaltbilgi odffootfirstbalıkçıl</text:p></style:footer-first>'
+				. '</style:master-page></office:master-styles>'
+				. '</office:document-styles>',
+		]);
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odfheadflamingo')['ids'], 'B5.3b: styles.xml header indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odfleftibis')['ids'], 'B5.3b: styles.xml header-left indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odffirstpelikan')['ids'], 'B5.3b: styles.xml header-first indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odffootturna')['ids'], 'B5.3b: styles.xml footer indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odffootleftleylek')['ids'], 'B5.3b: styles.xml footer-left indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odffootfirstbalıkçıl')['ids'], 'B5.3b: styles.xml footer-first indexed');
+		same([], search($platform, 'alice', 'styleleakshouldnotindex')['ids'], 'B5.3b: office:styles metadata not indexed');
+		same([], search($platform, 'alice', 'autostyleleakshouldnotindex')['ids'], 'B5.3b: office:automatic-styles metadata not indexed');
+		$odfStylesContent = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B5_ODF_STYLES'")->fetchOne();
+		$bodyPos = strpos($odfStylesContent, 'OdfBodyMetni');
+		$hdrPos = strpos($odfStylesContent, 'Üstbilgi odfheadflamingo');
+		check($bodyPos !== false && $hdrPos !== false && $bodyPos < $hdrPos, 'B5.3b: content.xml precedes styles.xml headers/footers');
+
+		// B5.4: metadata-only INDEX_META update restricts vocabulary additions to title and tags_text
+		$platform->indexDocument(doc('B5_META_VOCAB', 'alice', 'InitialMetaTitle', 'storedcontentquokka bodytext', [
+			'parts' => ['comments' => 'storedpartsquoll commenttext'],
+			'tags' => ['initialtagquail'],
+		]));
+		$wordsBeforeMeta = $conn->executeQuery('SELECT word FROM ftspg_oc_words')->fetchAll(PDO::FETCH_COLUMN);
+		check(in_array('storedcontentquokka', $wordsBeforeMeta, true), 'B5.4: initial full index adds content word to vocabulary');
+		check(in_array('storedpartsquoll', $wordsBeforeMeta, true), 'B5.4: initial full index adds parts word to vocabulary');
+
+		$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word IN ('storedcontentquokka', 'storedpartsquoll')");
+		$platform->indexDocument(doc('B5_META_VOCAB', 'alice', 'RenamedMetaTitle SplitAlpha123SplitBeta.txt', '', [
+			'tags' => ['renamedtaglemur'],
+		], 'files', IIndex::INDEX_META));
+		$wordsAfterMeta = $conn->executeQuery('SELECT word FROM ftspg_oc_words')->fetchAll(PDO::FETCH_COLUMN);
+		check(in_array('renamedmetatitle', $wordsAfterMeta, true), 'B5.4: INDEX_META adds new title word to vocabulary');
+		check(in_array('splitalpha', $wordsAfterMeta, true) && in_array('splitbeta', $wordsAfterMeta, true), 'B5.4: INDEX_META adds split title words to vocabulary');
+		check(in_array('renamedtaglemur', $wordsAfterMeta, true), 'B5.4: INDEX_META adds new tag word to vocabulary');
+		check(!in_array('storedcontentquokka', $wordsAfterMeta, true), 'B5.4: INDEX_META does not re-add stored content words');
+		check(!in_array('storedpartsquoll', $wordsAfterMeta, true), 'B5.4: INDEX_META does not re-add stored parts words');
+
+		// B5.5: CreateIndexTable::fillVocabulary() skips when typo_correction = false
+		$conn->executeStatement('TRUNCATE ftspg_oc_words');
+		$config->setConfig(['typo_correction' => false]);
+		$progressOff = 0;
+		$repairOutputOff = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progressOff) {
+			$progressOff += $step;
+		}]);
+		(new CreateIndexTable($schema, $vocabulary, $config))->run($repairOutputOff);
+		same(0, $vocabulary->count(), 'B5.5: upgrade step leaves vocabulary empty when typo_correction is false');
+		same(0, $progressOff, 'B5.5: upgrade step reports 0 progress when typo_correction is false');
+
+		$config->setConfig(['typo_correction' => true]);
+		$progressOn = 0;
+		$repairOutputOn = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progressOn) {
+			$progressOn += $step;
+		}]);
+		(new CreateIndexTable($schema, $vocabulary, $config))->run($repairOutputOn);
+		check($vocabulary->count() > 20, 'B5.5: upgrade step populates vocabulary once typo_correction is re-enabled');
+		same($schema->countDocuments(), $progressOn, 'B5.5: upgrade step reports progress per document when enabled');
+	} finally {
+		$config->setConfig(['max_content_size' => 512000, 'pdf_extractor' => 'auto', 'pdftotext_path' => '', 'typo_correction' => true, 'language' => 'turkish']);
+		foreach (glob($b5ToolDir . '/docx/*') ?: [] as $tmpFile) {
+			@unlink($tmpFile);
+		}
+		@rmdir($b5ToolDir . '/docx');
+		@unlink($b5HangTool);
+		@unlink($b5StderrTool);
+		@rmdir($b5HangDir);
+		@rmdir($b5StderrDir);
+		@rmdir($b5ToolDir);
+	}
+
+	section('atomic, serialized schema rebuild (S1)');
+	$s1DropTables = static function () use ($conn): void {
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s1fresh_index, ftspg_s1fresh_words, ftspg_s1conc_index, ftspg_s1conc_words, ftspg_s1race_index, ftspg_s1race_words, ftspg_s1test_index, ftspg_s1test_words, ftspg_s1notrgm_index, ftspg_s1notrgm_words');
+		$conn->executeStatement('DROP FUNCTION IF EXISTS ftspg_s1fresh_regconfig(text), ftspg_s1conc_regconfig(text), ftspg_s1race_regconfig(text), ftspg_s1test_regconfig(text), ftspg_s1notrgm_regconfig(text)');
+	};
+	$s1DropTables();
+
+	try {
+		// 0. CreateIndexTable on missing table omits rebuild/lock notice
+		$freshSysConfig = new ArrayConfig(['dbtableprefix' => 's1fresh_']);
+		$freshSchema = new SchemaService($conn, $freshSysConfig, $logger);
+		$freshConfig = new ConfigService(new ArrayAppConfig(), $freshSchema);
+		$freshVocab = new VocabularyService($conn, $freshSchema);
+		$freshInfos = [];
+		$freshWarnings = [];
+		$freshOutput = double(\OCP\Migration\IOutput::class, [
+			'info' => function (string $message) use (&$freshInfos) {
+				$freshInfos[] = $message;
+			},
+			'warning' => function (string $message) use (&$freshWarnings) {
+				$freshWarnings[] = $message;
+			},
+		]);
+		(new CreateIndexTable($freshSchema, $freshVocab, $freshConfig))->run($freshOutput);
+		same(true, $freshSchema->isCurrent(), 'S1 fresh install: CreateIndexTable creates current schema');
+		same(false, stripos(implode("\n", array_merge($freshInfos, $freshWarnings)), 'lock') !== false, 'S1 fresh install: repair step omits rebuild/lock notice');
+
+		// Helper for concurrent ensureSchema() via proc_open + commit() proxy + pg_locks polling
+		$runConcurrentEnsure = static function (string $prefix) use ($conn, $dsn, $logger): array {
+			$childScript = '<?php' . "\n"
+				. 'declare(strict_types=1);' . "\n"
+				. 'require ' . var_export(__DIR__ . '/bootstrap.php', true) . ';' . "\n"
+				. '$c = new \OCA\FullTextSearch_PgSql\Tests\PdoConnection(new \PDO(' . var_export($dsn, true) . '), ' . var_export($prefix, true) . ');' . "\n"
+				. '$s = new \OCA\FullTextSearch_PgSql\Service\SchemaService($c, new \OCA\FullTextSearch_PgSql\Tests\ArrayConfig([\'dbtableprefix\' => ' . var_export($prefix, true) . ']), new \OCA\FullTextSearch_PgSql\Tests\MemoryLogger());' . "\n"
+				. '$c->statements = [];' . "\n"
+				. '$s->ensureSchema();' . "\n"
+				. 'echo json_encode([\'statements\' => $c->statements, \'current\' => $s->isCurrent()]);' . "\n";
+
+			$state = new class {
+				public bool $committed = false;
+				public bool $sawAdvisoryWait = false;
+				/** @var list<string> */
+				public array $parentSqls = [];
+				public string $dsn = '';
+				public string $childScript = '';
+				/** @var resource|null */
+				public $proc = null;
+				/** @var array<int, resource> */
+				public array $pipes = [];
+				public ?int $exitCode = null;
+			};
+			$state->dsn = $dsn;
+			$state->childScript = $childScript;
+
+			$proxy = new class($conn, $state) implements \OCP\IDBConnection {
+				public function __construct(
+					private \OCP\IDBConnection $inner,
+					private object $state,
+				) {
+				}
+				public function executeStatement($sql, array $params = [], array $types = []): int {
+					$this->state->parentSqls[] = (string)$sql;
+					return $this->inner->executeStatement($sql, $params, $types);
+				}
+				public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+					$this->state->parentSqls[] = $sql;
+					return $this->inner->executeQuery($sql, $params, $types);
+				}
+				public function inTransaction(): bool {
+					return $this->inner->inTransaction();
+				}
+				public function beginTransaction(): void {
+					$this->inner->beginTransaction();
+				}
+				public function commit(): void {
+					if (!$this->state->committed) {
+						$this->state->committed = true;
+						$pipes = [];
+						$proc = proc_open(
+							[PHP_BINARY],
+							[0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+							$pipes
+						);
+						if (!is_resource($proc)) {
+							$this->inner->commit();
+							throw new \RuntimeException('Failed to spawn child PHP process');
+						}
+						fwrite($pipes[0], $this->state->childScript);
+						fclose($pipes[0]);
+						$this->state->proc = $proc;
+						$this->state->pipes = $pipes;
+						try {
+							$monitorPdo = new PDO($this->state->dsn);
+							$deadline = microtime(true) + 5.0;
+							while (microtime(true) < $deadline) {
+								$waitCount = (int)$monitorPdo->query(
+									"SELECT count(*) FROM pg_locks WHERE pid <> pg_backend_pid() AND locktype = 'advisory' AND NOT granted"
+								)->fetchColumn();
+								if ($waitCount > 0) {
+									$this->state->sawAdvisoryWait = true;
+									break;
+								}
+								$status = proc_get_status($proc);
+								if (!$status['running']) {
+									if ($this->state->exitCode === null) {
+										$this->state->exitCode = $status['exitcode'];
+									}
+									break;
+								}
+								usleep(10000);
+							}
+						} finally {
+							$this->inner->commit();
+						}
+						return;
+					}
+					$this->inner->commit();
+				}
+				public function rollBack(): void {
+					$this->inner->rollBack();
+				}
+				public function getDatabaseProvider(): string {
+					return $this->inner->getDatabaseProvider();
+				}
+			};
+
+			$parentSchema = new SchemaService($proxy, new ArrayConfig(['dbtableprefix' => $prefix]), $logger);
+			try {
+				$parentSchema->ensureSchema();
+			} finally {
+				$childStdout = '';
+				$childStderr = '';
+				$childExit = -1;
+				if (is_resource($state->proc)) {
+					stream_set_blocking($state->pipes[1], false);
+					stream_set_blocking($state->pipes[2], false);
+					$readDeadline = microtime(true) + 5.0;
+					while (microtime(true) < $readDeadline) {
+						$childStdout .= stream_get_contents($state->pipes[1]) ?: '';
+						$childStderr .= stream_get_contents($state->pipes[2]) ?: '';
+						$status = proc_get_status($state->proc);
+						if (!$status['running']) {
+							if ($state->exitCode === null) {
+								$state->exitCode = $status['exitcode'];
+							}
+							if (feof($state->pipes[1]) && feof($state->pipes[2])) {
+								break;
+							}
+						}
+						usleep(10000);
+					}
+					if ($state->exitCode === null) {
+						$status = proc_get_status($state->proc);
+						if ($status['running']) {
+							proc_terminate($state->proc);
+						} else {
+							$state->exitCode = $status['exitcode'];
+						}
+					}
+					$childStdout .= stream_get_contents($state->pipes[1]) ?: '';
+					$childStderr .= stream_get_contents($state->pipes[2]) ?: '';
+					fclose($state->pipes[1]);
+					fclose($state->pipes[2]);
+					$closeCode = proc_close($state->proc);
+					$childExit = $state->exitCode ?? $closeCode;
+				}
+			}
+
+			return [
+				'sawAdvisoryWait' => $state->sawAdvisoryWait,
+				'parentSqls' => $state->parentSqls,
+				'childExit' => $childExit,
+				'childJson' => json_decode($childStdout, true) ?: [],
+				'childStderr' => $childStderr,
+			];
+		};
+
+		// 1. Concurrent ensureSchema() on outdated Schema v2 table executes rebuild once
+		$concSchema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 's1conc_']), $logger);
+		$concSchema->ensureSchema();
+		$conn->executeStatement(
+			"INSERT INTO ftspg_s1conc_index (provider_id, document_id, config, title, content) VALUES ('files', 'S1C1', 'simple', 'S1 Conc', 'concurrent test')"
+		);
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s1conc_index.tsv IS 'ftspg schema 1'");
+		same(false, $concSchema->isCurrent(), 'S1 concurrency: downgraded schema detected as outdated');
+
+		$concRun = $runConcurrentEnsure('s1conc_');
+		same(true, $concRun['sawAdvisoryWait'], 'S1 concurrency (outdated): second caller blocks on pg_advisory_xact_lock');
+		same(0, $concRun['childExit'], 'S1 concurrency (outdated): second caller exits cleanly' . ($concRun['childStderr'] !== '' ? ' (' . trim($concRun['childStderr']) . ')' : ''));
+		same(true, $concRun['childJson']['current'] ?? false, 'S1 concurrency (outdated): second caller observes current schema');
+		$parentRebuilt = count(array_filter(
+			$concRun['parentSqls'],
+			static fn (string $sql): bool => str_contains($sql, 'ALTER TABLE') || str_contains($sql, 'COMMENT ON COLUMN')
+		)) > 0;
+		$childDdl = array_values(array_filter(
+			$concRun['childJson']['statements'] ?? [],
+			static fn (string $sql): bool => preg_match('/\b(ALTER TABLE|DROP INDEX|COMMENT ON COLUMN|CREATE INDEX)\b/i', $sql) === 1
+		));
+		same(true, $parentRebuilt, 'S1 concurrency (outdated): parent performed rebuild');
+		same([], $childDdl, 'S1 concurrency (outdated): second caller executed zero rebuild DDL');
+		same(true, $concSchema->isCurrent(), 'S1 concurrency (outdated): schema is current');
+		same(1, $concSchema->countDocuments(), 'S1 concurrency (outdated): existing row preserved');
+
+		// 2. Concurrent ensureSchema() on missing table serializes CREATE TABLE IF NOT EXISTS
+		$raceSchema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 's1race_']), $logger);
+		$raceRun = $runConcurrentEnsure('s1race_');
+		same(true, $raceRun['sawAdvisoryWait'], 'S1 concurrency (missing): second caller blocks on pg_advisory_xact_lock');
+		same(0, $raceRun['childExit'], 'S1 concurrency (missing): second caller exits cleanly' . ($raceRun['childStderr'] !== '' ? ' (' . trim($raceRun['childStderr']) . ')' : ''));
+		same(true, $raceRun['childJson']['current'] ?? false, 'S1 concurrency (missing): second caller observes current schema');
+		$raceChildDdl = array_values(array_filter(
+			$raceRun['childJson']['statements'] ?? [],
+			static fn (string $sql): bool => preg_match('/\b(CREATE TABLE|ALTER TABLE|DROP INDEX|COMMENT ON COLUMN|CREATE INDEX)\b/i', $sql) === 1
+		));
+		same([], $raceChildDdl, 'S1 concurrency (missing): second caller skipped CREATE TABLE/DDL');
+		same(true, $raceSchema->tableExists() && $raceSchema->isCurrent(), 'S1 concurrency (missing): table created and current');
+
+		// 3. Forced mid-rebuild failure leaves Schema v2 columns, indexes, marker, and rows intact
+		$s1SysConfig = new ArrayConfig(['dbtableprefix' => 's1test_']);
+		$s1Schema = new SchemaService($conn, $s1SysConfig, $logger);
+		$s1Config = new ConfigService(new ArrayAppConfig(), $s1Schema);
+		$s1Extractor = new ContentExtractor($s1Config);
+		$s1Vocab = new VocabularyService($conn, $s1Schema);
+		$s1Detector = new LanguageDetector($conn, $s1Config, $logger);
+		$s1Index = new IndexService($conn, $s1Schema, $s1Config, $s1Extractor, $s1Vocab, $logger, $s1Detector);
+		$s1Search = new SearchService($conn, $s1Schema, $s1Config, new TsQueryBuilder(), $s1Vocab);
+		$s1Platform = new PostgreSQLPlatform($s1Config, $s1Schema, $s1Index, $s1Search, $logger, $s1Extractor);
+		$s1Platform->initializeIndex();
+		$s1Platform->indexDocument(doc('S1_KEEP', 'alice', 'S1 Atomic Keep', 'atomic rollback verification'));
+
+		$makeFailProxy = static function (string $failTrigger) use ($conn): \OCP\IDBConnection {
+			return new class($conn, $failTrigger) implements \OCP\IDBConnection {
+				public function __construct(
+					private \OCP\IDBConnection $inner,
+					private string $failTrigger,
+				) {
+				}
+				public function executeStatement($sql, array $params = [], array $types = []): int {
+					if (str_contains((string)$sql, $this->failTrigger)) {
+						throw new \RuntimeException('injected failure at ' . $this->failTrigger);
+					}
+					return $this->inner->executeStatement($sql, $params, $types);
+				}
+				public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+					return $this->inner->executeQuery($sql, $params, $types);
+				}
+				public function inTransaction(): bool {
+					return $this->inner->inTransaction();
+				}
+				public function beginTransaction(): void {
+					$this->inner->beginTransaction();
+				}
+				public function commit(): void {
+					$this->inner->commit();
+				}
+				public function rollBack(): void {
+					$this->inner->rollBack();
+				}
+				public function getDatabaseProvider(): string {
+					return $this->inner->getDatabaseProvider();
+				}
+			};
+		};
+
+		foreach (['ADD COLUMN tsv', 'COMMENT ON COLUMN'] as $failTrigger) {
+			$conn->executeStatement("COMMENT ON COLUMN ftspg_s1test_index.tsv IS 'ftspg schema 1'");
+			$failSchema = new SchemaService($makeFailProxy($failTrigger), $s1SysConfig, $logger);
+			$threw = false;
+			try {
+				$failSchema->ensureSchema();
+			} catch (\RuntimeException) {
+				$threw = true;
+			}
+			same(true, $threw, "S1 rollback ($failTrigger): exception propagates");
+			same(false, $conn->inTransaction(), "S1 rollback ($failTrigger): no leaked open transaction");
+			same(1, (int)$conn->executeQuery('SELECT 1')->fetchOne(), "S1 rollback ($failTrigger): connection remains usable");
+			$cols = $conn->executeQuery(
+				"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ftspg_s1test_index'"
+			)->fetchAll(PDO::FETCH_COLUMN);
+			check(in_array('tsv', $cols, true) && in_array('title_search', $cols, true), "S1 rollback ($failTrigger): Schema v2 columns remain intact");
+			$idxs = $conn->executeQuery("SELECT indexname FROM pg_indexes WHERE tablename = 'ftspg_s1test_index'")->fetchAll(PDO::FETCH_COLUMN);
+			check(in_array('ftspg_s1test_index_tsv_idx', $idxs, true), "S1 rollback ($failTrigger): tsv index remains intact");
+			if ($s1Schema->hasTrigram()) {
+				check(in_array('ftspg_s1test_index_title_search_trgm_idx', $idxs, true), "S1 rollback ($failTrigger): trigram index remains intact");
+			}
+			$marker = $conn->executeQuery(
+				"SELECT col_description(to_regclass('ftspg_s1test_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s1test_index') AND attname = 'tsv' AND NOT attisdropped"
+			)->fetchOne();
+			same('ftspg schema 1', $marker, "S1 rollback ($failTrigger): marker preserved");
+			same(['S1_KEEP'], search($s1Platform, 'alice', 'atomic')['ids'], "S1 rollback ($failTrigger): existing row intact and searchable");
+		}
+
+		$s1Schema->ensureSchema();
+		same(true, $s1Schema->isCurrent(), 'S1: subsequent normal ensureSchema succeeds after prior rollback');
+		same(['S1_KEEP'], search($s1Platform, 'alice', 'atomic')['ids'], 'S1: existing row remains searchable after recovery');
+
+		// 4. ensureSchema() inside an already-open caller transaction (success + savepoint rollback)
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s1test_index.tsv IS 'ftspg schema 1'");
+		$conn->beginTransaction();
+		$conn->executeStatement("UPDATE ftspg_s1test_index SET title = 'Outer Tx Title' WHERE document_id = 'S1_KEEP'");
+		$s1Schema->ensureSchema();
+		same(true, $conn->inTransaction(), 'S1 caller tx: ensureSchema leaves outer transaction open on success');
+		same(true, $s1Schema->isCurrent(), 'S1 caller tx: schema upgraded inside caller transaction');
+		$conn->commit();
+		same('Outer Tx Title', (string)$conn->executeQuery("SELECT title FROM ftspg_s1test_index WHERE document_id = 'S1_KEEP'")->fetchOne(), 'S1 caller tx: outer DML committed');
+
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s1test_index.tsv IS 'ftspg schema 1'");
+		$conn->beginTransaction();
+		$conn->executeStatement("UPDATE ftspg_s1test_index SET title = 'Outer Tx Pending' WHERE document_id = 'S1_KEEP'");
+		$txFailSchema = new SchemaService($makeFailProxy('ADD COLUMN tsv'), $s1SysConfig, $logger);
+		$txThrew = false;
+		try {
+			$txFailSchema->ensureSchema();
+		} catch (\RuntimeException) {
+			$txThrew = true;
+		}
+		same(true, $txThrew, 'S1 caller tx rollback: exception propagates');
+		same(true, $conn->inTransaction(), 'S1 caller tx rollback: outer transaction remains open');
+		same(
+			'Outer Tx Pending',
+			(string)$conn->executeQuery("SELECT title FROM ftspg_s1test_index WHERE document_id = 'S1_KEEP'")->fetchOne(),
+			'S1 caller tx rollback: outer transaction is un-aborted (no 25P02) and DML is intact'
+		);
+		$txCols = $conn->executeQuery(
+			"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ftspg_s1test_index'"
+		)->fetchAll(PDO::FETCH_COLUMN);
+		check(in_array('tsv', $txCols, true) && in_array('title_search', $txCols, true), 'S1 caller tx rollback: Schema v2 columns remain intact');
+		$txMarker = $conn->executeQuery(
+			"SELECT col_description(to_regclass('ftspg_s1test_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s1test_index') AND attname = 'tsv' AND NOT attisdropped"
+		)->fetchOne();
+		same('ftspg schema 1', $txMarker, 'S1 caller tx rollback: marker preserved');
+		$conn->rollBack();
+		same('Outer Tx Title', (string)$conn->executeQuery("SELECT title FROM ftspg_s1test_index WHERE document_id = 'S1_KEEP'")->fetchOne(), 'S1 caller tx rollback: outer rollback succeeds cleanly');
+
+		// 5. CREATE EXTENSION pg_trgm failure (42501) stays outside the rebuild transaction
+		$noTrgmState = new class {
+			public ?bool $createExtInTx = null;
+		};
+		$noTrgmProxy = new class($conn, $noTrgmState) implements \OCP\IDBConnection {
+			public function __construct(
+				private \OCP\IDBConnection $inner,
+				private object $state,
+			) {
+			}
+			public function executeStatement($sql, array $params = [], array $types = []): int {
+				if (str_contains((string)$sql, 'CREATE EXTENSION')) {
+					$this->state->createExtInTx = $this->inner->inTransaction();
+					$e = new \PDOException('SQLSTATE[42501]: Insufficient privilege: permission denied to create extension "pg_trgm"', 42501);
+					$e->errorInfo = ['42501', 7, 'permission denied to create extension "pg_trgm"'];
+					throw $e;
+				}
+				return $this->inner->executeStatement($sql, $params, $types);
+			}
+			public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+				if (str_contains($sql, 'pg_extension')) {
+					return new class implements \OCP\DB\IResult {
+						public function closeCursor(): bool {
+							return true;
+						}
+						public function fetch(int $fetchMode = \PDO::FETCH_ASSOC) {
+							return false;
+						}
+						public function fetchAll(int $fetchMode = \PDO::FETCH_ASSOC): array {
+							return [];
+						}
+						public function fetchOne() {
+							return false;
+						}
+					};
+				}
+				return $this->inner->executeQuery($sql, $params, $types);
+			}
+			public function inTransaction(): bool {
+				return $this->inner->inTransaction();
+			}
+			public function beginTransaction(): void {
+				$this->inner->beginTransaction();
+			}
+			public function commit(): void {
+				$this->inner->commit();
+			}
+			public function rollBack(): void {
+				$this->inner->rollBack();
+			}
+			public function getDatabaseProvider(): string {
+				return $this->inner->getDatabaseProvider();
+			}
+		};
+		$noTrgmSchema = new SchemaService($noTrgmProxy, new ArrayConfig(['dbtableprefix' => 's1notrgm_']), $logger);
+		$noTrgmSchema->ensureSchema();
+		same(false, $noTrgmState->createExtInTx, 'S1 pg_trgm isolation: CREATE EXTENSION attempted outside transaction');
+		same(false, $conn->inTransaction(), 'S1 pg_trgm isolation: no open transaction leaked');
+		same(true, $noTrgmSchema->tableExists() && $noTrgmSchema->isCurrent(), 'S1 pg_trgm isolation: schema rebuild committed despite 42501');
+
+		// 6. Recovery of missing words table/index when marker is already current does not rewrite tsv
+		$s1Schema->ensureSchema();
+		same(true, $s1Schema->isCurrent(), 'S1 recovery: schema marker is current before dropping words table');
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s1test_words');
+		$conn->statements = [];
+		$s1Schema->ensureSchema();
+		same(true, (bool)$conn->executeQuery("SELECT to_regclass('ftspg_s1test_words') IS NOT NULL")->fetchOne(), 'S1 recovery: missing words table recreated when schema marker is current');
+		$rewriteDdl = array_values(array_filter(
+			$conn->statements,
+			static fn (string $sql): bool => preg_match('/\b(ALTER TABLE|COMMENT ON)\b/i', $sql) === 1
+		));
+		same([], $rewriteDdl, 'S1 recovery: words table/index recovery does not drop or rebuild tsv');
+	} finally {
+		$s1DropTables();
+	}
+
+	section('config as text and schema version 3 (S2)');
+	$s2Cleanup = static function () use ($conn, $platform): void {
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s2fresh_index, ftspg_s2fresh_words, ftspg_s2up_index, ftspg_s2up_words, ftspg_s2drop_index, ftspg_s2drop_words');
+		$conn->executeStatement('DROP FUNCTION IF EXISTS ftspg_s2fresh_regconfig(text), ftspg_s2up_regconfig(text), ftspg_s2drop_regconfig(text)');
+		$conn->executeStatement("DELETE FROM ftspg_oc_index WHERE provider_id = 's2ml' OR length(provider_id) > 64");
+		$platform->resetIndex('s2ml');
+	};
+	$s2Cleanup();
+
+	try {
+		// 1. Schema v3 marker on ftspg_oc_index.tsv
+		$s2Marker = $conn->executeQuery(
+			"SELECT col_description(to_regclass('ftspg_oc_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_oc_index') AND attname = 'tsv' AND NOT attisdropped"
+		)->fetchOne();
+		same('ftspg schema 3', $s2Marker, 'S2: tsv column comment carries ftspg schema 3 marker');
+
+		// 2. Columns are text (zero reg* columns) and tsv uses ftspg_oc_regconfig(config)
+		$s2ColRows = $conn->executeQuery(
+			"SELECT attname, format_type(atttypid, atttypmod) AS typ FROM pg_attribute WHERE attrelid = to_regclass('ftspg_oc_index') AND attnum > 0 AND NOT attisdropped"
+		)->fetchAll();
+		$s2ColTypes = [];
+		$s2RegCols = [];
+		foreach ($s2ColRows as $row) {
+			$colName = (string)$row['attname'];
+			$colType = (string)$row['typ'];
+			$s2ColTypes[$colName] = $colType;
+			if (str_starts_with($colType, 'reg')) {
+				$s2RegCols[] = $colName . ':' . $colType;
+			}
+		}
+		foreach (['config', 'provider_id', 'document_id', 'owner_id', 'source', 'hash'] as $col) {
+			same('text', $s2ColTypes[$col] ?? null, "S2: ftspg_oc_index.$col is text");
+		}
+		same([], $s2RegCols, 'S2: ftspg_oc_index has zero reg* columns');
+		$s2TsvExpr = (string)$conn->executeQuery(
+			"SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = to_regclass('ftspg_oc_index') AND a.attname = 'tsv' AND NOT a.attisdropped"
+		)->fetchOne();
+		check(str_contains($s2TsvExpr, 'ftspg_oc_regconfig(config)'), 'S2: generated tsv expression uses ftspg_oc_regconfig(config)');
+
+		// 3. ftspg_oc_regconfig(text) wrapper metadata and evaluation
+		$s2FnRow = $conn->executeQuery(
+			"SELECT p.provolatile, p.proparallel, p.prorettype::regtype::text AS rettype, p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = current_schema() AND p.proname = 'ftspg_oc_regconfig' AND pg_get_function_identity_arguments(p.oid) = 'text'"
+		)->fetch();
+		check(is_array($s2FnRow), 'S2: ftspg_oc_regconfig(text) exists in current schema');
+		same('i', is_array($s2FnRow) ? (string)$s2FnRow['provolatile'] : null, 'S2: ftspg_oc_regconfig(text) is IMMUTABLE');
+		same('s', is_array($s2FnRow) ? (string)$s2FnRow['proparallel'] : null, 'S2: ftspg_oc_regconfig(text) is PARALLEL SAFE');
+		same('regconfig', is_array($s2FnRow) ? (string)$s2FnRow['rettype'] : null, 'S2: ftspg_oc_regconfig(text) returns regconfig');
+		check(is_array($s2FnRow) && str_contains((string)$s2FnRow['prosrc'], 'pg_catalog.regconfig'), 'S2: ftspg_oc_regconfig(text) body qualifies pg_catalog.regconfig');
+		try {
+			same('english', (string)$conn->executeQuery("SELECT ftspg_oc_regconfig('english')::text")->fetchOne(), 'S2: ftspg_oc_regconfig evaluates english');
+			same('turkish', (string)$conn->executeQuery("SELECT ftspg_oc_regconfig('turkish')::text")->fetchOne(), 'S2: ftspg_oc_regconfig evaluates turkish');
+		} catch (Throwable $e) {
+			check(false, 'S2: ftspg_oc_regconfig evaluation failed: ' . $e->getMessage());
+		}
+
+		// 4a. Fresh install creates Schema v3 directly
+		$s2FreshSchema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 's2fresh_']), $logger);
+		$s2FreshSchema->dropSchema();
+		$s2FreshSchema->ensureSchema();
+		same(true, $s2FreshSchema->isCurrent(), 'S2 fresh install: ensureSchema creates current schema');
+		$s2FreshMarker = $conn->executeQuery(
+			"SELECT col_description(to_regclass('ftspg_s2fresh_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s2fresh_index') AND attname = 'tsv' AND NOT attisdropped"
+		)->fetchOne();
+		same('ftspg schema 3', $s2FreshMarker, 'S2 fresh install: marker is ftspg schema 3');
+		$s2FreshColTypes = [];
+		foreach ($conn->executeQuery("SELECT attname, format_type(atttypid, atttypmod) AS typ FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s2fresh_index') AND attnum > 0 AND NOT attisdropped")->fetchAll() as $row) {
+			$s2FreshColTypes[(string)$row['attname']] = (string)$row['typ'];
+		}
+		foreach (['config', 'provider_id', 'document_id', 'owner_id', 'source', 'hash'] as $col) {
+			same('text', $s2FreshColTypes[$col] ?? null, "S2 fresh install: $col is text");
+		}
+		$s2FreshFn = $conn->executeQuery("SELECT to_regprocedure('ftspg_s2fresh_regconfig(text)') IS NOT NULL")->fetchOne();
+		same(true, (bool)$s2FreshFn, 'S2 fresh install: ftspg_s2fresh_regconfig(text) created');
+
+		// 4b. Upgrading an explicit Schema v2 table (varchar + regconfig + 'ftspg schema 2') preserves rows & config and searches cleanly
+		$s2UpSysConfig = new ArrayConfig(['dbtableprefix' => 's2up_']);
+		$s2UpSchema = new SchemaService($conn, $s2UpSysConfig, $logger);
+		$s2UpConfig = new ConfigService(new ArrayAppConfig(), $s2UpSchema);
+		$s2UpConfig->setConfig(['language' => 'turkish,english']);
+		$s2UpVocab = new VocabularyService($conn, $s2UpSchema);
+		$s2UpIndex = new IndexService($conn, $s2UpSchema, $s2UpConfig, new ContentExtractor($s2UpConfig), $s2UpVocab, $logger, new LanguageDetector($conn, $s2UpConfig, $logger));
+		$s2UpSearch = new SearchService($conn, $s2UpSchema, $s2UpConfig, new TsQueryBuilder(), $s2UpVocab);
+		$s2UpPlatform = new PostgreSQLPlatform($s2UpConfig, $s2UpSchema, $s2UpIndex, $s2UpSearch, $logger, new ContentExtractor($s2UpConfig));
+		$conn->executeStatement(<<<'SQL'
+			CREATE TABLE ftspg_s2up_index (
+				id            bigserial    PRIMARY KEY,
+				provider_id   varchar(64)  NOT NULL,
+				document_id   varchar(254) NOT NULL,
+				owner_id      varchar(64)  NOT NULL DEFAULT '',
+				access        text[]       NOT NULL DEFAULT '{}',
+				links         text[]       NOT NULL DEFAULT '{}',
+				tags          text[]       NOT NULL DEFAULT '{}',
+				metatags      text[]       NOT NULL DEFAULT '{}',
+				subtags       text[]       NOT NULL DEFAULT '{}',
+				source        varchar(64)  NOT NULL DEFAULT '',
+				hash          varchar(128) NOT NULL DEFAULT '',
+				modified_time bigint       NOT NULL DEFAULT 0,
+				indexed_at    bigint       NOT NULL DEFAULT 0,
+				config        regconfig    NOT NULL,
+				title         text         NOT NULL DEFAULT '',
+				tags_text     text         NOT NULL DEFAULT '',
+				parts         jsonb        NOT NULL DEFAULT '{}',
+				parts_text    text         NOT NULL DEFAULT '',
+				content       text         NOT NULL DEFAULT '',
+				info          jsonb        NOT NULL DEFAULT '{}',
+				tsv           tsvector     GENERATED ALWAYS AS (
+					setweight(to_tsvector(config, CASE WHEN config = 'turkish'::regconfig THEN translate(title, 'Iİ', 'ıi') ELSE title END), 'A')
+					|| setweight(to_tsvector(config, CASE WHEN config = 'turkish'::regconfig THEN translate(content, 'Iİ', 'ıi') ELSE content END), 'D')
+				) STORED,
+				title_search  text         GENERATED ALWAYS AS (lower(CASE WHEN config = 'turkish'::regconfig THEN translate(title, 'Iİ', 'ıi') ELSE title END)) STORED,
+				CONSTRAINT ftspg_s2up_index_doc_uniq UNIQUE (provider_id, document_id)
+			)
+			SQL);
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s2up_index.tsv IS 'ftspg schema 2'");
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_index_tsv_idx ON ftspg_s2up_index USING GIN (tsv)');
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_index_access_idx ON ftspg_s2up_index USING GIN (access)');
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_index_metatags_idx ON ftspg_s2up_index USING GIN (metatags)');
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_index_subtags_idx ON ftspg_s2up_index USING GIN (subtags)');
+		$conn->executeStatement(sprintf(
+			'CREATE TABLE ftspg_s2up_words (word text COLLATE "C" PRIMARY KEY, folded text COLLATE "C" GENERATED ALWAYS AS (translate(word, \'%s\', \'%s\')) STORED)',
+			\OCA\FullTextSearch_PgSql\Tools\Fold::FROM,
+			\OCA\FullTextSearch_PgSql\Tools\Fold::TO
+		));
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_words_folded_idx ON ftspg_s2up_words (folded)');
+		if ($s2UpSchema->hasTrigram()) {
+			$conn->executeStatement('CREATE INDEX ftspg_s2up_index_title_search_trgm_idx ON ftspg_s2up_index USING GIN (title_search gin_trgm_ops)');
+			$conn->executeStatement('CREATE INDEX ftspg_s2up_words_folded_trgm_idx ON ftspg_s2up_words USING GIN (folded gin_trgm_ops)');
+		}
+		$conn->executeStatement(
+			'INSERT INTO ftspg_s2up_index (provider_id, document_id, owner_id, access, config, title, content) VALUES '
+			. "('files', 'S2U_EN', 'alice', '{u:alice}', 'english'::regconfig, 'Annual budget', 'The studies were published in the archive.'), "
+			. "('files', 'S2U_TR', 'alice', '{u:alice}', 'turkish'::regconfig, 'Yıllık rapor', 'Bu yılki kitapları kütüphaneye verdik.')"
+		);
+		$s2UpSchema->ensureSchema();
+		$s2UpMarker = $conn->executeQuery(
+			"SELECT col_description(to_regclass('ftspg_s2up_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s2up_index') AND attname = 'tsv' AND NOT attisdropped"
+		)->fetchOne();
+		same('ftspg schema 3', $s2UpMarker, 'S2 upgrade from v2: marker updated to ftspg schema 3');
+		$s2UpColTypes = [];
+		foreach ($conn->executeQuery("SELECT attname, format_type(atttypid, atttypmod) AS typ FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s2up_index') AND attnum > 0 AND NOT attisdropped")->fetchAll() as $row) {
+			$s2UpColTypes[(string)$row['attname']] = (string)$row['typ'];
+		}
+		foreach (['config', 'provider_id', 'document_id', 'owner_id', 'source', 'hash'] as $col) {
+			same('text', $s2UpColTypes[$col] ?? null, "S2 upgrade from v2: $col migrated to text");
+		}
+		same(true, (bool)$conn->executeQuery("SELECT to_regprocedure('ftspg_s2up_regconfig(text)') IS NOT NULL")->fetchOne(), 'S2 upgrade from v2: ftspg_s2up_regconfig(text) created');
+		same(2, $s2UpSchema->countDocuments(), 'S2 upgrade from v2: row count preserved');
+		same('english', (string)$conn->executeQuery("SELECT config::text FROM ftspg_s2up_index WHERE document_id = 'S2U_EN'")->fetchOne(), 'S2 upgrade from v2: english config preserved');
+		same('turkish', (string)$conn->executeQuery("SELECT config::text FROM ftspg_s2up_index WHERE document_id = 'S2U_TR'")->fetchOne(), 'S2 upgrade from v2: turkish config preserved');
+		try {
+			same(['S2U_EN'], search($s2UpPlatform, 'alice', 'study')['ids'], 'S2 upgrade from v2: English search works after upgrade');
+			same(['S2U_TR'], search($s2UpPlatform, 'alice', 'kitaplarımız')['ids'], 'S2 upgrade from v2: Turkish search works after upgrade');
+		} catch (Throwable $e) {
+			check(false, 'S2 upgrade from v2 search failed: ' . $e->getMessage());
+		}
+
+		// 5. Uninstall (DropIndexTable / dropSchema) drops ftspg_<prefix>regconfig(text) cleanly
+		$s2DropSchema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 's2drop_']), $logger);
+		$s2DropSchema->ensureSchema();
+		if (!(bool)$conn->executeQuery("SELECT to_regprocedure('ftspg_s2drop_regconfig(text)') IS NOT NULL")->fetchOne()) {
+			// On S1 baseline, create the function so DropIndexTable/dropSchema removal is independently verified.
+			$conn->executeStatement('CREATE OR REPLACE FUNCTION ftspg_s2drop_regconfig(text) RETURNS pg_catalog.regconfig LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$SELECT $1::pg_catalog.regconfig$$');
+		}
+		$dropOutput = double(\OCP\Migration\IOutput::class, [
+			'info' => function (string $message) {
+			},
+			'warning' => function (string $message) {
+			},
+		]);
+		(new DropIndexTable($s2DropSchema))->run($dropOutput);
+		$s2DropSchema->dropSchema();
+		same(false, (bool)$conn->executeQuery("SELECT to_regclass('ftspg_s2drop_index') IS NOT NULL")->fetchOne(), 'S2 uninstall: index table dropped');
+		same(false, (bool)$conn->executeQuery("SELECT to_regclass('ftspg_s2drop_words') IS NOT NULL")->fetchOne(), 'S2 uninstall: words table dropped');
+		same(0, (int)$conn->executeQuery("SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = current_schema() AND p.proname = 'ftspg_s2drop_regconfig'")->fetchOne(), 'S2 uninstall: ftspg_s2drop_regconfig(text) dropped');
+
+		// 6. varchar caps lifted (>254 document_id, >64 provider_id/owner_id/source, >128 hash with content === '', plus >254 document_id with content)
+		$longProvider = str_repeat('p', 80);
+		$longDocId = str_repeat('d', 300);
+		$longOwner = str_repeat('o', 80);
+		$longSource = str_repeat('s', 80);
+		$longHash = str_repeat('h', 160);
+		$longDoc = doc($longDocId, $longOwner, 'LongVarcharTitle', '', ['parts' => ['comments' => 'longvarcharneedle']], $longProvider);
+		$longDoc->setSource($longSource);
+		$longDoc->setHash($longHash);
+		$longDocContent = doc($longDocId . '_c', $longOwner, 'LongVarcharContentTitle', 'longvarcharcontentneedle indexed body text', [], $longProvider);
+		try {
+			$res1 = $platform->indexDocument($longDoc);
+			$res2 = $platform->indexDocument($longDocContent);
+			same(true, $res1->isStatus(IIndex::INDEX_DONE), 'S2 varchar caps: indexed doc with >254 doc_id, >64 provider/owner/source, >128 hash');
+			same(true, $res2->isStatus(IIndex::INDEX_DONE), 'S2 varchar caps: indexed doc with >254 doc_id and non-empty content');
+			same([$longDocId], search($platform, $longOwner, 'longvarcharneedle', ['provider' => $longProvider])['ids'], 'S2 varchar caps: search finds >254 document_id by parts');
+			same([$longDocId . '_c'], search($platform, $longOwner, 'longvarcharcontentneedle', ['provider' => $longProvider])['ids'], 'S2 varchar caps: search finds >254 document_id by content');
+			$fetchedLong = $platform->getDocument($longProvider, $longDocId);
+			same($longProvider, $fetchedLong->getProviderId(), 'S2 varchar caps: >64 provider_id round-trips');
+			same($longDocId, $fetchedLong->getId(), 'S2 varchar caps: >254 document_id round-trips');
+			same($longOwner, $fetchedLong->getAccess()->getOwnerId(), 'S2 varchar caps: >64 owner_id round-trips');
+			same($longSource, $fetchedLong->getSource(), 'S2 varchar caps: >64 source round-trips');
+			same($longHash, $fetchedLong->getHash(), 'S2 varchar caps: >128 hash round-trips');
+		} catch (Throwable $e) {
+			check(false, 'S2 varchar caps lifted failed: ' . $e->getMessage());
+		}
+
+		// 7. Multi-language (turkish,english) + fallback 'french' row exercising languageConditions(), headlineSql(), countDocumentsByLanguage(), VocabularyService::rebuild()
+		$config->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		try {
+			$platform->indexDocument(doc('S2ML_TR', 'alice', 'ISPARTA GÜLLERİ', 'İSTANBUL ofisinde ISPARTA çalışma ve projeler arttı.', [], 's2ml'));
+			$platform->indexDocument(doc('S2ML_EN', 'alice', 'Annual study', 'The studies were published in the archive.', [], 's2ml'));
+			$conn->executeStatement(
+				"INSERT INTO ftspg_oc_index (provider_id, document_id, owner_id, access, config, title, content) VALUES ('s2ml', 'S2ML_FR', 'alice', '{u:alice}', 'french', 'Rapport', 'kitapları okuyalım')"
+			);
+			$langCounts = $schema->countDocumentsByLanguage();
+			check(($langCounts['turkish'] ?? 0) >= 1 && ($langCounts['english'] ?? 0) >= 1 && ($langCounts['french'] ?? 0) >= 1, 'S2 multi-lang: countDocumentsByLanguage reports turkish, english, and french');
+
+			$trRes = search($platform, 'alice', 'ısparta', ['provider' => 's2ml']);
+			same(['S2ML_TR'], $trRes['ids'], 'S2 multi-lang: Turkish search finds S2ML_TR');
+			$trExcerpt = isset($trRes['docs'][0]) ? implode(' ', array_column($trRes['docs'][0]->getExcerpts() ?? [], 'excerpt')) : '';
+			check(str_contains($trExcerpt, 'ISPARTA'), 'S2 multi-lang: Turkish headlineSql preserves uppercase I/İ casing in excerpt');
+
+			$enRes = search($platform, 'alice', 'study', ['provider' => 's2ml']);
+			same(['S2ML_EN'], $enRes['ids'], 'S2 multi-lang: English search finds S2ML_EN');
+			$enExcerpt = isset($enRes['docs'][0]) ? implode(' ', array_column($enRes['docs'][0]->getExcerpts() ?? [], 'excerpt')) : '';
+			check($enExcerpt !== '' && str_contains($enExcerpt, 'studies'), 'S2 multi-lang: English headlineSql produces excerpt');
+
+			same(['S2ML_FR'], search($platform, 'alice', 'kitaplarımız', ['provider' => 's2ml'])['ids'], 'S2 multi-lang: fallback french row matched by primary turkish branch (<> ALL text[])');
+
+			$vocabTotal = $vocabulary->rebuild();
+			check($vocabTotal > 0, 'S2 multi-lang: VocabularyService::rebuild() succeeds');
+			same(['S2ML_TR'], search($platform, 'alice', 'calisma', ['provider' => 's2ml'])['ids'], 'S2 multi-lang: Turkish accent variant calisma finds çalışma');
+		} catch (Throwable $e) {
+			check(false, 'S2 multi-lang check failed: ' . $e->getMessage());
+		} finally {
+			$config->setConfig(['language' => 'turkish']);
+		}
+	} finally {
+		$s2Cleanup();
+	}
+
+	section('1.4.2/1.5.x to schema v3 upgrade fixture (S3)');
+	$s3UpCleanup = static function () use ($conn): void {
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s3up_index, ftspg_s3up_words');
+		$conn->executeStatement('DROP FUNCTION IF EXISTS ftspg_s3up_regconfig(text)');
+	};
+	$s3UpCleanup();
+
+	try {
+		$s3UpSysConfig = new ArrayConfig(['dbtableprefix' => 's3up_']);
+		$s3UpSchema = new SchemaService($conn, $s3UpSysConfig, $logger);
+		$s3UpConfig = new ConfigService(new ArrayAppConfig(), $s3UpSchema);
+		$s3UpConfig->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		$s3UpVocab = new VocabularyService($conn, $s3UpSchema);
+		$s3UpIndex = new IndexService($conn, $s3UpSchema, $s3UpConfig, new ContentExtractor($s3UpConfig), $s3UpVocab, $logger, new LanguageDetector($conn, $s3UpConfig, $logger));
+		$s3UpSearch = new SearchService($conn, $s3UpSchema, $s3UpConfig, new TsQueryBuilder(), $s3UpVocab);
+		$s3UpPlatform = new PostgreSQLPlatform($s3UpConfig, $s3UpSchema, $s3UpIndex, $s3UpSearch, $logger, new ContentExtractor($s3UpConfig));
+
+		$v2Norm = static fn (string $c): string => "CASE WHEN config = 'turkish'::regconfig THEN translate($c, 'Iİ', 'ıi') ELSE $c END";
+		$v2Title = $v2Norm('title');
+		$v2SplitTitle = $s3UpSchema->splitWords($v2Title);
+		$v2Tags = $v2Norm('tags_text');
+		$v2Parts = $v2Norm('parts_text');
+		$v2Content = $v2Norm('content');
+
+		$conn->executeStatement(<<<SQL
+			CREATE TABLE ftspg_s3up_index (
+				id            bigserial    PRIMARY KEY,
+				provider_id   varchar(64)  NOT NULL,
+				document_id   varchar(254) NOT NULL,
+				owner_id      varchar(64)  NOT NULL DEFAULT '',
+				access        text[]       NOT NULL DEFAULT '{}',
+				links         text[]       NOT NULL DEFAULT '{}',
+				tags          text[]       NOT NULL DEFAULT '{}',
+				metatags      text[]       NOT NULL DEFAULT '{}',
+				subtags       text[]       NOT NULL DEFAULT '{}',
+				source        varchar(64)  NOT NULL DEFAULT '',
+				hash          varchar(128) NOT NULL DEFAULT '',
+				modified_time bigint       NOT NULL DEFAULT 0,
+				indexed_at    bigint       NOT NULL DEFAULT 0,
+				config        regconfig    NOT NULL,
+				title         text         NOT NULL DEFAULT '',
+				tags_text     text         NOT NULL DEFAULT '',
+				parts         jsonb        NOT NULL DEFAULT '{}',
+				parts_text    text         NOT NULL DEFAULT '',
+				content       text         NOT NULL DEFAULT '',
+				info          jsonb        NOT NULL DEFAULT '{}',
+				tsv           tsvector     GENERATED ALWAYS AS (
+					setweight(to_tsvector(config, $v2Title), 'A')
+					|| setweight(to_tsvector(config, $v2SplitTitle), 'A')
+					|| setweight(to_tsvector(config, $v2Tags), 'B')
+					|| setweight(to_tsvector(config, $v2Parts), 'C')
+					|| setweight(to_tsvector(config, $v2Content), 'D')
+				) STORED,
+				title_search  text         GENERATED ALWAYS AS (lower($v2Title)) STORED,
+				CONSTRAINT ftspg_s3up_index_doc_uniq UNIQUE (provider_id, document_id)
+			)
+			SQL);
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s3up_index.tsv IS 'ftspg schema 2'");
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_index_tsv_idx ON ftspg_s3up_index USING GIN (tsv)');
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_index_access_idx ON ftspg_s3up_index USING GIN (access)');
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_index_metatags_idx ON ftspg_s3up_index USING GIN (metatags)');
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_index_subtags_idx ON ftspg_s3up_index USING GIN (subtags)');
+		$conn->executeStatement(sprintf(
+			'CREATE TABLE ftspg_s3up_words (word text COLLATE "C" PRIMARY KEY, folded text COLLATE "C" GENERATED ALWAYS AS (translate(word, \'%s\', \'%s\')) STORED)',
+			\OCA\FullTextSearch_PgSql\Tools\Fold::FROM,
+			\OCA\FullTextSearch_PgSql\Tools\Fold::TO
+		));
+		$conn->executeStatement('CREATE INDEX ftspg_s3up_words_folded_idx ON ftspg_s3up_words (folded)');
+		if ($s3UpSchema->hasTrigram()) {
+			$conn->executeStatement('CREATE INDEX ftspg_s3up_index_title_search_trgm_idx ON ftspg_s3up_index USING GIN (title_search gin_trgm_ops)');
+			$conn->executeStatement('CREATE INDEX ftspg_s3up_words_folded_trgm_idx ON ftspg_s3up_words USING GIN (folded gin_trgm_ops)');
+		}
+
+		$conn->executeStatement(
+			'INSERT INTO ftspg_s3up_index (provider_id, document_id, owner_id, access, source, hash, config, title, tags_text, parts_text, content) VALUES '
+			. "('files', 'S3UP_EN1', 'alice', '{u:alice}', 'local', 'hash_en_1', 'english'::regconfig, 'Quarterly budget review', 'finance', 'annual_comment', 'The studies were archived cleanly.'), "
+			. "('files', 'S3UP_EN2', 'bob', '{u:bob}', 'external', 'hash_en_2', 'english'::regconfig, 'Private notes', '', '', 'Bob confidential report.'), "
+			. "('files', 'S3UP_TR1', 'alice', '{u:alice}', 'local', 'hash_tr_1', 'turkish'::regconfig, 'ISPARTA GÜLLERİ', 'İSTANBUL', 'proje_notu', 'Yeni çalışma kapsamında kitapları inceledik.'), "
+			. "('files', 'S3UP_TR2', 'alice', '{u:alice}', 'share', 'hash_tr_2', 'turkish'::regconfig, 'Yıllık toplantı', '', '', 'Veri tabanı planlaması tamamlandı.')"
+		);
+		$conn->executeStatement(
+			'INSERT INTO ftspg_s3up_words (word) VALUES '
+			. "('quarterly'), ('budget'), ('studies'), ('archived'), ('çalışma'), ('ısparta'), ('istanbul'), ('kitapları'), ('planlaması')"
+		);
+
+		same(false, $s3UpSchema->isCurrent(), 'S3 upgrade fixture: pre-upgrade isCurrent() is false');
+		$loadRefused = false;
+		try {
+			$s3UpPlatform->loadPlatform();
+		} catch (\RuntimeException) {
+			$loadRefused = true;
+		}
+		same(true, $loadRefused, 'S3 upgrade fixture: loadPlatform() refuses stale v2 schema');
+		same(
+			'regconfig',
+			(string)$conn->executeQuery("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s3up_index') AND attname = 'config' AND NOT attisdropped")->fetchOne(),
+			'S3 upgrade fixture: loadPlatform() leaves config as regconfig'
+		);
+
+		$s3UpSchema->ensureSchema();
+		same(true, $s3UpSchema->isCurrent(), 'S3 upgrade fixture: ensureSchema() brings schema to current');
+		same(
+			'ftspg schema 3',
+			$conn->executeQuery("SELECT col_description(to_regclass('ftspg_s3up_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s3up_index') AND attname = 'tsv' AND NOT attisdropped")->fetchOne(),
+			'S3 upgrade fixture: tsv comment updated to ftspg schema 3'
+		);
+		$s3UpFnRow = $conn->executeQuery(
+			"SELECT p.provolatile, p.proparallel FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = current_schema() AND p.proname = 'ftspg_s3up_regconfig' AND pg_get_function_identity_arguments(p.oid) = 'text'"
+		)->fetch();
+		same('i', is_array($s3UpFnRow) ? (string)$s3UpFnRow['provolatile'] : null, 'S3 upgrade fixture: ftspg_s3up_regconfig(text) is IMMUTABLE');
+		same('s', is_array($s3UpFnRow) ? (string)$s3UpFnRow['proparallel'] : null, 'S3 upgrade fixture: ftspg_s3up_regconfig(text) is PARALLEL SAFE');
+
+		$s3UpColTypes = [];
+		$s3UpRegCols = [];
+		foreach ($conn->executeQuery("SELECT attname, format_type(atttypid, atttypmod) AS typ FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s3up_index') AND attnum > 0 AND NOT attisdropped")->fetchAll() as $row) {
+			$colName = (string)$row['attname'];
+			$colType = (string)$row['typ'];
+			$s3UpColTypes[$colName] = $colType;
+			if (str_starts_with($colType, 'reg')) {
+				$s3UpRegCols[] = $colName . ':' . $colType;
+			}
+		}
+		foreach (['config', 'provider_id', 'document_id', 'owner_id', 'source', 'hash'] as $col) {
+			same('text', $s3UpColTypes[$col] ?? null, "S3 upgrade fixture: $col migrated to text");
+		}
+		same([], $s3UpRegCols, 'S3 upgrade fixture: zero reg* columns after upgrade');
+
+		same(4, $s3UpSchema->countDocuments(), 'S3 upgrade fixture: index row count preserved');
+		same(9, $s3UpVocab->count(), 'S3 upgrade fixture: vocabulary row count preserved');
+		$s3UpEnRow = $conn->executeQuery("SELECT config, owner_id, source, hash FROM ftspg_s3up_index WHERE document_id = 'S3UP_EN1'")->fetch();
+		same(['config' => 'english', 'owner_id' => 'alice', 'source' => 'local', 'hash' => 'hash_en_1'], $s3UpEnRow, 'S3 upgrade fixture: English metadata and config preserved');
+		$s3UpTrRow = $conn->executeQuery("SELECT config, owner_id, source, hash FROM ftspg_s3up_index WHERE document_id = 'S3UP_TR1'")->fetch();
+		same(['config' => 'turkish', 'owner_id' => 'alice', 'source' => 'local', 'hash' => 'hash_tr_1'], $s3UpTrRow, 'S3 upgrade fixture: Turkish metadata and config preserved');
+
+		same(['S3UP_EN1'], search($s3UpPlatform, 'alice', 'study')['ids'], 'S3 upgrade fixture: English stemming search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'kitaplarımız')['ids'], 'S3 upgrade fixture: Turkish stemming search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'ısparta')['ids'], 'S3 upgrade fixture: Turkish lowercase I folding search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'Isparta')['ids'], 'S3 upgrade fixture: Turkish uppercase I folding search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'istanbul')['ids'], 'S3 upgrade fixture: Turkish tags_text İ folding search works');
+		same(['S3UP_TR1'], search($s3UpPlatform, 'alice', 'calisma')['ids'], 'S3 upgrade fixture: preserved vocabulary accent variant search works');
+		if ($s3UpSchema->hasTrigram()) {
+			same(['S3UP_EN1'], search($s3UpPlatform, 'alice', 'quartrly')['ids'], 'S3 upgrade fixture: preserved vocabulary typo correction works');
+		}
+
+		$s3LongProvider = str_repeat('p', 80);
+		$s3LongDocId = str_repeat('d', 300);
+		$s3LongRes = $s3UpPlatform->indexDocument(doc($s3LongDocId, 'alice', 'PostUpgradeWideTitle', 'postupgradewideneedle content', [], $s3LongProvider));
+		same(true, $s3LongRes->isStatus(IIndex::INDEX_DONE), 'S3 upgrade fixture: post-upgrade >254 doc_id and >64 provider_id insert succeeds');
+		same([$s3LongDocId], search($s3UpPlatform, 'alice', 'postupgradewideneedle', ['provider' => $s3LongProvider])['ids'], 'S3 upgrade fixture: post-upgrade wide-id document is searchable');
+	} finally {
+		$s3UpCleanup();
+	}
+
+	section('pg_catalog reg* column assertion (S3)');
+	$ocTableCount = (int)$conn->executeQuery(
+		"SELECT count(*)
+		 FROM pg_catalog.pg_class c
+		 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		 WHERE c.relkind IN ('r', 'p')
+		   AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+		   AND n.nspname <> 'information_schema'
+		   AND c.relname IN ('ftspg_oc_index', 'ftspg_oc_words')"
+	)->fetchOne();
+	check($ocTableCount >= 2, 'S3 catalog: ftspg_oc_index and ftspg_oc_words exist in pg_catalog');
+	$regColumns = $conn->executeQuery(
+		"SELECT n.nspname || '.' || c.relname || '.' || a.attname || ':' || pg_catalog.format_type(a.atttypid, a.atttypmod) AS col
+		 FROM pg_catalog.pg_attribute a
+		 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+		 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		 JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+		 LEFT JOIN pg_catalog.pg_type elem ON elem.oid = t.typelem AND t.typcategory = 'A'
+		 WHERE c.relkind IN ('r', 'p', 'm')
+		   AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+		   AND n.nspname <> 'information_schema'
+		   AND c.relname LIKE 'ftspg\_%' ESCAPE '\'
+		   AND a.attnum > 0
+		   AND NOT a.attisdropped
+		   AND (t.typname LIKE 'reg%' OR elem.typname LIKE 'reg%')
+		 ORDER BY 1"
+	)->fetchAll(\PDO::FETCH_COLUMN);
+	same([], $regColumns, 'S3 catalog: zero reg* or _reg* columns on any ftspg_* table');
+
+	section('pg_dump / pg_restore under empty search_path (S3)');
+	$dsnBody = str_starts_with($dsn, 'pgsql:') ? substr($dsn, 6) : $dsn;
+	$rawPairs = str_contains($dsnBody, ';')
+		? explode(';', $dsnBody)
+		: (preg_split('/\s+/', trim($dsnBody)) ?: []);
+	$dsnParts = [];
+	foreach ($rawPairs as $pair) {
+		$pair = trim($pair);
+		if ($pair === '' || !str_contains($pair, '=')) {
+			continue;
+		}
+		[$k, $v] = explode('=', $pair, 2);
+		$dsnParts[strtolower(trim($k))] = trim($v);
+	}
+	$pgEnv = getenv();
+	if (!is_array($pgEnv)) {
+		$pgEnv = [];
+	}
+	unset($pgEnv['PGDATABASE']);
+	if (isset($dsnParts['host']) && $dsnParts['host'] !== '') {
+		$pgEnv['PGHOST'] = $dsnParts['host'];
+	}
+	if (isset($dsnParts['port']) && $dsnParts['port'] !== '') {
+		$pgEnv['PGPORT'] = $dsnParts['port'];
+	}
+	if (isset($dsnParts['user']) && $dsnParts['user'] !== '') {
+		$pgEnv['PGUSER'] = $dsnParts['user'];
+	}
+	if (isset($dsnParts['password'])) {
+		$pgEnv['PGPASSWORD'] = $dsnParts['password'];
+	}
+	if (isset($dsnParts['sslmode']) && $dsnParts['sslmode'] !== '') {
+		$pgEnv['PGSSLMODE'] = $dsnParts['sslmode'];
+	}
+	$sourceDb = $dsnParts['dbname'] ?? ($dsnParts['user'] ?? 'postgres');
+	$restoreDb = 'ftspg_restore_test_' . getmypid();
+	$qRestoreDb = '"' . str_replace('"', '""', $restoreDb) . '"';
+	$restoreParts = $dsnParts;
+	$restoreParts['dbname'] = $restoreDb;
+	$restoreDsn = 'pgsql:' . implode(';', array_map(
+		static fn (string $k, string $v): string => "$k=$v",
+		array_keys($restoreParts),
+		array_values($restoreParts)
+	));
+	$dumpFile = sys_get_temp_dir() . '/ftspg_s3_dump_' . getmypid() . '_' . mt_rand() . '.dump';
+
+	$runPgTool = static function (array $cmd, array $env): array {
+		$proc = proc_open($cmd, [
+			0 => ['pipe', 'r'],
+			1 => ['pipe', 'w'],
+			2 => ['pipe', 'w'],
+		], $pipes, null, $env);
+		if (!is_resource($proc)) {
+			throw new \RuntimeException('Failed to spawn ' . $cmd[0]);
+		}
+		fclose($pipes[0]);
+		$stdout = stream_get_contents($pipes[1]);
+		$stderr = stream_get_contents($pipes[2]);
+		fclose($pipes[1]);
+		fclose($pipes[2]);
+		$code = proc_close($proc);
+		return [$code, is_string($stdout) ? $stdout : '', is_string($stderr) ? $stderr : ''];
+	};
+
+	$restorePdo = null;
+	$restoreConn = null;
+	$restoreSchema = null;
+	$restoreConfig = null;
+	$restoreVocab = null;
+	$restoreDetector = null;
+	$restoreIndex = null;
+	$restoreSearch = null;
+	$restorePlatform = null;
+
+	try {
+		[$dumpVerCode, $dumpVerOut, $dumpVerErr] = $runPgTool(['pg_dump', '--version'], $pgEnv);
+		same(0, $dumpVerCode, 'S3 pg_dump --version exits 0: ' . trim($dumpVerOut . ' ' . $dumpVerErr));
+		[$restoreVerCode, $restoreVerOut, $restoreVerErr] = $runPgTool(['pg_restore', '--version'], $pgEnv);
+		same(0, $restoreVerCode, 'S3 pg_restore --version exits 0: ' . trim($restoreVerOut . ' ' . $restoreVerErr));
+
+		$config->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		$platform->indexDocument(doc('S3DUMP_EN', 'alice', 'Annual budget archive', 'The quarterly studies were published in the archive.', [], 's3dump'));
+		$platform->indexDocument(doc('S3DUMP_TR', 'alice', 'ISPARTA GÜLLERİ', 'İSTANBUL ofisinde ISPARTA çalışma ve kitapları inceledik.', [], 's3dump'));
+		$platform->indexDocument(doc('S3DUMP_IDF', 'alice', 'Budget summary', 'budget common word and rarexylophone needle', [], 's3dump'));
+		$sourceCount = $schema->countDocuments();
+		check($sourceCount >= 3, 'S3 dump/restore: source database populated');
+
+		[$dumpCode, , $dumpErr] = $runPgTool(['pg_dump', '-w', '-Fc', '-f', $dumpFile, $sourceDb], $pgEnv);
+		same(0, $dumpCode, 'S3 pg_dump exits 0' . ($dumpErr === '' ? '' : ': ' . trim($dumpErr)));
+		same('', trim($dumpErr), 'S3 pg_dump produces empty stderr');
+		check(is_file($dumpFile) && filesize($dumpFile) > 0, 'S3 pg_dump produces non-empty archive');
+
+		[$listCode, $listOut, $listErr] = $runPgTool(['pg_restore', '-l', $dumpFile], $pgEnv);
+		same(0, $listCode, 'S3 pg_restore -l exits 0' . ($listErr === '' ? '' : ': ' . trim($listErr)));
+		$fnLine = null;
+		$tblLine = null;
+		foreach (explode("\n", $listOut) as $lineIdx => $line) {
+			if ($fnLine === null && preg_match('/\bFUNCTION\b.*\bftspg_oc_regconfig\b/', $line) === 1) {
+				$fnLine = $lineIdx;
+			}
+			if ($tblLine === null && preg_match('/\bTABLE\b.*\bftspg_oc_index\b/', $line) === 1) {
+				$tblLine = $lineIdx;
+			}
+		}
+		check($fnLine !== null && $tblLine !== null && $fnLine < $tblLine, 'S3 pg_restore -l places FUNCTION ftspg_oc_regconfig before TABLE ftspg_oc_index');
+
+		$conn->executeStatement("DROP DATABASE IF EXISTS $qRestoreDb WITH (FORCE)");
+		$conn->executeStatement("CREATE DATABASE $qRestoreDb TEMPLATE template0");
+		[$restoreCode, , $restoreErr] = $runPgTool(['pg_restore', '-w', '-e', '--no-owner', '--no-acl', '-d', $restoreDb, $dumpFile], $pgEnv);
+		same(0, $restoreCode, 'S3 pg_restore exits 0' . ($restoreErr === '' ? '' : ': ' . trim($restoreErr)));
+		same('', trim($restoreErr), 'S3 pg_restore produces empty stderr');
+
+		$restorePdo = new PDO($restoreDsn);
+		$restorePdo->exec("SET search_path = ''");
+		$spVal = (string)$restorePdo->query("SELECT pg_catalog.current_setting('search_path')")->fetchColumn();
+		check(in_array($spVal, ['', '""'], true), 'S3 empty search_path: current_setting is empty');
+		same(true, (bool)$restorePdo->query('SELECT pg_catalog.current_schema() IS NULL')->fetchColumn(), 'S3 empty search_path: current_schema() is NULL');
+
+		$restoreConn = new PdoConnection($restorePdo);
+		$restoreSchema = new SchemaService($restoreConn, new ArrayConfig(['dbtableprefix' => 'oc_']), $logger);
+		$restoreConfig = new ConfigService(new ArrayAppConfig(), $restoreSchema);
+		$restoreConfig->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		$restoreVocab = new VocabularyService($restoreConn, $restoreSchema);
+		$restoreDetector = new LanguageDetector($restoreConn, $restoreConfig, $logger);
+		$restoreExtractor = new ContentExtractor($restoreConfig);
+		$restoreIndex = new IndexService($restoreConn, $restoreSchema, $restoreConfig, $restoreExtractor, $restoreVocab, $logger, $restoreDetector);
+		$restoreSearch = new SearchService($restoreConn, $restoreSchema, $restoreConfig, new TsQueryBuilder(), $restoreVocab);
+		$restorePlatform = new PostgreSQLPlatform($restoreConfig, $restoreSchema, $restoreIndex, $restoreSearch, $logger, $restoreExtractor);
+
+		same(true, $restoreSchema->isCurrent(), 'S3 empty search_path: SchemaService::isCurrent() returns true');
+		same($sourceCount, $restoreSchema->countDocuments(), 'S3 empty search_path: SchemaService::countDocuments() matches source');
+		same(['S3DUMP_EN'], search($restorePlatform, 'alice', 'study', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: English search works');
+
+		$trDumpRes = search($restorePlatform, 'alice', 'ısparta', ['provider' => 's3dump']);
+		same(['S3DUMP_TR'], $trDumpRes['ids'], 'S3 empty search_path: Turkish I/İ search works');
+		$trDumpExcerpt = isset($trDumpRes['docs'][0]) ? implode(' ', array_column($trDumpRes['docs'][0]->getExcerpts() ?? [], 'excerpt')) : '';
+		check(str_contains($trDumpExcerpt, 'ISPARTA'), 'S3 empty search_path: Turkish ts_headline excerpt preserves casing');
+
+		same(['S3DUMP_IDF', 'S3DUMP_EN'], search($restorePlatform, 'alice', 'budget rarexylophone', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: multi-word IDF search works');
+		same(['S3DUMP_TR'], search($restorePlatform, 'alice', 'calisma', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: vocabulary accent variant works');
+
+		if ($restoreSchema->hasTrigram()) {
+			same(['S3DUMP_EN'], search($restorePlatform, 'alice', 'quartrly', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: vocabulary typo correction (pg_trgm similarity/%) works');
+			$restoreConfig->setConfig(['language' => 'turkish,english', 'typo_correction' => false]);
+			same(['S3DUMP_EN'], search($restorePlatform, 'alice', 'annuall', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: title similarity fallback (pg_trgm word_similarity/<%) works');
+			$restoreConfig->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		}
+
+		$emptySpInsert = $restorePlatform->indexDocument(doc('S3DUMP_EMPTY_SP', 'alice', 'Empty path insert', 'verification payload under empty search path', [], 's3dump'));
+		same(true, $emptySpInsert->isStatus(IIndex::INDEX_DONE), 'S3 empty search_path: IndexService::upsert() succeeds');
+		same(['S3DUMP_EMPTY_SP'], search($restorePlatform, 'alice', 'verification', ['provider' => 's3dump'])['ids'], 'S3 empty search_path: newly indexed doc is searchable');
+		same('Empty path insert', $restorePlatform->getDocument('s3dump', 'S3DUMP_EMPTY_SP')->getTitle(), 'S3 empty search_path: getDocument() round-trips');
+	} finally {
+		$restorePlatform = null;
+		$restoreSearch = null;
+		$restoreIndex = null;
+		$restoreDetector = null;
+		$restoreVocab = null;
+		$restoreConfig = null;
+		$restoreSchema = null;
+		$restoreConn = null;
+		$restorePdo = null;
+		$conn->executeStatement("DROP DATABASE IF EXISTS $qRestoreDb WITH (FORCE)");
+		if (is_file($dumpFile)) {
+			@unlink($dumpFile);
+		}
+		$platform->resetIndex('s3dump');
+		$config->setConfig(['language' => 'turkish']);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";

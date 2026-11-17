@@ -26,6 +26,7 @@ class ContentExtractor {
 
 	private const PDF_TIMEOUT_SECONDS = 60;
 	private const TOOL_TIMEOUT_SECONDS = 60;
+	private const MAX_STDERR_BYTES = 65536;
 
 	private const BLOCK_TAGS_PATTERN = '#</?(?:p|div|td|th|li|ul|ol|table|tr|h[1-6]|header|footer|section|article|blockquote|pre|aside|nav|main|figure|figcaption|br|hr)\b[^>]*>#i';
 
@@ -319,40 +320,103 @@ class ContentExtractor {
 	private function runTool(string $label, array $command, string $raw, int $timeout): array {
 		$tmp = tempnam(sys_get_temp_dir(), 'ftspg');
 		if ($tmp === false || file_put_contents($tmp, $raw) === false) {
+			if ($tmp !== false) {
+				@unlink($tmp);
+			}
 			return ['', 'could not write a temporary file for ' . $label, false];
 		}
 
 		try {
 			$command = array_map(static fn (string $arg): string => $arg === '{file}' ? $tmp : $arg, $command);
+			$pipes = [];
 			$process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
 			if (!is_resource($process)) {
 				return ['', 'could not run ' . $label, false];
 			}
 
-			// Non-blocking: a tool that hangs must not hang the indexing run.
+			// Non-blocking: a tool that hangs or floods stderr must not stall indexing.
 			stream_set_blocking($pipes[1], false);
 			stream_set_blocking($pipes[2], false);
 			$output = '';
+			$errors = '';
 			$limit = $this->configService->getMaxContentSize() * 2 + 1;
-			$deadline = time() + $timeout;
-			while (!feof($pipes[1]) && time() < $deadline && strlen($output) < $limit) {
-				$chunk = fread($pipes[1], 65536);
-				if ($chunk === false || $chunk === '') {
-					usleep(20000);
+			$deadline = microtime(true) + (float)$timeout;
+			$stdoutOpen = true;
+			$stderrOpen = true;
+
+			while (($stdoutOpen || $stderrOpen) && strlen($output) < $limit && microtime(true) < $deadline) {
+				$read = [];
+				if ($stdoutOpen) {
+					$read[] = $pipes[1];
+				}
+				if ($stderrOpen) {
+					$read[] = $pipes[2];
+				}
+				$remainingUs = max(1, (int)ceil(($deadline - microtime(true)) * 1000000.0));
+				$sec = intdiv($remainingUs, 1000000);
+				$usec = $remainingUs % 1000000;
+				$write = null;
+				$except = null;
+				$ready = @stream_select($read, $write, $except, $sec, $usec);
+				if ($ready === false) {
+					usleep(10000);
 					continue;
 				}
-				$output .= $chunk;
+				if ($ready === 0) {
+					continue;
+				}
+				if ($stdoutOpen && in_array($pipes[1], $read, true)) {
+					$chunk = fread($pipes[1], 65536);
+					if ($chunk === false) {
+						$stdoutOpen = false;
+					} else {
+						if ($chunk !== '') {
+							$output .= $chunk;
+						}
+						if (feof($pipes[1])) {
+							$stdoutOpen = false;
+						}
+					}
+				}
+				if ($stderrOpen && in_array($pipes[2], $read, true)) {
+					$chunk = fread($pipes[2], 65536);
+					if ($chunk === false) {
+						$stderrOpen = false;
+					} else {
+						if ($chunk !== '' && strlen($errors) < self::MAX_STDERR_BYTES) {
+							$errors .= substr($chunk, 0, self::MAX_STDERR_BYTES - strlen($errors));
+						}
+						if (feof($pipes[2])) {
+							$stderrOpen = false;
+						}
+					}
+				}
 			}
-			$timedOut = !feof($pipes[1]) && time() >= $deadline;
+
+			$hitLimit = strlen($output) >= $limit;
+			$allEof = !$stdoutOpen && !$stderrOpen;
+			$timedOut = !$hitLimit && !$allEof && microtime(true) >= $deadline;
 			fclose($pipes[1]);
-			$errors = (string)stream_get_contents($pipes[2]);
 			fclose($pipes[2]);
-			if ($timedOut) {
-				proc_terminate($process);
+			// Skip proc_get_status() on normal EOF so proc_close() preserves the real exit code.
+			if (!$allEof) {
+				@proc_terminate($process);
+				$running = true;
+				for ($i = 0; $i < 10; $i++) {
+					$status = proc_get_status($process);
+					if (!$status['running']) {
+						$running = false;
+						break;
+					}
+					usleep(20000);
+				}
+				if ($running) {
+					@proc_terminate($process, 9);
+				}
 			}
 			$exitCode = proc_close($process);
 
-			if (!$timedOut && $exitCode !== 0 && trim($output) === '') {
+			if (!$timedOut && !$hitLimit && $exitCode !== 0 && trim($output) === '') {
 				$reason = trim(strtok($errors, "\n") ?: '');
 				return ['', $label . ' failed (exit code ' . $exitCode . ($reason !== '' ? ': ' . $reason : '') . ')', false];
 			}

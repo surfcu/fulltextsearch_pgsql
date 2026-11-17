@@ -64,6 +64,22 @@ class TsQueryBuilder {
 	}
 
 	/**
+	 * Parameterised tsquery for one word in a given language, matching build().
+	 *
+	 * @return array{0: string, 1: list<string>}
+	 */
+	public function wordTsQuery(string $word, string $language, ?string $weights = null, bool $prefix = true): array {
+		$word = $this->cleanInput($word);
+		if ($language === 'turkish') {
+			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
+			$word = strtr($word, ['I' => 'ı', 'İ' => 'i']);
+		}
+		$word = $this->trimTerm($word);
+		$query = $word === '' ? '' : $this->wordQuery($word, $prefix, [], $weights ?? '');
+		return ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $query]];
+	}
+
+	/**
 	 * @param bool $substring also match words inside titles (title_search LIKE '%word%')
 	 * @param array<string, list<string>> $alternatives lowercase word => words ORed in for it
 	 * @param string|null $weights only match in these fields, as tsvector weight labels ("A", "AD");
@@ -80,6 +96,7 @@ class TsQueryBuilder {
 		/** @var array<string, list<array{ts: array{0: string, 1: list<string>}, pred: array{0: string, 1: list<string>}, phrase: bool}>> $terms */
 		$terms = ['optional' => [], 'required' => [], 'excluded' => []];
 		$words = [];
+		$plainWordsOnly = true;
 		$count = 0;
 
 		foreach ($matches as $m) {
@@ -99,12 +116,25 @@ class TsQueryBuilder {
 				'-' => 'excluded',
 				default => 'optional',
 			};
+			if ($isPhrase || $kind !== 'optional') {
+				$plainWordsOnly = false;
+			}
 
 			if ($isPhrase) {
 				$ts = ['phraseto_tsquery(CAST(? AS regconfig), ?)', [$language, $text]];
 			} else {
 				$alts = $kind === 'excluded' ? [] : ($alternatives[mb_strtolower($text, 'UTF-8')] ?? []);
-				$ts = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $this->wordQuery($text, $kind !== 'excluded', $alts, $weights ?? '')]];
+				$withAlts = $this->wordQuery($text, $kind !== 'excluded', $alts, $weights ?? '');
+				if ($alts !== []) {
+					// A stopword in $language must stay empty even if accented/typo alternatives exist.
+					$baseQuery = $this->wordQuery($text, true, [], $weights ?? '');
+					$ts = [
+						"CASE WHEN numnode(to_tsquery(CAST(? AS regconfig), ?)) = 0 THEN CAST('' AS tsquery) ELSE to_tsquery(CAST(? AS regconfig), ?) END",
+						[$language, $baseQuery, $language, $withAlts],
+					];
+				} else {
+					$ts = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $withAlts]];
+				}
 			}
 
 			$pred = ['d.tsv @@ ' . $ts[0], $ts[1]];
@@ -132,20 +162,52 @@ class TsQueryBuilder {
 			$count++;
 		}
 
-		$required = array_column($terms['required'], 'pred');
+		/** @var list<array{0: string, 1: list<string>}> $required */
+		$required = [];
+		/** @var list<array{0: string, 1: list<string>}> $requiredTs */
+		$requiredTs = [];
+		foreach ($terms['required'] as $term) {
+			$requiredTs[] = $term['ts'];
+			$required[] = $this->nonEmptyOr($term['ts'], $term['pred']);
+		}
 		$optional = array_column($terms['optional'], 'pred');
 		$excluded = array_column($terms['excluded'], 'ts');
 
 		// A query made only of exclusions would scan the whole table and match nearly everything.
-		$base = $required !== [] ? $this->join($required, 'AND') : ($optional !== [] ? $this->join($optional, 'OR') : null);
-		if ($base === null) {
+		if ($required !== [] && $requiredTs !== [] && $optional !== []) {
+			$reqTs = $this->join($requiredTs, '||');
+			$req = $this->join($required, 'AND');
+			$opt = $this->join($optional, 'OR');
+			$base = [
+				'((numnode(' . $reqTs[0] . ') > 0 AND ' . $req[0] . ') OR (numnode(' . $reqTs[0] . ') = 0 AND ' . $opt[0] . '))',
+				[...$reqTs[1], ...$req[1], ...$reqTs[1], ...$opt[1]],
+			];
+		} elseif ($required !== []) {
+			$base = $this->join($required, 'AND');
+		} elseif ($optional !== []) {
+			$base = $this->join($optional, 'OR');
+		} else {
 			return null;
 		}
 
-		$match = $base;
+		/** @var list<array{0: string, 1: list<string>}> $positiveTs */
+		$positiveTs = array_merge($requiredTs, array_column($terms['optional'], 'ts'));
+		/** @var list<array{0: string, 1: list<string>}> $positivePreds */
+		$positivePreds = $required;
+		foreach ($terms['optional'] as $term) {
+			$positivePreds[] = $this->nonEmptyOr($term['ts'], $term['pred']);
+		}
+		if ($positiveTs === [] || $positivePreds === []) {
+			return null; // unreachable: $base above guarantees a positive term
+		}
+		$rank = $this->join($positiveTs, '||');
+		$all = $this->join($positivePreds, 'AND');
+
+		// Guard against queries made only of required stopwords, where every nonEmptyOr() folds to TRUE.
+		$match = ['(numnode(' . $rank[0] . ') > 0 AND ' . $base[0] . ')', [...$rank[1], ...$base[1]]];
 		if ($excluded !== [] && $filterWeights === null) {
 			$none = $this->join($excluded, '||');
-			$match = ['(' . $base[0] . ' AND NOT (d.tsv @@ ' . $none[0] . '))', [...$base[1], ...$none[1]]];
+			$match = ['(' . $match[0] . ' AND NOT (d.tsv @@ ' . $none[0] . '))', [...$match[1], ...$none[1]]];
 		} elseif ($excluded !== []) {
 			// Exclusions only apply within the requested fields too.
 			/** @var list<array{0: string, 1: list<string>}> $exclusions */
@@ -158,21 +220,11 @@ class TsQueryBuilder {
 			}
 			if ($exclusions !== []) {
 				[$noneSql, $noneParams] = $this->join($exclusions, 'OR');
-				$match = ['(' . $base[0] . ' AND NOT (' . $noneSql . '))', [...$base[1], ...$noneParams]];
+				$match = ['(' . $match[0] . ' AND NOT (' . $noneSql . '))', [...$match[1], ...$noneParams]];
 			}
 		}
 
-		/** @var list<array{0: string, 1: list<string>}> $positiveTs */
-		$positiveTs = array_merge(array_column($terms['required'], 'ts'), array_column($terms['optional'], 'ts'));
-		/** @var list<array{0: string, 1: list<string>}> $positivePreds */
-		$positivePreds = array_merge($required, $optional);
-		if ($positiveTs === [] || $positivePreds === []) {
-			return null; // unreachable: $base above guarantees a positive term
-		}
-		$rank = $this->join($positiveTs, '||');
-		$all = $this->join($positivePreds, 'AND');
-
-		return new ParsedQuery($match[0], $match[1], $rank[0], $rank[1], $all[0], $all[1], implode(' ', $words), $positiveTs);
+		return new ParsedQuery($match[0], $match[1], $rank[0], $rank[1], $all[0], $all[1], implode(' ', $words), $positiveTs, $plainWordsOnly);
 	}
 
 	/**
@@ -203,13 +255,30 @@ class TsQueryBuilder {
 
 	/** @return list<array<int, string>> regex matches: [1] phrase operator, [2] phrase, [3] word operator, [4] word */
 	private function tokenize(string $search, string $language): array {
-		$search = str_replace("\0", '', mb_scrub($search, 'UTF-8'));
+		$search = $this->cleanInput($search);
 		if ($language === 'turkish') {
 			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
 			$search = strtr($search, ['I' => 'ı', 'İ' => 'i']);
 		}
 		preg_match_all('/([+-]?)"([^"]*)"?|([+-]?)(\S+)/u', $search, $matches, PREG_SET_ORDER);
 		return $matches;
+	}
+
+	private function cleanInput(string $text): string {
+		// Strip NUL and non-whitespace control characters; keep \t, \n, \r as token separators.
+		return (string)preg_replace('/[^\P{Cc}\t\n\r]+/u', '', mb_scrub($text, 'UTF-8'));
+	}
+
+	/**
+	 * Skip a predicate when its tsquery has no lexemes (e.g. a stopword), so it does not
+	 * force AND-expressions like required terms or all_match to false.
+	 *
+	 * @param array{0: string, 1: list<string>} $ts
+	 * @param array{0: string, 1: list<string>} $pred
+	 * @return array{0: string, 1: list<string>}
+	 */
+	private function nonEmptyOr(array $ts, array $pred): array {
+		return ['(numnode(' . $ts[0] . ') = 0 OR ' . $pred[0] . ')', [...$ts[1], ...$pred[1]]];
 	}
 
 	/**

@@ -42,8 +42,16 @@ jobs:
           php-version: ${{ matrix.php }}
           extensions: pdo_pgsql, zip, mbstring
           coverage: none
-      - name: Install pdftotext, catdoc and xmllint
-        run: sudo apt-get update && sudo apt-get install -y poppler-utils catdoc libxml2-utils
+      - name: Install pdftotext, catdoc, xmllint and PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils catdoc libxml2-utils
+          if [ ! -x "/usr/lib/postgresql/${{ matrix.postgres }}/bin/pg_dump" ]; then
+            sudo apt-get install -y postgresql-common ca-certificates curl
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -c "${{ matrix.postgres }}" -y
+            sudo apt-get install -y --no-upgrade -o Dpkg::Options::="--force-overwrite" "postgresql-client-${{ matrix.postgres }}"
+          fi
+          echo "/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_PATH"
       - name: Select Nextcloud API version
         run: |
           composer require --dev --no-update "nextcloud/ocp:dev-stable${{ matrix.nextcloud }}"
@@ -88,3 +96,73 @@ jobs:
             exit 1
           fi
           echo "ok: AppStore package archive validation passed"
+
+  pg_upgrade:
+    name: pg_upgrade --check (PG 17 -> PG 18)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_pgsql, pgsql, intl, zip, mbstring
+          coverage: none
+      - name: Install extraction tools and PostgreSQL 17 & 18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils catdoc postgresql-common ca-certificates curl
+          sudo install -d /etc/postgresql-common/createcluster.d
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -c 17 -y
+          pkgs="postgresql-17"
+          if [ ! -x /usr/lib/postgresql/18/bin/pg_upgrade ]; then
+            pkgs="$pkgs postgresql-18"
+          fi
+          sudo apt-get install -y --no-upgrade -o Dpkg::Options::="--force-overwrite" $pkgs
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --no-progress
+      - name: Initialize PG 17 cluster, run suite, and verify pg_upgrade --check to PG 18
+        run: |
+          sudo install -d -o postgres -g postgres /var/run/postgresql /tmp/pg17 /tmp/pg18 /tmp/pg_upgrade_work
+
+          sudo -u postgres /usr/lib/postgresql/17/bin/initdb \
+            -D /tmp/pg17 -U postgres --encoding=UTF8 --locale-provider=libc --locale=C.UTF-8 --data-checksums --auth=trust
+          sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl \
+            -D /tmp/pg17 -l /tmp/pg17.log -o "-h 127.0.0.1 -p 55432 -k /tmp/pg17" start
+          sudo -u postgres /usr/lib/postgresql/17/bin/createdb \
+            -h 127.0.0.1 -p 55432 -U postgres fts_test
+
+          PATH="/usr/lib/postgresql/17/bin:$PATH" \
+            FTSPG_TEST_DSN='pgsql:host=127.0.0.1;port=55432;dbname=fts_test;user=postgres' \
+            composer test
+
+          index_rows=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 55432 -U postgres -d fts_test -tAc "SELECT count(*) FROM ftspg_oc_index")
+          words_rows=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 55432 -U postgres -d fts_test -tAc "SELECT count(*) FROM ftspg_oc_words")
+          marker=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 55432 -U postgres -d fts_test -tAc "SELECT col_description(to_regclass('ftspg_oc_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_oc_index') AND attname = 'tsv' AND NOT attisdropped")
+          fn_exists=$(sudo -u postgres /usr/lib/postgresql/17/bin/psql -h 127.0.0.1 -p 55432 -U postgres -d fts_test -tAc "SELECT to_regprocedure('ftspg_oc_regconfig(text)') IS NOT NULL")
+          echo "Live PG 17 state: ftspg_oc_index=$index_rows, ftspg_oc_words=$words_rows, marker=$marker, fn=$fn_exists"
+          test "$index_rows" -gt 0
+          test "$words_rows" -gt 0
+          test "$marker" = "ftspg schema 3"
+          test "$fn_exists" = "t"
+
+          sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl -D /tmp/pg17 -m fast stop
+          sudo -u postgres /usr/lib/postgresql/18/bin/initdb \
+            -D /tmp/pg18 -U postgres --encoding=UTF8 --locale-provider=libc --locale=C.UTF-8 --data-checksums --auth=trust
+
+          set -o pipefail
+          sudo -u postgres bash -c '
+            set -euo pipefail
+            cd /tmp/pg_upgrade_work
+            /usr/lib/postgresql/18/bin/pg_upgrade \
+              --old-bindir=/usr/lib/postgresql/17/bin \
+              --new-bindir=/usr/lib/postgresql/18/bin \
+              --old-datadir=/tmp/pg17 \
+              --new-datadir=/tmp/pg18 \
+              --old-port=55432 \
+              --new-port=55432 \
+              --socketdir=/tmp/pg_upgrade_work \
+              --username=postgres \
+              --check
+          ' | tee /tmp/pg_upgrade_check.log
+          grep -q 'Clusters are compatible' /tmp/pg_upgrade_check.log

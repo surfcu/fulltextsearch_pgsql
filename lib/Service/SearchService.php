@@ -148,37 +148,38 @@ class SearchService {
 		if ($ownTransaction) {
 			$this->db->beginTransaction();
 		}
-		$timeout = $ownTransaction ? $this->configService->getSearchTimeout() : 0;
-		$hasTrigram = $this->schemaService->hasTrigram();
-		$selectCols = [
-			"current_setting('enable_seqscan')",
-			"current_setting('random_page_cost')",
-			"current_setting('jit')",
-			"current_setting('pg_trgm.similarity_threshold', true)",
-			"set_config('enable_seqscan', 'off', true)",
-			"set_config('random_page_cost', least(current_setting('random_page_cost')::float8, CAST(? AS float8))::text, true)",
-			"set_config('jit', 'off', true)",
-		];
-		$params = [
-			(string)self::SEARCH_RANDOM_PAGE_COST,
-		];
-		if ($hasTrigram) {
-			$selectCols[] = "set_config('pg_trgm.similarity_threshold', CAST(? AS text), true)";
-			$params[] = (string)VocabularyService::TRIGRAM_THRESHOLD;
-		}
-		if ($timeout > 0) {
-			$selectCols[] = "set_config('statement_timeout', CAST(? AS text), true)";
-			$params[] = ($timeout * 1000) . 'ms';
-		}
-		$result = $this->db->executeQuery(
-			'SELECT ' . implode(', ', $selectCols),
-			$params
-		);
-		$previous = $result->fetch(\PDO::FETCH_NUM);
-		$result->closeCursor();
-
 		$failed = true;
+		$previous = false;
+		$hasTrigram = false;
 		try {
+			$timeout = $ownTransaction ? $this->configService->getSearchTimeout() : 0;
+			$hasTrigram = $this->schemaService->hasTrigram();
+
+			// Snapshot previous settings before changing them, inside the try so failures roll back.
+			$prevResult = $this->db->executeQuery(
+				"SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit'), current_setting('pg_trgm.similarity_threshold', true)"
+			);
+			$previous = $prevResult->fetch(\PDO::FETCH_NUM);
+			$prevResult->closeCursor();
+
+			$setCols = [
+				"set_config('enable_seqscan', 'off', true)",
+				"set_config('random_page_cost', least(current_setting('random_page_cost')::float8, CAST(? AS float8))::text, true)",
+				"set_config('jit', 'off', true)",
+			];
+			$params = [
+				(string)self::SEARCH_RANDOM_PAGE_COST,
+			];
+			if ($hasTrigram) {
+				$setCols[] = "set_config('pg_trgm.similarity_threshold', CAST(? AS text), true)";
+				$params[] = (string)VocabularyService::TRIGRAM_THRESHOLD;
+			}
+			if ($timeout > 0) {
+				$setCols[] = "set_config('statement_timeout', CAST(? AS text), true)";
+				$params[] = ($timeout * 1000) . 'ms';
+			}
+			$this->db->executeQuery('SELECT ' . implode(', ', $setCols), $params)->closeCursor();
+
 			$search();
 			$failed = false;
 		} finally {
@@ -192,7 +193,7 @@ class SearchService {
 						"set_config('jit', ?, true)",
 					];
 					$restoreParams = [(string)$previous[0], (string)$previous[1], (string)$previous[2]];
-					if ($hasTrigram && $previous[3] !== null) {
+					if ($hasTrigram && ($previous[3] ?? null) !== null) {
 						$restoreCols[] = "set_config('pg_trgm.similarity_threshold', ?, true)";
 						$restoreParams[] = (string)$previous[3];
 					}
@@ -212,56 +213,102 @@ class SearchService {
 		$providerId = $result->getProvider()->getId();
 
 		$viewerTokens = AccessTokens::forViewer($access);
+		$weights = $this->limitWeights($request->getLimitFields());
+		if ($weights === '' || $viewerTokens === []) {
+			// No access tokens, or limited to fields this platform does not index.
+			$result->setTotal(0);
+			return;
+		}
+
 		$languages = $this->configService->getLanguages();
 		$search = $request->getSearch();
-		$weights = $this->limitWeights($request->getLimitFields());
-		if ($weights === '') {
-			// Limited to fields this platform does not index.
-			$result->setTotal(0);
-			return;
+		// Words as each language tokenizes them (Turkish lowercases I to ı), reused for alternatives and excerpts.
+		$words = [];
+		foreach ($languages as $language) {
+			array_push($words, ...$this->queryBuilder->searchWords($search, $language));
 		}
+		$words = array_values(array_unique($words));
+
+		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
 
 		$alternatives = [];
-		if ($this->configService->useTypoCorrection()) {
-			// Words as each language tokenizes them (Turkish lowercases I to ı), looked up once.
-			$words = [];
-			foreach ($languages as $language) {
-				array_push($words, ...$this->queryBuilder->searchWords($search, $language));
-			}
-			$alternatives = $this->vocabulary->alternatives(array_values(array_unique($words)), $this->fuzzyAvailable());
+		$typoOn = $this->configService->useTypoCorrection() && $words !== [];
+		$visible = null;
+		$stopwords = null;
+		if ($typoOn) {
+			[$visible, $stopwords] = $this->vocabularyProbes($languages, $weights, $filterConditions, $filterParams);
+			$alternatives = $this->vocabulary->alternatives($words, false, $visible, $stopwords);
 		}
 
-		/** @var array<string, ParsedQuery> $queries */
-		$queries = [];
-		foreach ($languages as $language) {
-			$query = $this->queryBuilder->build($search, $language, $this->fuzzyAvailable(), $alternatives, $weights);
-			if ($query === null) {
-				break;
-			}
-			$queries[$language] = $query;
-		}
-		if ($viewerTokens === [] || count($queries) !== count($languages)) {
+		$queries = $this->buildQueries($search, $languages, $alternatives, $weights);
+		if ($queries === null) {
 			$result->setTotal(0);
 			return;
 		}
-		/** @var non-empty-array<string, ParsedQuery> $queries one per configured language, at least one */
 		$query = $queries[$languages[0]];
 
 		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
 		$page = max(1, $request->getPage());
-		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
 		$filtersFirst = $this->startFromFilters($queries, $filterConditions, $filterParams);
 		$filterSql = self::renderFilters($filterConditions, !$filtersFirst);
 
-		$excerptWords = [];
-		foreach ($languages as $language) {
-			array_push($excerptWords, ...$this->queryBuilder->searchWords($search, $language));
+		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, ($page - 1) * $size, $words);
+
+		// Gate spelling correction to first-page searches with fewer than $size uncorrected hits.
+		if ($typoOn && $this->fuzzyAvailable() && $visible !== null && $stopwords !== null && $page === 1 && count($rows) < $size) {
+			$pass2Visible = $visible;
+			if ($rows === [] && $query->plainWordsOnly && $alternatives === []) {
+				// Pass 1 already proved none of the words tested in $queries match under the active filters.
+				$tested = [];
+				foreach ($queries as $q) {
+					if ($q->plainText !== '') {
+						foreach (explode(' ', mb_strtolower($q->plainText, 'UTF-8')) as $tw) {
+							$tested[$tw] = true;
+						}
+					}
+				}
+				$knownInvisible = array_intersect_key($tested, array_flip($words));
+				if ($knownInvisible !== []) {
+					$pass2Visible = static function (array $probeWords, bool $prefix = false) use ($visible, $knownInvisible): array {
+						$toProbe = array_values(array_filter(
+							$probeWords,
+							static fn (string $w): bool => !isset($knownInvisible[$w])
+						));
+						return $toProbe === [] ? [] : $visible($toProbe, $prefix);
+					};
+				}
+			}
+			$withSpelling = $this->vocabulary->alternatives($words, true, $pass2Visible, $stopwords);
+			if ($withSpelling !== $alternatives) {
+				$queries = $this->buildQueries($search, $languages, $withSpelling, $weights);
+				if ($queries === null) {
+					$result->setTotal(0);
+					return;
+				}
+				$query = $queries[$languages[0]];
+				$filtersFirst = $this->startFromFilters($queries, $filterConditions, $filterParams);
+				$filterSql = self::renderFilters($filterConditions, !$filtersFirst);
+				$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, 0, $words);
+			}
 		}
-		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, ($page - 1) * $size, array_values(array_unique($excerptWords)));
+
+		if ($rows !== []) {
+			$total = (int)$rows[0]['total'];
+		} elseif ($page > 1) {
+			$total = $this->fullTextCount($queries, $filterSql, $filterParams, $filtersFirst);
+		} else {
+			$total = 0;
+		}
+
 		$titlesSearched = $weights === null || str_contains($weights, 'A');
-		if ($rows === [] && $page === 1 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '') {
+		if ($total === 0 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '' && $query->plainWordsOnly) {
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
-			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size);
+			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size, ($page - 1) * $size);
+			if ($rows !== []) {
+				$total = (int)$rows[0]['total'];
+			} elseif ($page > 1) {
+				$total = $this->titleSimilarityCount($query->plainText, $filterSql, $filterParams);
+			}
 		}
 
 		$maxScore = 0;
@@ -271,10 +318,192 @@ class SearchService {
 			$result->addDocument($this->toResultDocument($providerId, $row, (string)$score, $access->getViewerId()));
 		}
 
-		$result->setTotal($rows === [] ? 0 : (int)$rows[0]['total']);
+		$result->setTotal($total);
 		$result->setMaxScore($maxScore);
 		$result->setTime((int)round((microtime(true) - $start) * 1000.0));
 		$result->setTimedOut(false);
+	}
+
+	/**
+	 * @param non-empty-list<string> $languages
+	 * @param array<string, list<string>> $alternatives
+	 * @return non-empty-array<string, ParsedQuery>|null
+	 */
+	private function buildQueries(string $search, array $languages, array $alternatives, ?string $weights): ?array {
+		/** @var array<string, ParsedQuery> $queries */
+		$queries = [];
+		$substring = $this->fuzzyAvailable();
+		foreach ($languages as $language) {
+			$query = $this->queryBuilder->build($search, $language, $substring, $alternatives, $weights);
+			if ($query === null) {
+				return null;
+			}
+			$queries[$language] = $query;
+		}
+		return $queries === [] ? null : $queries;
+	}
+
+	/**
+	 * Batched EXISTS visibility and stopword probes under the search's active filters.
+	 *
+	 * @param non-empty-list<string> $languages
+	 * @param list<string> $filterConditions
+	 * @param list<string> $filterParams
+	 * @return array{0: callable(list<string>, bool=): list<string>, 1: callable(list<string>): list<string>}
+	 */
+	private function vocabularyProbes(array $languages, ?string $weights, array $filterConditions, array $filterParams): array {
+		$t = $this->schemaService->getQualifiedTableName();
+		$langConditions = self::languageConditions($languages);
+		// Hide provider_id from the planner so EXISTS uses GIN (tsv/access) instead of scanning every row via doc_uniq.
+		$probeConditions = $filterConditions;
+		if ($probeConditions !== []) {
+			$probeConditions[0] = "({$probeConditions[0]}) IS TRUE";
+		}
+		$probeFilterSql = self::renderFilters($probeConditions, false);
+		$hasA = $weights === null || str_contains($weights, 'A');
+		$hasB = $weights === null || str_contains($weights, 'B');
+		$hasC = $weights === null || str_contains($weights, 'C');
+		$hasD = $weights === null || str_contains($weights, 'D');
+		$titleNorm = $hasA ? $this->schemaService->normalized('d.title') : '';
+		$titleExpr = $hasA ? $titleNorm . " || ' ' || " . $this->schemaService->splitWords($titleNorm) : '';
+		$tagsNorm = $hasB ? $this->schemaService->normalized('d.tags_text') : '';
+		$partsNorm = $hasC ? $this->schemaService->normalized('d.parts_text') : '';
+		$contentNorm = $hasD ? $this->schemaService->normalized('d.content') : '';
+		/** @var array<string, bool> $stopwordCache */
+		$stopwordCache = [];
+
+		$visible = function (array $probeWords, bool $prefix = false) use (
+			$t,
+			$languages,
+			$langConditions,
+			$weights,
+			$probeFilterSql,
+			$filterParams,
+			$hasA,
+			$hasB,
+			$hasC,
+			$hasD,
+			$titleExpr,
+			$tagsNorm,
+			$partsNorm,
+			$contentNorm,
+			&$stopwordCache
+		): array {
+			$unique = array_values(array_unique($probeWords));
+			if ($unique === []) {
+				return [];
+			}
+			$visibleWords = [];
+			foreach (array_chunk($unique, 200) as $chunk) {
+				$selects = [];
+				$params = [];
+				foreach ($chunk as $word) {
+					$branches = [];
+					$branchParams = [];
+					$stopChecks = [];
+					$stopParams = [];
+					foreach ($languages as $langIdx => $language) {
+						[$langCond, $langCondParams] = $langConditions[$langIdx];
+						[$tsSql, $tsParams] = $this->queryBuilder->wordTsQuery($word, $language, $weights);
+						$branches[] = "(numnode($tsSql) > 0 AND $langCond AND d.tsv @@ $tsSql)";
+						array_push($branchParams, ...$tsParams, ...$langCondParams, ...$tsParams);
+						$stopChecks[] = "numnode($tsSql) = 0";
+						array_push($stopParams, ...$tsParams);
+					}
+					$matchSql = count($branches) === 1 ? $branches[0] : '(' . implode(' OR ', $branches) . ')';
+
+					// Verify unstemmed surface occurrence ('simple') across active weighted fields so stemmed/prefix neighbors cannot leak.
+					// When $prefix is true, match only ^[[:alpha:]]{3,40}$ lexemes like VocabularyService::insertSql().
+					$needle = mb_strtolower($word, 'UTF-8');
+					$simpleTsSql = '';
+					$simpleTsParams = [];
+					if (!$prefix) {
+						[$simpleTsSql, $simpleTsParams] = $this->queryBuilder->wordTsQuery($word, 'simple', null, false);
+					}
+					$surfaceMatch = static function (string $expr) use ($prefix, $needle, $simpleTsSql, $simpleTsParams): array {
+						if ($prefix) {
+							return [
+								"EXISTS (SELECT 1 FROM unnest(to_tsvector('simple', $expr)) AS w WHERE w.lexeme ~ '^[[:alpha:]]{3,40}$' AND starts_with(w.lexeme, ?))",
+								[$needle],
+							];
+						}
+						return ["to_tsvector('simple', $expr) @@ $simpleTsSql", $simpleTsParams];
+					};
+					$surfaceBranches = [];
+					$surfaceParams = [];
+					if ($hasA) {
+						[$exprSql, $exprParams] = $surfaceMatch($titleExpr);
+						$surfaceBranches[] = "((d.title <> '') IS TRUE AND $exprSql)";
+						array_push($surfaceParams, ...$exprParams);
+					}
+					if ($hasB) {
+						[$exprSql, $exprParams] = $surfaceMatch($tagsNorm);
+						$surfaceBranches[] = "((d.tags_text <> '') IS TRUE AND $exprSql)";
+						array_push($surfaceParams, ...$exprParams);
+					}
+					if ($hasC) {
+						[$exprSql, $exprParams] = $surfaceMatch($partsNorm);
+						$surfaceBranches[] = "((d.parts_text <> '') IS TRUE AND strpos(lower($partsNorm), ?) > 0 AND $exprSql)";
+						$surfaceParams[] = $needle;
+						array_push($surfaceParams, ...$exprParams);
+					}
+					if ($hasD) {
+						[$exprSql, $exprParams] = $surfaceMatch($contentNorm);
+						$surfaceBranches[] = "((d.content <> '') IS TRUE AND strpos(lower($contentNorm), ?) > 0 AND $exprSql)";
+						$surfaceParams[] = $needle;
+						array_push($surfaceParams, ...$exprParams);
+					}
+					$surfaceSql = $surfaceBranches === [] ? 'FALSE' : (count($surfaceBranches) === 1 ? $surfaceBranches[0] : '(' . implode(' OR ', $surfaceBranches) . ')');
+
+					$selects[] = "EXISTS (SELECT 1 FROM $t d WHERE $matchSql AND $surfaceSql AND $probeFilterSql)";
+					array_push($params, ...$branchParams, ...$surfaceParams, ...$filterParams);
+					$selects[] = '(' . implode(' OR ', $stopChecks) . ')';
+					array_push($params, ...$stopParams);
+				}
+				$result = $this->db->executeQuery('SELECT ' . implode(', ', $selects), $params);
+				$row = $result->fetch(\PDO::FETCH_NUM);
+				$result->closeCursor();
+				if (!is_array($row)) {
+					continue;
+				}
+				foreach ($chunk as $i => $word) {
+					$stopwordCache[$word] = in_array($row[$i * 2 + 1] ?? false, [true, 1, '1', 't'], true);
+					if (in_array($row[$i * 2] ?? false, [true, 1, '1', 't'], true)) {
+						$visibleWords[] = $word;
+					}
+				}
+			}
+			return $visibleWords;
+		};
+
+		$stopwords = function (array $checkWords) use ($languages, $weights, &$stopwordCache): array {
+			$unique = array_values(array_unique($checkWords));
+			$missing = array_values(array_filter($unique, static fn (string $w): bool => !array_key_exists($w, $stopwordCache)));
+			foreach (array_chunk($missing, 200) as $chunk) {
+				$selects = [];
+				$params = [];
+				foreach ($chunk as $word) {
+					$stopChecks = [];
+					foreach ($languages as $language) {
+						[$tsSql, $tsParams] = $this->queryBuilder->wordTsQuery($word, $language, $weights);
+						$stopChecks[] = "numnode($tsSql) = 0";
+						array_push($params, ...$tsParams);
+					}
+					$selects[] = '(' . implode(' OR ', $stopChecks) . ')';
+				}
+				$result = $this->db->executeQuery('SELECT ' . implode(', ', $selects), $params);
+				$row = $result->fetch(\PDO::FETCH_NUM);
+				$result->closeCursor();
+				if (is_array($row)) {
+					foreach ($chunk as $i => $word) {
+						$stopwordCache[$word] = in_array($row[$i] ?? false, [true, 1, '1', 't'], true);
+					}
+				}
+			}
+			return array_values(array_filter($unique, static fn (string $w): bool => $stopwordCache[$w] ?? false));
+		};
+
+		return [$visible, $stopwords];
 	}
 
 	/**
@@ -285,7 +514,7 @@ class SearchService {
 			'SELECT owner_id, array_to_json(access) AS access, array_to_json(links) AS links,
 					array_to_json(tags) AS tags, array_to_json(metatags) AS metatags, array_to_json(subtags) AS subtags,
 					source, hash, modified_time, title, parts, content, info
-			 FROM ' . $this->schemaService->getTableName() . ' WHERE provider_id = ? AND document_id = ?',
+			 FROM ' . $this->schemaService->getQualifiedTableName() . ' WHERE provider_id = ? AND document_id = ?',
 			[$providerId, $documentId]
 		);
 		$row = $result->fetch();
@@ -405,7 +634,7 @@ class SearchService {
 	 * @param list<string> $filterParams
 	 */
 	private function startFromFilters(array $queries, array $filterConditions, array $filterParams): bool {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		$filtered = $this->estimateRows("SELECT 1 FROM $t d WHERE " . self::renderFilters($filterConditions, false), $filterParams);
 		[$matchSql, $matchParams] = $this->matchCondition($queries);
 		$matching = $this->estimateRows("SELECT 1 FROM $t d WHERE $matchSql", $matchParams);
@@ -424,8 +653,8 @@ class SearchService {
 		$conditions = [];
 		foreach ($languages as $i => $language) {
 			$conditions[] = $i === 0
-				? ($others === [] ? ['TRUE', []] : ['d.config <> ALL (CAST(? AS regconfig[]))', ['{' . implode(',', $others) . '}']])
-				: ['d.config = CAST(? AS regconfig)', [$language]];
+				? ($others === [] ? ['TRUE', []] : ['d.config <> ALL (CAST(? AS text[]))', [PgArray::toLiteral($others)]])
+				: ['d.config = ?', [$language]];
 		}
 		return $conditions;
 	}
@@ -733,7 +962,7 @@ class SearchService {
 	 * @return list<array<string, mixed>>
 	 */
 	private function fullTextSearch(array $queries, string $filterSql, array $filterParams, bool $filtersFirst, int $limit, int $offset, array $excerptWords = []): array {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		$conditions = self::languageConditions(array_keys($queries));
 
 		$rankColumns = [];
@@ -782,13 +1011,13 @@ class SearchService {
 				SELECT m.document_id, m.title, m.source, m.hash, m.modified_time, m.rank, m.total,
 					   h.excerpt
 				FROM (
-					SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config, d.body, d.all_match,
+					SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config, d.content, d.parts_text, d.all_match,
 						   $rankQuery AS rank_query,
 						   $rankSql AS rank,
 						   count(*) OVER () AS total
 					FROM (
 						SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config, d.tsv,
-							   CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END AS body,
+							   d.content, d.parts_text,
 							   $allSql AS all_match
 						FROM $t d
 						WHERE $matchSql AND $filterSql
@@ -816,7 +1045,7 @@ class SearchService {
 					   h.excerpt
 				FROM (
 					SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config,
-						   CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END AS body,
+						   d.content, d.parts_text,
 						   $rankQuery AS rank_query,
 						   $allSql AS all_match,
 						   $rankSql AS rank,
@@ -862,12 +1091,11 @@ class SearchService {
 		$lowered = 'lower(' . $this->schemaService->normalized('b.text') . ')';
 		// querytree() prints the lexemes quoted, with quotes inside doubled: 'o''brien':*
 		$lexemes = "SELECT replace((regexp_matches(querytree(m.rank_query)::text, '''((?:[^'']|'''')+)''', 'g'))[1], '''''', '''')";
-		// A long body is detoasted once, into b.text: every function given the column itself
-		// would decompress it again, about 3 ms per 500 KB. octet_length() reads the stored size
-		// without decompressing; a body short in bytes is short in characters too. OFFSET 0 keeps
-		// PostgreSQL from inlining the subqueries, which would repeat the work at every use.
+		// Content and parts_text stay separate until the page-level lateral so inner queries never
+		// detoast non-page rows. A long body is detoasted once into b.text via OFFSET 0.
+		$joined = "CASE WHEN m.content = '' THEN m.parts_text WHEN m.parts_text = '' THEN m.content ELSE m.content || ' ' || m.parts_text END";
 		return <<<SQL
-			SELECT CASE WHEN b.text IS NULL THEN m.body
+			SELECT CASE WHEN b.text IS NULL THEN ($joined)
 			            ELSE substr(b.text, greatest(1, coalesce((
 			                SELECT min(p.pos) FROM (
 			                    SELECT CASE WHEN starts_with(l.lb, w.word) THEN 1
@@ -877,7 +1105,7 @@ class SearchService {
 			                    WHERE w.word <> ''
 			                ) p WHERE p.pos > 0
 			            ), 1) - $lead), $window) END AS source
-			FROM (SELECT CASE WHEN octet_length(m.body) > $window THEN m.body || '' END AS text OFFSET 0) b
+			FROM (SELECT CASE WHEN octet_length(m.content) + octet_length(m.parts_text) > $window THEN ($joined) || '' END AS text OFFSET 0) b
 			SQL;
 	}
 
@@ -895,15 +1123,15 @@ class SearchService {
 	private function headlineSql(): string {
 		$delimiter = self::FRAGMENT_DELIMITER;
 		return <<<SQL
-			SELECT CASE WHEN m.config = 'turkish'::regconfig THEN array_to_string(ARRAY(
+			SELECT CASE WHEN m.config = 'turkish' THEN array_to_string(ARRAY(
 			           SELECT CASE WHEN strpos(n.text, f.fragment) > 0
 			                       THEN substr(e.source, strpos(n.text, f.fragment), length(f.fragment))
 			                       ELSE f.fragment END
 			           FROM (SELECT translate(e.source, 'Iİ', 'ıi') AS text) n,
-			                unnest(string_to_array(ts_headline(m.config, n.text, m.rank_query, ?), '$delimiter')) WITH ORDINALITY AS f(fragment, i)
+			                unnest(string_to_array(ts_headline(m.config::pg_catalog.regconfig, n.text, m.rank_query, ?), '$delimiter')) WITH ORDINALITY AS f(fragment, i)
 			           ORDER BY f.i
 			       ), '$delimiter')
-			       ELSE ts_headline(m.config, e.source, m.rank_query, ?) END AS excerpt
+			       ELSE ts_headline(m.config::pg_catalog.regconfig, e.source, m.rank_query, ?) END AS excerpt
 			SQL;
 	}
 
@@ -1028,7 +1256,7 @@ class SearchService {
 	 * @return array{0: list<int>, 1: float} document frequency per term, N
 	 */
 	private function documentFrequencies(array $queries, array $conditions, string $filterSql, array $filterParams, bool $filtersFirst): array {
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		$limit = self::EXACT_FREQUENCY_LIMIT;
 		$columns = [];
 		$params = [];
@@ -1048,7 +1276,7 @@ class SearchService {
 			array_push($params, ...$terms[$j][1]);
 		}
 		$columns[] = "(SELECT CASE WHEN c.reltuples >= 10000 THEN c.reltuples::bigint ELSE (SELECT count(*) FROM $t) END
-			FROM pg_class c WHERE c.oid = to_regclass(?))";
+			FROM pg_catalog.pg_class c WHERE c.oid = pg_catalog.to_regclass(?))";
 		$params[] = $t;
 
 		$result = $this->db->executeQuery('SELECT ' . implode(', ', $columns), $params);
@@ -1084,28 +1312,68 @@ class SearchService {
 	}
 
 	/**
+	 * @param non-empty-array<string, ParsedQuery> $queries
+	 * @param list<string> $filterParams
+	 */
+	private function fullTextCount(array $queries, string $filterSql, array $filterParams, bool $filtersFirst): int {
+		$t = $this->schemaService->getQualifiedTableName();
+		[$matchSql, $matchParams] = $this->matchCondition($queries);
+		if ($filtersFirst) {
+			$matchSql = "($matchSql) IS TRUE";
+		}
+		$result = $this->db->executeQuery(
+			"SELECT count(*) FROM $t d WHERE $matchSql AND $filterSql",
+			[...$matchParams, ...$filterParams]
+		);
+		$count = (int)$result->fetchOne();
+		$result->closeCursor();
+		return $count;
+	}
+
+	/**
 	 * @param list<string> $filterParams
 	 * @return list<array<string, mixed>>
 	 */
-	private function titleSimilaritySearch(string $text, string $filterSql, array $filterParams, int $limit): array {
-		$t = $this->schemaService->getTableName();
+	private function titleSimilaritySearch(string $text, string $filterSql, array $filterParams, int $limit, int $offset = 0): array {
+		$t = $this->schemaService->getQualifiedTableName();
+		$ts = $this->schemaService->getTrigramSchema();
+		$wordSim = $ts !== null ? "{$ts}.word_similarity" : 'word_similarity';
+		$wordOp = $ts !== null ? "OPERATOR({$ts}.<%)" : '<%';
+		$joined = "CASE WHEN d.content = '' THEN d.parts_text WHEN d.parts_text = '' THEN d.content ELSE d.content || ' ' || d.parts_text END";
 		$sql = <<<SQL
 			SELECT d.document_id, d.title, d.source, d.hash, d.modified_time,
-				   word_similarity(?, d.title_search) AS rank,
+				   {$wordSim}(?, d.title_search) AS rank,
 				   count(*) OVER () AS total,
-				   left(CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END, 300) AS excerpt
+				   left($joined, 300) AS excerpt
 			FROM $t d
-			WHERE ? <% d.title_search AND $filterSql
+			WHERE ? {$wordOp} d.title_search AND $filterSql
 			ORDER BY rank DESC, d.modified_time DESC, d.id
-			LIMIT ?
+			LIMIT ? OFFSET ?
 			SQL;
 
 		$text = mb_strtolower($text, 'UTF-8');
-		$params = array_merge([$text, $text], $filterParams, [(string)$limit]);
+		$params = array_merge([$text, $text], $filterParams, [(string)$limit, (string)$offset]);
 		$result = $this->db->executeQuery($sql, $params);
 		$rows = $result->fetchAll();
 		$result->closeCursor();
 		return $rows;
+	}
+
+	/**
+	 * @param list<string> $filterParams
+	 */
+	private function titleSimilarityCount(string $text, string $filterSql, array $filterParams): int {
+		$t = $this->schemaService->getQualifiedTableName();
+		$ts = $this->schemaService->getTrigramSchema();
+		$wordOp = $ts !== null ? "OPERATOR({$ts}.<%)" : '<%';
+		$text = mb_strtolower($text, 'UTF-8');
+		$result = $this->db->executeQuery(
+			"SELECT count(*) FROM $t d WHERE ? {$wordOp} d.title_search AND $filterSql",
+			array_merge([$text], $filterParams)
+		);
+		$count = (int)$result->fetchOne();
+		$result->closeCursor();
+		return $count;
 	}
 
 	private function fuzzyAvailable(): bool {

@@ -16,6 +16,7 @@ use OCP\FullTextSearch\Model\IIndexDocument;
 use OCP\FullTextSearch\Model\IRunner;
 use OCP\FullTextSearch\Model\ISearchResult;
 use Psr\Log\LoggerInterface;
+use RuntimeException;
 use Throwable;
 
 class PostgreSQLPlatform implements IFullTextSearchPlatform {
@@ -59,8 +60,14 @@ class PostgreSQLPlatform implements IFullTextSearchPlatform {
 	}
 
 	public function loadPlatform() {
-		// Normally done by the install/upgrade repair step; this covers skipped or failed runs.
+		// Create a missing table on first load, but never rebuild an existing schema on a request path.
 		if ($this->schemaService->isPostgres() && !$this->schemaService->isCurrent()) {
+			if ($this->schemaService->tableExists()) {
+				throw new RuntimeException(sprintf(
+					'Full text search index table "%s" uses an outdated schema; run "occ upgrade" or "occ maintenance:repair" to upgrade it.',
+					$this->schemaService->getTableName()
+				));
+			}
 			$this->schemaService->ensureSchema();
 		}
 	}

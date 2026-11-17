@@ -284,7 +284,7 @@ class IndexService {
 
 		if ($this->configService->useTypoCorrection()) {
 			try {
-				$this->vocabulary->addDocument($document->getProviderId(), $document->getId());
+				$this->vocabulary->addDocument($document->getProviderId(), $document->getId(), $updateContent, $updateParts);
 			} catch (Throwable $e) {
 				// Typo correction is a nicety; never fail indexing over it.
 				$this->logger->warning('Could not update the typo correction vocabulary', ['exception' => $e]);
@@ -296,7 +296,7 @@ class IndexService {
 
 	public function deleteDocument(string $providerId, string $documentId): void {
 		$this->db->executeStatement(
-			'DELETE FROM ' . $this->schemaService->getTableName() . ' WHERE provider_id = ? AND document_id = ?',
+			'DELETE FROM ' . $this->schemaService->getQualifiedTableName() . ' WHERE provider_id = ? AND document_id = ?',
 			[$providerId, $documentId]
 		);
 	}
@@ -307,7 +307,7 @@ class IndexService {
 			return;
 		}
 		$this->db->executeStatement(
-			'DELETE FROM ' . $this->schemaService->getTableName() . ' WHERE provider_id = ?',
+			'DELETE FROM ' . $this->schemaService->getQualifiedTableName() . ' WHERE provider_id = ?',
 			[$providerId]
 		);
 	}
@@ -335,7 +335,7 @@ class IndexService {
 		array $links,
 	): void {
 		$access = $document->getAccess();
-		$t = $this->schemaService->getTableName();
+		$t = $this->schemaService->getQualifiedTableName();
 		$this->db->executeStatement(<<<SQL
 			INSERT INTO $t AS d (
 				provider_id, document_id, owner_id, access, links, tags, metatags, subtags,
@@ -343,7 +343,7 @@ class IndexService {
 				title, tags_text, parts, parts_text, content, info
 			) VALUES (
 				?, ?, ?, CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]),
-				?, ?, ?, ?, CAST(? AS regconfig),
+				?, ?, ?, ?, ?,
 				?, ?, CAST(? AS jsonb), ?, ?, CAST(? AS jsonb)
 			)
 			ON CONFLICT (provider_id, document_id) DO UPDATE SET

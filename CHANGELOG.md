@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Upgrade-path and `pg_upgrade` test coverage in `tests/run.php` and CI: `1.4.2`/`1.5.x` Schema Version 2 to Version 3 upgrade fixture, `pg_catalog` assertion forbidding `reg*` columns on `ftspg_` tables, `pg_dump`/`pg_restore` search verification under empty `search_path` (with schema-qualified queries across all services), and a CI `pg_upgrade --check` job upgrading a populated PostgreSQL 17 cluster to PostgreSQL 18.
+
+### Changed
+- Bump schema version to 3 (`ftspg schema 3`), replace the `config` `regconfig` column and `varchar` caps on `provider_id`, `document_id`, `owner_id`, `source`, and `hash` with `text` plus an `IMMUTABLE PARALLEL SAFE` `ftspg_<prefix>regconfig(text)` SQL wrapper and post-rebuild `ANALYZE` to unblock `pg_upgrade` (one-time `ensureSchema()` rewrite measured at 51.7 s on the 100,000-document synthetic index); no re-indexing is needed.
+- Update documentation (`README.md`, `docs/TURKISH.md`, `docs/MIGRATION.md`, `docs/ARCHITECTURE.md`, `docs/RELEASING.md`) for Schema Version 3 and `1.6.0` (`pg_upgrade` works directly without dropping tables, one-time locked table rewrite on upgrade, `ftspg_<prefix>regconfig(text)`, `occ upgrade` / `occ maintenance:repair` requirement for older schemas), database locale requirements, ignored search-request fields under limitations, viewer-scoped typo correction behavior, and current extraction/ranking capabilities.
+
+### Fixed
+- Serialize and wrap schema creation and upgrades in an advisory-locked transaction (`pg_advisory_xact_lock`) with `pg_trgm` extension setup outside the transaction, refuse automatic schema rebuilds during `loadPlatform()` with an error directing administrators to `occ upgrade` or `occ maintenance:repair`, and report the document count and table-lock notice before rebuilding in the repair step; no re-indexing is needed.
+- Include document parts (such as comments) in search excerpts alongside content without detoasting non-page rows, strip NUL and non-whitespace control characters during query tokenization, roll back search-planning transactions if reading or applying planner settings fails, preserve accurate `total` counts on past-end result pages, and paginate the trigram title-similarity fallback across pages; no re-indexing is needed.
+- Scope vocabulary typo and accent-variant lookups to documents visible to the searching viewer under the active search filters, gating spelling corrections to searches whose uncorrected first page returns fewer than the requested page size; no re-indexing is needed.
+- Ignore stopwords in required terms (`+the +budget`), phrases (`"to be"`), and all-words ranking (`budget for 2025`) while returning nothing when every positive term is a stopword (`+the +of`); no re-indexing is needed.
+- Skip the trigram title-similarity fallback when a query uses exclusions (`-`), required terms (`+`), or phrases (`"..."`), keeping plain-word `OR`/`AND` searches eligible; no re-indexing is needed.
+- Extraction and vocabulary limits: drain `stdout` and `stderr` concurrently and terminate stalled or output-capped extraction tools, cap Office extraction at 128 MB of uncompressed XML and 2,000 entries, prevent mid-sentence word fusion at OpenDocument annotations/notes and index headers/footers from `styles.xml`, restrict metadata-only vocabulary updates to title and tags, and skip upgrade vocabulary population when `typo_correction` is disabled. Re-indexing of OpenDocument files is needed to benefit from the note and header/footer extraction fixes.
+
 ## [1.5.0] - 2026-11-17
 
 ### Added

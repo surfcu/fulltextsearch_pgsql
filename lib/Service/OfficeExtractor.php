@@ -23,28 +23,41 @@ class OfficeExtractor {
 
 	/** Uncompressed bytes read from any one entry, whatever its size (zip bombs, huge sheets). */
 	private const MAX_ENTRY_BYTES = 32 * 1024 * 1024;
+	/** Total uncompressed bytes read across all matching entries of one office file. */
+	private const MAX_TOTAL_BYTES = 128 * 1024 * 1024;
+	/** Maximum matching XML entries read from one office file. */
+	private const MAX_ENTRIES = 2000;
 
 	/**
 	 * Per format, in reading order: the entries holding text and how to read them. The main
 	 * body comes first, so it survives truncation at max_content_size.
 	 *
 	 * Rule keys (element local names):
-	 *  - text:   collect text only inside these; absent = every text node
-	 *  - breaks: their end separates words (paragraph, cell, line break)
-	 *  - spaces: empty elements standing for a space (tab, ODF's <text:s/>)
-	 *  - skip:   whole subtrees left out
-	 *  - attrs:  element => attribute whose value is text (sheet names)
-	 *  - cells:  spreadsheet cells, where <v> holds a shared-string index for t="s"
+	 *  - text:        collect text only inside these; absent = every text node
+	 *  - breaks:      their end separates words (paragraph, cell, line break)
+	 *  - startBreaks: their start separates words (inline annotations, footnotes)
+	 *  - spaces:      empty elements standing for a space (tab, ODF's <text:s/>)
+	 *  - skip:        whole subtrees left out
+	 *  - attrs:       element => attribute whose value is text (sheet names)
+	 *  - cells:       spreadsheet cells, where <v> holds a shared-string index for t="s"
 	 *
 	 * @var array<string, list<array{0: string, 1: 'WORD'|'DRAWING'|array<string, mixed>}>>
 	 */
 	private const FORMATS = [
 		'odf' => [
 			['#^content\.xml$#', [
-				'breaks' => ['p', 'h', 'line-break', 'table-cell', 'list-item', 'note-citation', 'annotation-end'],
+				'breaks' => ['p', 'h', 'line-break', 'table-cell', 'list-item', 'note-citation', 'annotation', 'annotation-end', 'note'],
+				'startBreaks' => ['annotation', 'note'],
 				'spaces' => ['s', 'tab'],
 				// Deleted text kept for change tracking; annotation author and date.
 				'skip' => ['tracked-changes', 'creator', 'date', 'sequence-decls', 'automatic-styles', 'font-face-decls'],
+			]],
+			['#^styles\.xml$#', [
+				'text' => ['header', 'header-left', 'header-first', 'footer', 'footer-left', 'footer-first'],
+				'breaks' => ['p', 'h', 'line-break', 'table-cell', 'list-item', 'note-citation', 'annotation', 'annotation-end', 'note', 'header', 'header-left', 'header-first', 'footer', 'footer-left', 'footer-first'],
+				'startBreaks' => ['annotation', 'note'],
+				'spaces' => ['s', 'tab'],
+				'skip' => ['tracked-changes', 'creator', 'date', 'styles', 'automatic-styles', 'font-face-decls'],
 			]],
 		],
 		'docx' => [
@@ -134,6 +147,8 @@ class OfficeExtractor {
 
 		$parts = [];
 		$length = 0;
+		$totalBytes = 0;
+		$entriesRead = 0;
 		$truncated = false;
 		foreach (self::FORMATS[$format] as [$pattern, $rule]) {
 			$matching = array_values(array_filter($names, static fn (string $n): bool => (bool)preg_match($pattern, $n)));
@@ -143,13 +158,20 @@ class OfficeExtractor {
 				if ($length >= $textBudget) {
 					break 2;
 				}
+				if ($entriesRead >= self::MAX_ENTRIES || $totalBytes >= self::MAX_TOTAL_BYTES) {
+					$truncated = true;
+					break 2;
+				}
+				$entriesRead++;
 				$stat = $zip->statName($name);
 				$size = is_array($stat) ? (int)$stat['size'] : 0;
-				$xml = $zip->getFromName($name, min(max($size, 1), self::MAX_ENTRY_BYTES));
+				$limit = min(self::MAX_ENTRY_BYTES, self::MAX_TOTAL_BYTES - $totalBytes);
+				$xml = $zip->getFromName($name, min(max($size, 1), $limit));
 				if (!is_string($xml) || $xml === '') {
 					continue;
 				}
-				$truncated = $truncated || $size > self::MAX_ENTRY_BYTES;
+				$totalBytes += strlen($xml);
+				$truncated = $truncated || $size > $limit || strlen($xml) > $limit;
 				$text = $this->readXml($xml, $this->rule($rule), $textBudget - $length);
 				if ($text !== '') {
 					$parts[] = $text;
@@ -187,16 +209,17 @@ class OfficeExtractor {
 
 	/**
 	 * @param string|array<string, mixed> $rule
-	 * @return array{text: ?list<string>, breaks: list<string>, spaces: list<string>, skip: list<string>, attrs: array<string, string>, cells: bool}
+	 * @return array{text: ?list<string>, breaks: list<string>, startBreaks: list<string>, spaces: list<string>, skip: list<string>, attrs: array<string, string>, cells: bool}
 	 */
 	private function rule(string|array $rule): array {
 		if (is_string($rule)) {
 			$rule = $rule === 'WORD' ? self::WORD : self::DRAWING;
 		}
-		/** @var array{text?: list<string>, breaks?: list<string>, spaces?: list<string>, skip?: list<string>, attrs?: array<string, string>, cells?: bool} $rule */
+		/** @var array{text?: list<string>, breaks?: list<string>, startBreaks?: list<string>, spaces?: list<string>, skip?: list<string>, attrs?: array<string, string>, cells?: bool} $rule */
 		return [
 			'text' => $rule['text'] ?? null,
 			'breaks' => $rule['breaks'] ?? [],
+			'startBreaks' => $rule['startBreaks'] ?? [],
 			'spaces' => $rule['spaces'] ?? [],
 			'skip' => $rule['skip'] ?? [],
 			'attrs' => $rule['attrs'] ?? [],
@@ -205,7 +228,7 @@ class OfficeExtractor {
 	}
 
 	/**
-	 * @param array{text: ?list<string>, breaks: list<string>, spaces: list<string>, skip: list<string>, attrs: array<string, string>, cells: bool} $rule
+	 * @param array{text: ?list<string>, breaks: list<string>, startBreaks: list<string>, spaces: list<string>, skip: list<string>, attrs: array<string, string>, cells: bool} $rule
 	 */
 	private function readXml(string $xml, array $rule, int $budget): string {
 		$previous = libxml_use_internal_errors(true);
@@ -253,11 +276,16 @@ class OfficeExtractor {
 						$out .= ' ';
 					}
 					if ($empty) {
-						if (in_array($name, $rule['breaks'], true)) {
+						if (in_array($name, $rule['breaks'], true) || in_array($name, $rule['startBreaks'], true)) {
 							$out .= "\n";
 						}
-					} elseif ($textOnly && in_array($name, (array)$rule['text'], true)) {
-						$inText++;
+					} else {
+						if (in_array($name, $rule['startBreaks'], true)) {
+							$out .= "\n";
+						}
+						if ($textOnly && in_array($name, (array)$rule['text'], true)) {
+							$inText++;
+						}
 					}
 				} elseif ($type === XMLReader::END_ELEMENT) {
 					if ($skipDepth !== null) {
