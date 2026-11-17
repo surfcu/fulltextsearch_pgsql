@@ -21,16 +21,16 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 
 ## Requirements
 
-- Nextcloud 29–35 running on **PostgreSQL 12 or newer**
+- Nextcloud 30–35 running on **PostgreSQL 13 or newer**
 - The **Full Text Search** app plus at least one content provider, e.g. **Full Text Search - Files**
-- The PHP version your Nextcloud release requires (8.1+ for Nextcloud 29, 8.3+ for 35), with `zip` for office documents
+- The PHP version your Nextcloud release requires (8.1+ for Nextcloud 30, 8.3+ for 35), with `zip` for office documents
 - Optional: `catdoc` for Office 97–2003 files (`apt install catdoc`; it provides `catdoc`, `xls2csv` and `catppt`). Without it, `.doc`, `.xls` and `.ppt` files are indexed by name only.
 - Recommended: `poppler-utils` for faster, more robust PDF text (`apt install poppler-utils`). Without it, a bundled parser ([smalot/pdfparser](https://github.com/smalot/pdfparser)) reads PDFs in PHP.
 - Optional: the `pg_trgm` extension for typo tolerance. Since PostgreSQL 13 it is a trusted extension and the app creates it automatically when the Nextcloud database user owns the database. Otherwise a superuser can run `CREATE EXTENSION pg_trgm;` in the Nextcloud database.
 
 ## Installation
 
-From the App Store (once the first release is published there): **Apps → Search → Full Text Search - PostgreSQL**, or
+From the App Store: **Apps → Search → Full Text Search - PostgreSQL**, or
 
 ```bash
 sudo -u www-data php /var/www/nextcloud/occ app:install fulltextsearch_pgsql
@@ -71,7 +71,7 @@ Keep the index current with the live indexer (`occ fulltextsearch:live`, e.g. as
 
 ## Configuration
 
-Administrators can change every setting in **Administration settings → Full text search**, under *PostgreSQL search platform*. The panel also shows whether `pg_trgm`, `pdftotext` and `catdoc` are available, which tool reads PDFs, and how many documents are indexed in each language.
+Administrators can change settings in **Administration settings → Full text search**, under *PostgreSQL search platform*. The panel also shows whether `pg_trgm`, `pdftotext`, `catdoc` and non-ASCII locale case folding are available, which tool reads PDFs, and how many documents are indexed in each language.
 
 <p align="center"><img src="screenshots/admin-settings.png" alt="The PostgreSQL search platform settings: status, languages, matching and content extraction" width="640"></p>
 
@@ -89,9 +89,10 @@ occ fulltextsearch_pgsql:configure '{"language":"turkish,english"}'   # several 
 | `language` | `english` | PostgreSQL text search configuration used for stemming and stopwords, or several separated by commas (at most 5), e.g. `turkish,english`. Each must be listed by `--languages`. With several, each document is indexed in the one it is written in and searches look in all of them; the first is used for documents whose language cannot be told. Use `simple` for no stemming at all. |
 | `use_trigram` | `true` | Substring matching in titles, spelling correction, and similarity matching on titles when a search has no results. Ignored if `pg_trgm` is unavailable. |
 | `typo_correction` | `true` | Accent variants and spelling corrections from the vocabulary of indexed words. Accent variants work without `pg_trgm`. |
-| `max_results` | `100` | Upper limit for the page size a client may request. |
-| `max_content_size` | `512000` | Bytes of extracted text indexed per document. Larger documents are truncated. PostgreSQL rejects search vectors over 1 MB; if a document still exceeds that it is indexed by title and metadata only, with a warning. |
-| `pdftotext_path` | *(empty)* | Path to `pdftotext`. Empty means look it up on `PATH`. |
+| `max_results` | `100` | Upper limit for the page size a client may request (`1`–`10000`). |
+| `search_timeout` | `10` | Seconds before a search query is cancelled (`0`–`300`; `0` disables the timeout). Timed-out searches return cleanly with no results. |
+| `max_content_size` | `512000` | Bytes of extracted text indexed per document. Larger documents are truncated. PostgreSQL rejects search vectors over 1 MB; oversized documents degrade gracefully in bounded steps with a warning. |
+| `pdftotext_path` | *(empty)* | Path to `pdftotext` (`occ`-only; shown read-only in the admin panel). Empty means look it up on `PATH`. |
 | `pdf_extractor` | `auto` | `auto`: `pdftotext` when found, otherwise the bundled parser (also used when `pdftotext` fails to run). `pdftotext`: never fall back. `pdfparser`: always use the bundled parser. |
 
 The configure command and the admin panel validate every value before saving any. `occ config:app:set` works too but does not validate.
@@ -121,6 +122,7 @@ occ fulltextsearch:reset && occ fulltextsearch:index
 
 Nextcloud runs the app's repair step on upgrade; the index table and its documents are kept. Some improvements only apply to documents indexed after them:
 
+- **Plain text angle brackets and HTML block spacing** — re-index plain text files so `<email>`, `<url>` and code generics are preserved.
 - **Office text extraction** (words split across formatting runs, spreadsheet numbers, comments, text boxes) and **Office 97–2003 files** — re-index office documents.
 - **Several languages** — documents keep the language they were indexed in until re-indexed.
 
@@ -190,7 +192,7 @@ composer cs:check         # Nextcloud coding standard (composer cs:fix applies i
 FTSPG_TEST_DSN="pgsql:host=localhost;dbname=fts_test;user=postgres;password=postgres" composer test
 ```
 
-The integration tests run against a real, disposable PostgreSQL database with a UTF-8 locale (Turkish lowercasing depends on it). With `poppler-utils` and `catdoc` installed they also extract real PDF and Office 97–2003 files; without them, they check the warnings instead. The Office 97–2003 samples in `tests/fixtures` come from Apache Tika (Apache-2.0) and are not part of the app archive. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, checks the coding standard, and the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13 and 17.
+The integration tests run against a real, disposable PostgreSQL database with a UTF-8 locale (Turkish lowercasing depends on it). With `poppler-utils` and `catdoc` installed they also extract real PDF and Office 97–2003 files; without them, they check the warnings instead. The Office 97–2003 samples in `tests/fixtures` come from Apache Tika (Apache-2.0) and are not part of the app archive. CI runs Psalm against the Nextcloud 30, 34 and 35 APIs, checks the coding standard, and runs the integration tests on PHP 8.1 through 8.5 with PostgreSQL 13, 16, 17 and 18.
 
 `tests/live/run.sh` goes further: CI installs real Nextcloud 30, 34 and 35 servers on PostgreSQL with Full Text Search and the Files provider, runs the framework's own `occ fulltextsearch:test`, then indexes and searches real files: text, Office documents (including a word split across formatting runs and a Word 97–2003 file), and PDFs through both `pdftotext` and the bundled parser. It also indexes English and Turkish documents side by side with two languages configured, checks that nothing from the app reaches `nextcloud.log` as a warning or error, and covers both a database the Nextcloud user owns (`pg_trgm` enabled by the app) and one it doesn't (trigram features off).
 
