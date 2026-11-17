@@ -2626,6 +2626,7 @@ try {
 				public $proc = null;
 				/** @var array<int, resource> */
 				public array $pipes = [];
+				public ?int $exitCode = null;
 			};
 			$state->dsn = $dsn;
 			$state->childScript = $childScript;
@@ -2680,6 +2681,9 @@ try {
 								}
 								$status = proc_get_status($proc);
 								if (!$status['running']) {
+									if ($this->state->exitCode === null) {
+										$this->state->exitCode = $status['exitcode'];
+									}
 									break;
 								}
 								usleep(10000);
@@ -2714,20 +2718,30 @@ try {
 						$childStdout .= stream_get_contents($state->pipes[1]) ?: '';
 						$childStderr .= stream_get_contents($state->pipes[2]) ?: '';
 						$status = proc_get_status($state->proc);
-						if (!$status['running'] && feof($state->pipes[1]) && feof($state->pipes[2])) {
-							break;
+						if (!$status['running']) {
+							if ($state->exitCode === null) {
+								$state->exitCode = $status['exitcode'];
+							}
+							if (feof($state->pipes[1]) && feof($state->pipes[2])) {
+								break;
+							}
 						}
 						usleep(10000);
 					}
-					$status = proc_get_status($state->proc);
-					if ($status['running']) {
-						proc_terminate($state->proc);
+					if ($state->exitCode === null) {
+						$status = proc_get_status($state->proc);
+						if ($status['running']) {
+							proc_terminate($state->proc);
+						} else {
+							$state->exitCode = $status['exitcode'];
+						}
 					}
 					$childStdout .= stream_get_contents($state->pipes[1]) ?: '';
 					$childStderr .= stream_get_contents($state->pipes[2]) ?: '';
 					fclose($state->pipes[1]);
 					fclose($state->pipes[2]);
-					$childExit = proc_close($state->proc);
+					$closeCode = proc_close($state->proc);
+					$childExit = $state->exitCode ?? $closeCode;
 				}
 			}
 
