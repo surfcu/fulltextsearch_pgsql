@@ -17,14 +17,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Oldest supported (nextcloud-deps/ocp has no stable29 branch; 30 is the closest API).
-          - { nextcloud: '30', php: '8.1', postgres: '13', psalm: true }
+          # Psalm 7 requires PHP 8.2.27+; PHP 8.1 checks oldest runtime behaviour, while NC 30's
+          # API is checked with Psalm on PHP 8.3 (psalm.xml enforces phpVersion="8.1" syntax).
+          - { nextcloud: '30', php: '8.1', postgres: '13', psalm: false }
+          - { nextcloud: '30', php: '8.3', postgres: '13', psalm: true }
           - { nextcloud: '34', php: '8.3', postgres: '16', psalm: true }
           - { nextcloud: '35', php: '8.3', postgres: '17', psalm: true }
           - { nextcloud: '35', php: '8.3', postgres: '18', psalm: true }
-          # Psalm 5 does not install on PHP 8.4+; these jobs check runtime behaviour and deprecations.
-          - { nextcloud: '35', php: '8.4', postgres: '17', psalm: false }
-          - { nextcloud: '35', php: '8.5', postgres: '18', psalm: false }
+          - { nextcloud: '35', php: '8.4', postgres: '17', psalm: true }
+          - { nextcloud: '35', php: '8.5', postgres: '18', psalm: true }
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}

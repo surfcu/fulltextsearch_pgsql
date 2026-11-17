@@ -75,12 +75,8 @@ class SearchService {
 	 */
 	private static function isInvalidRegexException(\Throwable $e): bool {
 		for ($curr = $e; $curr !== null; $curr = $curr->getPrevious()) {
-			if (method_exists($curr, 'getSQLState')) {
-				/** @var mixed $sqlState */
-				$sqlState = call_user_func([$curr, 'getSQLState']);
-				if ($sqlState === '2201B') {
-					return true;
-				}
+			if (method_exists($curr, 'getSQLState') && $curr->getSQLState() === '2201B') {
+				return true;
 			}
 			if ((string)$curr->getCode() === '2201B') {
 				return true;
@@ -105,12 +101,8 @@ class SearchService {
 	 */
 	public static function isTimeoutException(\Throwable $e): bool {
 		for ($curr = $e; $curr !== null; $curr = $curr->getPrevious()) {
-			if (method_exists($curr, 'getSQLState')) {
-				/** @var mixed $sqlState */
-				$sqlState = call_user_func([$curr, 'getSQLState']);
-				if ($sqlState === '57014') {
-					return true;
-				}
+			if (method_exists($curr, 'getSQLState') && $curr->getSQLState() === '57014') {
+				return true;
 			}
 			if ((string)$curr->getCode() === '57014') {
 				return true;
@@ -274,14 +266,14 @@ class SearchService {
 
 		$maxScore = 0;
 		foreach ($rows as $row) {
-			$score = round((float)$row['rank'] * 100, 2);
+			$score = round((float)$row['rank'] * 100.0, 2);
 			$maxScore = max($maxScore, (int)ceil($score));
 			$result->addDocument($this->toResultDocument($providerId, $row, (string)$score, $access->getViewerId()));
 		}
 
 		$result->setTotal($rows === [] ? 0 : (int)$rows[0]['total']);
 		$result->setMaxScore($maxScore);
-		$result->setTime((int)round((microtime(true) - $start) * 1000));
+		$result->setTime((int)round((microtime(true) - $start) * 1000.0));
 		$result->setTimedOut(false);
 	}
 
@@ -970,7 +962,7 @@ class SearchService {
 			if ($df > 0) {
 				// max(N, df) keeps the logarithm defined when statistics are stale.
 				$n = max($total, $df);
-				$weights[$j] = log(1 + ($n - $df + 0.5) / ($df + 0.5));
+				$weights[$j] = log(1.0 + ((float)$n - (float)$df + 0.5) / ((float)$df + 0.5));
 			}
 		}
 		if (count($weights) < 2) {

@@ -510,7 +510,7 @@ class ContentExtractor {
 		}
 		// Legacy 8-bit encodings: accept when control characters are rare.
 		$controls = preg_match_all('/[\x00-\x08\x0E-\x1F\x7F]/', $sample);
-		return $controls < strlen($sample) * 0.02;
+		return (float)$controls < (float)strlen($sample) * 0.02;
 	}
 
 	private function toUtf8(string $text): string {

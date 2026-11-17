@@ -423,12 +423,8 @@ class IndexService {
 	 */
 	private function isProgramLimitExceeded(Throwable $e): bool {
 		for ($curr = $e; $curr !== null; $curr = $curr->getPrevious()) {
-			if (method_exists($curr, 'getSQLState')) {
-				/** @var mixed $sqlState */
-				$sqlState = call_user_func([$curr, 'getSQLState']);
-				if ($sqlState === '54000') {
-					return true;
-				}
+			if (method_exists($curr, 'getSQLState') && $curr->getSQLState() === '54000') {
+				return true;
 			}
 			if ((string)$curr->getCode() === '54000') {
 				return true;
