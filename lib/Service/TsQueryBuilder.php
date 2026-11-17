@@ -69,7 +69,7 @@ class TsQueryBuilder {
 	 * @return array{0: string, 1: list<string>}
 	 */
 	public function wordTsQuery(string $word, string $language, ?string $weights = null, bool $prefix = true): array {
-		$word = str_replace("\0", '', mb_scrub($word, 'UTF-8'));
+		$word = $this->cleanInput($word);
 		if ($language === 'turkish') {
 			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
 			$word = strtr($word, ['I' => 'ı', 'İ' => 'i']);
@@ -255,13 +255,18 @@ class TsQueryBuilder {
 
 	/** @return list<array<int, string>> regex matches: [1] phrase operator, [2] phrase, [3] word operator, [4] word */
 	private function tokenize(string $search, string $language): array {
-		$search = str_replace("\0", '', mb_scrub($search, 'UTF-8'));
+		$search = $this->cleanInput($search);
 		if ($language === 'turkish') {
 			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
 			$search = strtr($search, ['I' => 'ı', 'İ' => 'i']);
 		}
 		preg_match_all('/([+-]?)"([^"]*)"?|([+-]?)(\S+)/u', $search, $matches, PREG_SET_ORDER);
 		return $matches;
+	}
+
+	private function cleanInput(string $text): string {
+		// Strip NUL and non-whitespace control characters; keep \t, \n, \r as token separators.
+		return (string)preg_replace('/[^\P{Cc}\t\n\r]+/u', '', mb_scrub($text, 'UTF-8'));
 	}
 
 	/**

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Include document parts (such as comments) in search excerpts alongside content without detoasting non-page rows, strip NUL and non-whitespace control characters during query tokenization, roll back search-planning transactions if reading or applying planner settings fails, preserve accurate `total` counts on past-end result pages, and paginate the trigram title-similarity fallback across pages; no re-indexing is needed.
 - Scope vocabulary typo and accent-variant lookups to documents visible to the searching viewer under the active search filters, gating spelling corrections to searches whose uncorrected first page returns fewer than the requested page size; no re-indexing is needed.
 - Ignore stopwords in required terms (`+the +budget`), phrases (`"to be"`), and all-words ranking (`budget for 2025`) while returning nothing when every positive term is a stopword (`+the +of`); no re-indexing is needed.
 - Skip the trigram title-similarity fallback when a query uses exclusions (`-`), required terms (`+`), or phrases (`"..."`), keeping plain-word `OR`/`AND` searches eligible; no re-indexing is needed.
