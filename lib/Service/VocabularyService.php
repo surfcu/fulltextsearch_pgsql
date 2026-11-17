@@ -45,9 +45,9 @@ class VocabularyService {
 	 * Add the words of one indexed document. One INSERT … SELECT computed in PostgreSQL;
 	 * words are inserted in sorted order so concurrent indexers cannot deadlock.
 	 */
-	public function addDocument(string $providerId, string $documentId): void {
+	public function addDocument(string $providerId, string $documentId, bool $withContent = true, bool $withParts = true): void {
 		$this->db->executeStatement(
-			$this->insertSql('d.provider_id = ? AND d.document_id = ?'),
+			$this->insertSql('d.provider_id = ? AND d.document_id = ?', $withContent, $withParts),
 			[$providerId, $documentId]
 		);
 	}
@@ -216,13 +216,23 @@ class VocabularyService {
 		return $d[$n][$m];
 	}
 
-	private function insertSql(string $where): string {
+	private function insertSql(string $where, bool $withContent = true, bool $withParts = true): string {
 		$t = $this->schemaService->getTableName();
 		$w = $this->schemaService->getWordsTableName();
 		$s = $this->schemaService;
 		// The 'simple' configuration lowercases without stemming or stopwords: surface words.
-		$text = "{$s->normalized('d.title')} || ' ' || {$s->splitWords($s->normalized('d.title'))} || ' ' || "
-			. "{$s->normalized('d.tags_text')} || ' ' || {$s->normalized('d.parts_text')} || ' ' || {$s->normalized('d.content')}";
+		$fields = [
+			$s->normalized('d.title'),
+			$s->splitWords($s->normalized('d.title')),
+			$s->normalized('d.tags_text'),
+		];
+		if ($withParts) {
+			$fields[] = $s->normalized('d.parts_text');
+		}
+		if ($withContent) {
+			$fields[] = $s->normalized('d.content');
+		}
+		$text = implode(" || ' ' || ", $fields);
 		$min = self::MIN_LENGTH;
 		$max = self::MAX_LENGTH;
 		return <<<SQL

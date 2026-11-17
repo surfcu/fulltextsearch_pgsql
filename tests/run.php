@@ -1651,7 +1651,7 @@ try {
 	$repairOutput = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progress) {
 		$progress += $step;
 	}]);
-	(new CreateIndexTable($schema, $vocabulary))->run($repairOutput);
+	(new CreateIndexTable($schema, $vocabulary, $config))->run($repairOutput);
 	check($vocabulary->count() > 20, 'upgrade step fills an empty vocabulary on small instances');
 	same($schema->countDocuments(), $progress, 'and reports progress per document');
 
@@ -1859,6 +1859,219 @@ try {
 
 	// Restore normal timeout
 	$config->setConfig(['search_timeout' => 10]);
+
+	section('extraction and vocabulary limits (B5)');
+	$b5ToolDir = sys_get_temp_dir() . '/ftspg_b5_tool_' . mt_rand();
+	mkdir($b5ToolDir);
+	$b5HangDir = $b5ToolDir . '/hang';
+	$b5StderrDir = $b5ToolDir . '/stderr';
+	mkdir($b5HangDir);
+	mkdir($b5StderrDir);
+	$b5HangTool = $b5HangDir . '/pdftotext';
+	$b5StderrTool = $b5StderrDir . '/pdftotext';
+	try {
+		$config->setConfig(['language' => 'english', 'typo_correction' => true]);
+
+		// B5.1a: tool ignoring SIGTERM after hitting output limit
+		file_put_contents($b5HangTool, "#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.0\"; exit 0; fi\ntrap '' TERM\nprintf 'hangmarker '\nhead -c 2500 /dev/zero | tr '\\0' 'a'\nexec sleep 5\n");
+		chmod($b5HangTool, 0755);
+		$config->setConfig(['max_content_size' => 1000, 'pdf_extractor' => 'pdftotext', 'pdftotext_path' => $b5HangTool]);
+		$runnerLog = [];
+		$t0 = microtime(true);
+		$platform->indexDocument(doc('B5_TOOL_HANG', 'alice', 'Hang.pdf', $b64("%PDF-1.4\nfake"), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+		$elapsed = microtime(true) - $t0;
+		check($elapsed < 2.0, sprintf('B5.1a: output-capped tool ignoring SIGTERM terminated quickly (%.2fs)', $elapsed));
+		same('ok', $runnerLog['B5_TOOL_HANG'][0] ?? '', 'B5.1a: output-capped tool is not flagged as timed out');
+		same(['B5_TOOL_HANG'], search($platform, 'alice', 'hangmarker')['ids'], 'B5.1a: output before limit is indexed');
+
+		// B5.1b: >128 KB stderr flood before stdout
+		file_put_contents($b5StderrTool, "#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.0\"; exit 0; fi\nhead -c 140000 /dev/zero | tr '\\0' 'e' >&2\necho \"betaword stderr flood recovered\"\nexit 0\n");
+		chmod($b5StderrTool, 0755);
+		$config->setConfig(['max_content_size' => 512000, 'pdf_extractor' => 'pdftotext', 'pdftotext_path' => $b5StderrTool]);
+		$runnerLog = [];
+		$t0 = microtime(true);
+		$platform->indexDocument(doc('B5_STDERR_FLOOD', 'alice', 'Stderr.pdf', $b64("%PDF-1.4\nfake"), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+		$elapsed = microtime(true) - $t0;
+		check($elapsed < 2.0, sprintf('B5.1b: stderr flood (>128 KB) drained without deadlock (%.2fs)', $elapsed));
+		same('ok', $runnerLog['B5_STDERR_FLOOD'][0] ?? '', 'B5.1b: stderr flood succeeds without warning');
+		same(['B5_STDERR_FLOOD'], search($platform, 'alice', 'betaword')['ids'], 'B5.1b: stdout after stderr flood is indexed');
+
+		$config->setConfig(['max_content_size' => 512000, 'pdf_extractor' => 'auto', 'pdftotext_path' => '']);
+
+		// B5.2a: 3,000-sheet xlsx hitting 2,000-entry cap
+		$files = ['xl/workbook.xml' => "<workbook $s><sheets><sheet name=\"BigBook\" sheetId=\"1\"/></sheets></workbook>"];
+		for ($i = 1; $i <= 3000; $i++) {
+			$files["xl/worksheets/sheet{$i}.xml"] = "<worksheet $s><sheetData><row><c t=\"inlineStr\"><is><t>sheettoken{$i}marker</t></is></c></row></sheetData></worksheet>";
+		}
+		$runnerLog = [];
+		$office('B5_XLSX_ENTRIES', 'sheets3000.xlsx', $files);
+		unset($files);
+		same('warning', $runnerLog['B5_XLSX_ENTRIES'][0] ?? '', 'B5.2a: 3000-sheet xlsx emits partial-index warning');
+		check(str_contains($runnerLog['B5_XLSX_ENTRIES'][1] ?? '', 'partially indexed'), 'B5.2a: warning mentions partially indexed');
+		same(['B5_XLSX_ENTRIES'], search($platform, 'alice', 'sheettoken1marker')['ids'], 'B5.2a: sheet 1 is indexed');
+		same(['B5_XLSX_ENTRIES'], search($platform, 'alice', 'sheettoken1999marker')['ids'], 'B5.2a: sheet 1999 (2000th entry) is indexed');
+		same([], search($platform, 'alice', 'sheettoken2000marker')['ids'], 'B5.2a: sheet 2000 (2001st entry) is skipped');
+		same([], search($platform, 'alice', 'sheettoken3000marker')['ids'], 'B5.2a: sheet 3000 is skipped');
+
+		// B5.2b: >128 MB uncompressed XML docx hitting 128 MB total cap
+		$conn->log = [];
+		$conn->statements = [];
+		$b5ZipDir = $b5ToolDir . '/docx';
+		mkdir($b5ZipDir);
+		$chunk = '<w:delText>' . str_repeat('a', 100000) . '</w:delText>';
+		$writeEntry = static function (string $path, string $head, string $tail) use ($chunk): void {
+			$fh = fopen($path, 'wb');
+			if ($fh === false) {
+				throw new \RuntimeException("Cannot open $path");
+			}
+			fwrite($fh, $head);
+			for ($i = 0; $i < 315; $i++) {
+				fwrite($fh, $chunk);
+			}
+			fwrite($fh, $tail);
+			fclose($fh);
+		};
+		$entryPaths = [
+			'word/document.xml' => [$b5ZipDir . '/document.xml', "<w:document $w><w:body><w:p><w:r><w:t>docentryonemarker</w:t></w:r></w:p>", '</w:body></w:document>'],
+			'word/header1.xml' => [$b5ZipDir . '/header1.xml', "<w:hdr $w><w:p><w:r><w:t>headeronemarker</w:t></w:r></w:p>", '</w:hdr>'],
+			'word/header2.xml' => [$b5ZipDir . '/header2.xml', "<w:hdr $w><w:p><w:r><w:t>headertwomarker</w:t></w:r></w:p>", '</w:hdr>'],
+			'word/header3.xml' => [$b5ZipDir . '/header3.xml', "<w:hdr $w><w:p><w:r><w:t>headerthreemarker</w:t></w:r></w:p>", '</w:hdr>'],
+			'word/header4.xml' => [$b5ZipDir . '/header4.xml', "<w:hdr $w>", '<w:p><w:r><w:t>headerfourtailmarker</w:t></w:r></w:p></w:hdr>'],
+		];
+		$tmpDocx = $b5ZipDir . '/huge.docx';
+		$zip = new ZipArchive();
+		$zip->open($tmpDocx, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+		foreach ($entryPaths as $entryName => [$filePath, $head, $tail]) {
+			$writeEntry($filePath, $head, $tail);
+			$zip->addFile($filePath, $entryName);
+		}
+		$zip->addFromString('word/header5.xml', "<w:hdr $w><w:p><w:r><w:t>headerfivemarker</w:t></w:r></w:p></w:hdr>");
+		$zip->close();
+		$docxZip = (string)file_get_contents($tmpDocx);
+		foreach ($entryPaths as [$filePath]) {
+			@unlink($filePath);
+		}
+		@unlink($tmpDocx);
+		@rmdir($b5ZipDir);
+		unset($chunk, $entryPaths);
+		$runnerLog = [];
+		$platform->indexDocument(doc('B5_DOCX_BYTES', 'alice', 'huge.docx', $b64($docxZip), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+		unset($docxZip);
+		same('warning', $runnerLog['B5_DOCX_BYTES'][0] ?? '', 'B5.2b: >128 MB xml docx emits partial-index warning');
+		check(str_contains($runnerLog['B5_DOCX_BYTES'][1] ?? '', 'partially indexed'), 'B5.2b: warning mentions partially indexed');
+		same(['B5_DOCX_BYTES'], search($platform, 'alice', 'docentryonemarker')['ids'], 'B5.2b: first entry under 128 MB is indexed');
+		same(['B5_DOCX_BYTES'], search($platform, 'alice', 'headerthreemarker')['ids'], 'B5.2b: 4th entry under 128 MB is indexed');
+		same([], search($platform, 'alice', 'headerfourtailmarker')['ids'], 'B5.2b: entry tail past 128 MB cap is not indexed');
+		same([], search($platform, 'alice', 'headerfivemarker')['ids'], 'B5.2b: 6th entry after 128 MB cap is skipped');
+
+		// B5.3a: ODF mid-sentence annotation & note without word fusion
+		$office('B5_ODF_NOTES', 'notes.odt', [
+			'mimetype' => 'application/vnd.oasis.opendocument.text',
+			'content.xml' => "<office:document-content $o><office:body><office:text>"
+				. '<text:p>odfkitap<text:span>lık</text:span> odfkalem<office:annotation><dc:creator>ZeynepNotator</dc:creator><dc:date>1999-12-31</dc:date><text:p>odfyorum odfmartı</text:p></office:annotation>odfdefter</text:p>'
+				. '<text:p>odfelma<text:note text:note-class="footnote"><text:note-citation>odfcite</text:note-citation><text:note-body><text:p>Dipnot odfkumru</text:p></text:note-body></text:note>odfarmut</text:p>'
+				. '</office:text></office:body></office:document-content>',
+		]);
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfkitaplık')['ids'], 'B5.3a: <text:span> still leaves words joined');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfkalem')['ids'], 'B5.3a: word before mid-sentence annotation is searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfyorum')['ids'], 'B5.3a: first word inside annotation is separately searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfmartı')['ids'], 'B5.3a: annotation body is searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfdefter')['ids'], 'B5.3a: word after mid-sentence annotation is searchable');
+		same([], search($platform, 'alice', 'odfkalemodfyorum')['ids'], 'B5.3a: word before annotation does not fuse with annotation text');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfelma')['ids'], 'B5.3a: word before mid-sentence note is searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfcite')['ids'], 'B5.3a: note citation is separately searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfkumru')['ids'], 'B5.3a: note body is searchable');
+		same(['B5_ODF_NOTES'], search($platform, 'alice', 'odfarmut')['ids'], 'B5.3a: word after mid-sentence note is searchable');
+		same([], search($platform, 'alice', 'odfelmaodfcite')['ids'], 'B5.3a: word before note does not fuse with note citation');
+		same([], search($platform, 'alice', 'zeynepnotator')['ids'], 'B5.3a: annotation dc:creator is skipped');
+		same([], search($platform, 'alice', '1999')['ids'], 'B5.3a: annotation dc:date is skipped');
+		$odfNotesContent = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B5_ODF_NOTES'")->fetchOne();
+		check(str_contains($odfNotesContent, 'odfkitaplık'), 'B5.3a: stored content preserves span joining');
+		check(str_contains($odfNotesContent, 'odfkalem odfyorum odfmartı odfdefter'), 'B5.3a: stored content separates annotation cleanly');
+		check(str_contains($odfNotesContent, 'odfelma odfcite Dipnot odfkumru odfarmut'), 'B5.3a: stored content separates note cleanly');
+
+		// B5.3b: ODF styles.xml headers/footers without style metadata leak, ordered after content.xml
+		$office('B5_ODF_STYLES', 'headers.odt', [
+			'mimetype' => 'application/vnd.oasis.opendocument.text',
+			'content.xml' => "<office:document-content $o><office:body><office:text><text:p>OdfBodyMetni</text:p></office:text></office:body></office:document-content>",
+			'styles.xml' => "<office:document-styles $o xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\">"
+				. '<office:font-face-decls><style:font-face style:name="Sans"/></office:font-face-decls>'
+				. '<office:styles><style:style style:name="Header"><text:p>StyleLeakShouldNotIndex</text:p></style:style></office:styles>'
+				. '<office:automatic-styles><style:page-layout style:name="pm1"><text:p>AutoStyleLeakShouldNotIndex</text:p></style:page-layout></office:automatic-styles>'
+				. '<office:master-styles><style:master-page style:name="Standard">'
+				. '<style:header><text:p>Üstbilgi odfheadflamingo</text:p></style:header>'
+				. '<style:header-left><text:p>Solüstbilgi odfleftibis</text:p></style:header-left>'
+				. '<style:header-first><text:p>İlküstbilgi odffirstpelikan</text:p></style:header-first>'
+				. '<style:footer><text:p>Altbilgi odffootturna</text:p></style:footer>'
+				. '<style:footer-left><text:p>Solaltbilgi odffootleftleylek</text:p></style:footer-left>'
+				. '<style:footer-first><text:p>İlkaltbilgi odffootfirstbalıkçıl</text:p></style:footer-first>'
+				. '</style:master-page></office:master-styles>'
+				. '</office:document-styles>',
+		]);
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odfheadflamingo')['ids'], 'B5.3b: styles.xml header indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odfleftibis')['ids'], 'B5.3b: styles.xml header-left indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odffirstpelikan')['ids'], 'B5.3b: styles.xml header-first indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odffootturna')['ids'], 'B5.3b: styles.xml footer indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odffootleftleylek')['ids'], 'B5.3b: styles.xml footer-left indexed');
+		same(['B5_ODF_STYLES'], search($platform, 'alice', 'odffootfirstbalıkçıl')['ids'], 'B5.3b: styles.xml footer-first indexed');
+		same([], search($platform, 'alice', 'styleleakshouldnotindex')['ids'], 'B5.3b: office:styles metadata not indexed');
+		same([], search($platform, 'alice', 'autostyleleakshouldnotindex')['ids'], 'B5.3b: office:automatic-styles metadata not indexed');
+		$odfStylesContent = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B5_ODF_STYLES'")->fetchOne();
+		$bodyPos = strpos($odfStylesContent, 'OdfBodyMetni');
+		$hdrPos = strpos($odfStylesContent, 'Üstbilgi odfheadflamingo');
+		check($bodyPos !== false && $hdrPos !== false && $bodyPos < $hdrPos, 'B5.3b: content.xml precedes styles.xml headers/footers');
+
+		// B5.4: metadata-only INDEX_META update restricts vocabulary additions to title and tags_text
+		$platform->indexDocument(doc('B5_META_VOCAB', 'alice', 'InitialMetaTitle', 'storedcontentquokka bodytext', [
+			'parts' => ['comments' => 'storedpartsquoll commenttext'],
+			'tags' => ['initialtagquail'],
+		]));
+		$wordsBeforeMeta = $conn->executeQuery('SELECT word FROM ftspg_oc_words')->fetchAll(PDO::FETCH_COLUMN);
+		check(in_array('storedcontentquokka', $wordsBeforeMeta, true), 'B5.4: initial full index adds content word to vocabulary');
+		check(in_array('storedpartsquoll', $wordsBeforeMeta, true), 'B5.4: initial full index adds parts word to vocabulary');
+
+		$conn->executeStatement("DELETE FROM ftspg_oc_words WHERE word IN ('storedcontentquokka', 'storedpartsquoll')");
+		$platform->indexDocument(doc('B5_META_VOCAB', 'alice', 'RenamedMetaTitle SplitAlpha123SplitBeta.txt', '', [
+			'tags' => ['renamedtaglemur'],
+		], 'files', IIndex::INDEX_META));
+		$wordsAfterMeta = $conn->executeQuery('SELECT word FROM ftspg_oc_words')->fetchAll(PDO::FETCH_COLUMN);
+		check(in_array('renamedmetatitle', $wordsAfterMeta, true), 'B5.4: INDEX_META adds new title word to vocabulary');
+		check(in_array('splitalpha', $wordsAfterMeta, true) && in_array('splitbeta', $wordsAfterMeta, true), 'B5.4: INDEX_META adds split title words to vocabulary');
+		check(in_array('renamedtaglemur', $wordsAfterMeta, true), 'B5.4: INDEX_META adds new tag word to vocabulary');
+		check(!in_array('storedcontentquokka', $wordsAfterMeta, true), 'B5.4: INDEX_META does not re-add stored content words');
+		check(!in_array('storedpartsquoll', $wordsAfterMeta, true), 'B5.4: INDEX_META does not re-add stored parts words');
+
+		// B5.5: CreateIndexTable::fillVocabulary() skips when typo_correction = false
+		$conn->executeStatement('TRUNCATE ftspg_oc_words');
+		$config->setConfig(['typo_correction' => false]);
+		$progressOff = 0;
+		$repairOutputOff = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progressOff) {
+			$progressOff += $step;
+		}]);
+		(new CreateIndexTable($schema, $vocabulary, $config))->run($repairOutputOff);
+		same(0, $vocabulary->count(), 'B5.5: upgrade step leaves vocabulary empty when typo_correction is false');
+		same(0, $progressOff, 'B5.5: upgrade step reports 0 progress when typo_correction is false');
+
+		$config->setConfig(['typo_correction' => true]);
+		$progressOn = 0;
+		$repairOutputOn = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progressOn) {
+			$progressOn += $step;
+		}]);
+		(new CreateIndexTable($schema, $vocabulary, $config))->run($repairOutputOn);
+		check($vocabulary->count() > 20, 'B5.5: upgrade step populates vocabulary once typo_correction is re-enabled');
+		same($schema->countDocuments(), $progressOn, 'B5.5: upgrade step reports progress per document when enabled');
+	} finally {
+		$config->setConfig(['max_content_size' => 512000, 'pdf_extractor' => 'auto', 'pdftotext_path' => '', 'typo_correction' => true, 'language' => 'turkish']);
+		foreach (glob($b5ToolDir . '/docx/*') ?: [] as $tmpFile) {
+			@unlink($tmpFile);
+		}
+		@rmdir($b5ToolDir . '/docx');
+		@unlink($b5HangTool);
+		@unlink($b5StderrTool);
+		@rmdir($b5HangDir);
+		@rmdir($b5StderrDir);
+		@rmdir($b5ToolDir);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";
