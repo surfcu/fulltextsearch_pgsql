@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Bump schema version to 3 (`ftspg schema 3`), replace the `config` `regconfig` column and `varchar` caps on `provider_id`, `document_id`, `owner_id`, `source`, and `hash` with `text` plus an `IMMUTABLE PARALLEL SAFE` `ftspg_<prefix>regconfig(text)` SQL wrapper and post-rebuild `ANALYZE` to unblock `pg_upgrade` (one-time `ensureSchema()` rewrite measured at 51.7 s on the 100,000-document synthetic index); no re-indexing is needed.
 - Update documentation (`README.md`, `docs/MIGRATION.md`, `docs/ARCHITECTURE.md`, `docs/RELEASING.md`) with PostgreSQL upgrade instructions prior to 1.6.0, database locale requirements, ignored search-request fields under limitations, viewer-scoped typo correction behavior, and current extraction/ranking capabilities.
 
 ### Fixed

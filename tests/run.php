@@ -16,6 +16,7 @@ use OC\FullTextSearch\Model\DocumentAccess;
 use OC\FullTextSearch\Model\IndexDocument;
 use OCA\FullTextSearch_PgSql\Controller\SettingsController;
 use OCA\FullTextSearch_PgSql\Migration\CreateIndexTable;
+use OCA\FullTextSearch_PgSql\Migration\DropIndexTable;
 use OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform;
 use OCA\FullTextSearch_PgSql\Service\ConfigService;
 use OCA\FullTextSearch_PgSql\Service\ContentExtractor;
@@ -1966,6 +1967,7 @@ try {
 	$t = $schema->getTableName();
 	$conn->executeStatement("DROP INDEX IF EXISTS {$t}_title_search_trgm_idx");
 	$conn->executeStatement("ALTER TABLE $t DROP COLUMN title_search, DROP COLUMN tsv");
+	$conn->executeStatement("ALTER TABLE $t ALTER COLUMN config TYPE regconfig USING config::regconfig");
 	$conn->executeStatement("ALTER TABLE $t ADD COLUMN tsv tsvector GENERATED ALWAYS AS (to_tsvector(config, title)) STORED");
 	if ($schema->hasTrigram()) {
 		$conn->executeStatement("CREATE INDEX {$t}_title_trgm_idx ON $t USING GIN (title gin_trgm_ops)");
@@ -2056,8 +2058,8 @@ try {
 
 	$conn->executeStatement('SET enable_seqscan = off');
 	$plan = implode("\n", array_column($conn->executeQuery(
-		"EXPLAIN SELECT id FROM ftspg_oc_index d WHERE ((d.config <> ALL ('{english}'::regconfig[]) AND d.tsv @@ to_tsquery('turkish', 'kitap:*'))"
-		. " OR (d.config = 'english'::regconfig AND d.tsv @@ to_tsquery('english', 'study:*'))) AND d.access && '{u:alice}'::text[]"
+		"EXPLAIN SELECT id FROM ftspg_oc_index d WHERE ((d.config <> ALL ('{english}'::text[]) AND d.tsv @@ to_tsquery('turkish', 'kitap:*'))"
+		. " OR (d.config = 'english' AND d.tsv @@ to_tsquery('english', 'study:*'))) AND d.access && '{u:alice}'::text[]"
 	)->fetchAll(), 'QUERY PLAN'));
 	check(str_contains($plan, 'ftspg_oc_index_tsv_idx') || str_contains($plan, 'ftspg_oc_index_access_idx'), 'two-language search still uses the GIN index');
 	$conn->executeStatement('SET enable_seqscan = on');
@@ -2578,6 +2580,7 @@ try {
 			$conn->rollBack();
 		}
 		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s1fresh_index, ftspg_s1fresh_words, ftspg_s1conc_index, ftspg_s1conc_words, ftspg_s1race_index, ftspg_s1race_words, ftspg_s1test_index, ftspg_s1test_words, ftspg_s1notrgm_index, ftspg_s1notrgm_words');
+		$conn->executeStatement('DROP FUNCTION IF EXISTS ftspg_s1fresh_regconfig(text), ftspg_s1conc_regconfig(text), ftspg_s1race_regconfig(text), ftspg_s1test_regconfig(text), ftspg_s1notrgm_regconfig(text)');
 	};
 	$s1DropTables();
 
@@ -2967,6 +2970,246 @@ try {
 		same([], $rewriteDdl, 'S1 recovery: words table/index recovery does not drop or rebuild tsv');
 	} finally {
 		$s1DropTables();
+	}
+
+	section('config as text and schema version 3 (S2)');
+	$s2Cleanup = static function () use ($conn, $platform): void {
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s2fresh_index, ftspg_s2fresh_words, ftspg_s2up_index, ftspg_s2up_words, ftspg_s2drop_index, ftspg_s2drop_words');
+		$conn->executeStatement('DROP FUNCTION IF EXISTS ftspg_s2fresh_regconfig(text), ftspg_s2up_regconfig(text), ftspg_s2drop_regconfig(text)');
+		$conn->executeStatement("DELETE FROM ftspg_oc_index WHERE provider_id = 's2ml' OR length(provider_id) > 64");
+		$platform->resetIndex('s2ml');
+	};
+	$s2Cleanup();
+
+	try {
+		// 1. Schema v3 marker on ftspg_oc_index.tsv
+		$s2Marker = $conn->executeQuery(
+			"SELECT col_description(to_regclass('ftspg_oc_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_oc_index') AND attname = 'tsv' AND NOT attisdropped"
+		)->fetchOne();
+		same('ftspg schema 3', $s2Marker, 'S2: tsv column comment carries ftspg schema 3 marker');
+
+		// 2. Columns are text (zero reg* columns) and tsv uses ftspg_oc_regconfig(config)
+		$s2ColRows = $conn->executeQuery(
+			"SELECT attname, format_type(atttypid, atttypmod) AS typ FROM pg_attribute WHERE attrelid = to_regclass('ftspg_oc_index') AND attnum > 0 AND NOT attisdropped"
+		)->fetchAll();
+		$s2ColTypes = [];
+		$s2RegCols = [];
+		foreach ($s2ColRows as $row) {
+			$colName = (string)$row['attname'];
+			$colType = (string)$row['typ'];
+			$s2ColTypes[$colName] = $colType;
+			if (str_starts_with($colType, 'reg')) {
+				$s2RegCols[] = $colName . ':' . $colType;
+			}
+		}
+		foreach (['config', 'provider_id', 'document_id', 'owner_id', 'source', 'hash'] as $col) {
+			same('text', $s2ColTypes[$col] ?? null, "S2: ftspg_oc_index.$col is text");
+		}
+		same([], $s2RegCols, 'S2: ftspg_oc_index has zero reg* columns');
+		$s2TsvExpr = (string)$conn->executeQuery(
+			"SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = to_regclass('ftspg_oc_index') AND a.attname = 'tsv' AND NOT a.attisdropped"
+		)->fetchOne();
+		check(str_contains($s2TsvExpr, 'ftspg_oc_regconfig(config)'), 'S2: generated tsv expression uses ftspg_oc_regconfig(config)');
+
+		// 3. ftspg_oc_regconfig(text) wrapper metadata and evaluation
+		$s2FnRow = $conn->executeQuery(
+			"SELECT p.provolatile, p.proparallel, p.prorettype::regtype::text AS rettype, p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = current_schema() AND p.proname = 'ftspg_oc_regconfig' AND pg_get_function_identity_arguments(p.oid) = 'text'"
+		)->fetch();
+		check(is_array($s2FnRow), 'S2: ftspg_oc_regconfig(text) exists in current schema');
+		same('i', is_array($s2FnRow) ? (string)$s2FnRow['provolatile'] : null, 'S2: ftspg_oc_regconfig(text) is IMMUTABLE');
+		same('s', is_array($s2FnRow) ? (string)$s2FnRow['proparallel'] : null, 'S2: ftspg_oc_regconfig(text) is PARALLEL SAFE');
+		same('regconfig', is_array($s2FnRow) ? (string)$s2FnRow['rettype'] : null, 'S2: ftspg_oc_regconfig(text) returns regconfig');
+		check(is_array($s2FnRow) && str_contains((string)$s2FnRow['prosrc'], 'pg_catalog.regconfig'), 'S2: ftspg_oc_regconfig(text) body qualifies pg_catalog.regconfig');
+		try {
+			same('english', (string)$conn->executeQuery("SELECT ftspg_oc_regconfig('english')::text")->fetchOne(), 'S2: ftspg_oc_regconfig evaluates english');
+			same('turkish', (string)$conn->executeQuery("SELECT ftspg_oc_regconfig('turkish')::text")->fetchOne(), 'S2: ftspg_oc_regconfig evaluates turkish');
+		} catch (Throwable $e) {
+			check(false, 'S2: ftspg_oc_regconfig evaluation failed: ' . $e->getMessage());
+		}
+
+		// 4a. Fresh install creates Schema v3 directly
+		$s2FreshSchema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 's2fresh_']), $logger);
+		$s2FreshSchema->dropSchema();
+		$s2FreshSchema->ensureSchema();
+		same(true, $s2FreshSchema->isCurrent(), 'S2 fresh install: ensureSchema creates current schema');
+		$s2FreshMarker = $conn->executeQuery(
+			"SELECT col_description(to_regclass('ftspg_s2fresh_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s2fresh_index') AND attname = 'tsv' AND NOT attisdropped"
+		)->fetchOne();
+		same('ftspg schema 3', $s2FreshMarker, 'S2 fresh install: marker is ftspg schema 3');
+		$s2FreshColTypes = [];
+		foreach ($conn->executeQuery("SELECT attname, format_type(atttypid, atttypmod) AS typ FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s2fresh_index') AND attnum > 0 AND NOT attisdropped")->fetchAll() as $row) {
+			$s2FreshColTypes[(string)$row['attname']] = (string)$row['typ'];
+		}
+		foreach (['config', 'provider_id', 'document_id', 'owner_id', 'source', 'hash'] as $col) {
+			same('text', $s2FreshColTypes[$col] ?? null, "S2 fresh install: $col is text");
+		}
+		$s2FreshFn = $conn->executeQuery("SELECT to_regprocedure('ftspg_s2fresh_regconfig(text)') IS NOT NULL")->fetchOne();
+		same(true, (bool)$s2FreshFn, 'S2 fresh install: ftspg_s2fresh_regconfig(text) created');
+
+		// 4b. Upgrading an explicit Schema v2 table (varchar + regconfig + 'ftspg schema 2') preserves rows & config and searches cleanly
+		$s2UpSysConfig = new ArrayConfig(['dbtableprefix' => 's2up_']);
+		$s2UpSchema = new SchemaService($conn, $s2UpSysConfig, $logger);
+		$s2UpConfig = new ConfigService(new ArrayAppConfig(), $s2UpSchema);
+		$s2UpConfig->setConfig(['language' => 'turkish,english']);
+		$s2UpVocab = new VocabularyService($conn, $s2UpSchema);
+		$s2UpIndex = new IndexService($conn, $s2UpSchema, $s2UpConfig, new ContentExtractor($s2UpConfig), $s2UpVocab, $logger, new LanguageDetector($conn, $s2UpConfig, $logger));
+		$s2UpSearch = new SearchService($conn, $s2UpSchema, $s2UpConfig, new TsQueryBuilder(), $s2UpVocab);
+		$s2UpPlatform = new PostgreSQLPlatform($s2UpConfig, $s2UpSchema, $s2UpIndex, $s2UpSearch, $logger, new ContentExtractor($s2UpConfig));
+		$conn->executeStatement(<<<'SQL'
+			CREATE TABLE ftspg_s2up_index (
+				id            bigserial    PRIMARY KEY,
+				provider_id   varchar(64)  NOT NULL,
+				document_id   varchar(254) NOT NULL,
+				owner_id      varchar(64)  NOT NULL DEFAULT '',
+				access        text[]       NOT NULL DEFAULT '{}',
+				links         text[]       NOT NULL DEFAULT '{}',
+				tags          text[]       NOT NULL DEFAULT '{}',
+				metatags      text[]       NOT NULL DEFAULT '{}',
+				subtags       text[]       NOT NULL DEFAULT '{}',
+				source        varchar(64)  NOT NULL DEFAULT '',
+				hash          varchar(128) NOT NULL DEFAULT '',
+				modified_time bigint       NOT NULL DEFAULT 0,
+				indexed_at    bigint       NOT NULL DEFAULT 0,
+				config        regconfig    NOT NULL,
+				title         text         NOT NULL DEFAULT '',
+				tags_text     text         NOT NULL DEFAULT '',
+				parts         jsonb        NOT NULL DEFAULT '{}',
+				parts_text    text         NOT NULL DEFAULT '',
+				content       text         NOT NULL DEFAULT '',
+				info          jsonb        NOT NULL DEFAULT '{}',
+				tsv           tsvector     GENERATED ALWAYS AS (
+					setweight(to_tsvector(config, CASE WHEN config = 'turkish'::regconfig THEN translate(title, 'Iİ', 'ıi') ELSE title END), 'A')
+					|| setweight(to_tsvector(config, CASE WHEN config = 'turkish'::regconfig THEN translate(content, 'Iİ', 'ıi') ELSE content END), 'D')
+				) STORED,
+				title_search  text         GENERATED ALWAYS AS (lower(CASE WHEN config = 'turkish'::regconfig THEN translate(title, 'Iİ', 'ıi') ELSE title END)) STORED,
+				CONSTRAINT ftspg_s2up_index_doc_uniq UNIQUE (provider_id, document_id)
+			)
+			SQL);
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s2up_index.tsv IS 'ftspg schema 2'");
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_index_tsv_idx ON ftspg_s2up_index USING GIN (tsv)');
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_index_access_idx ON ftspg_s2up_index USING GIN (access)');
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_index_metatags_idx ON ftspg_s2up_index USING GIN (metatags)');
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_index_subtags_idx ON ftspg_s2up_index USING GIN (subtags)');
+		$conn->executeStatement(sprintf(
+			'CREATE TABLE ftspg_s2up_words (word text COLLATE "C" PRIMARY KEY, folded text COLLATE "C" GENERATED ALWAYS AS (translate(word, \'%s\', \'%s\')) STORED)',
+			\OCA\FullTextSearch_PgSql\Tools\Fold::FROM,
+			\OCA\FullTextSearch_PgSql\Tools\Fold::TO
+		));
+		$conn->executeStatement('CREATE INDEX ftspg_s2up_words_folded_idx ON ftspg_s2up_words (folded)');
+		if ($s2UpSchema->hasTrigram()) {
+			$conn->executeStatement('CREATE INDEX ftspg_s2up_index_title_search_trgm_idx ON ftspg_s2up_index USING GIN (title_search gin_trgm_ops)');
+			$conn->executeStatement('CREATE INDEX ftspg_s2up_words_folded_trgm_idx ON ftspg_s2up_words USING GIN (folded gin_trgm_ops)');
+		}
+		$conn->executeStatement(
+			'INSERT INTO ftspg_s2up_index (provider_id, document_id, owner_id, access, config, title, content) VALUES '
+			. "('files', 'S2U_EN', 'alice', '{u:alice}', 'english'::regconfig, 'Annual budget', 'The studies were published in the archive.'), "
+			. "('files', 'S2U_TR', 'alice', '{u:alice}', 'turkish'::regconfig, 'Yıllık rapor', 'Bu yılki kitapları kütüphaneye verdik.')"
+		);
+		$s2UpSchema->ensureSchema();
+		$s2UpMarker = $conn->executeQuery(
+			"SELECT col_description(to_regclass('ftspg_s2up_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s2up_index') AND attname = 'tsv' AND NOT attisdropped"
+		)->fetchOne();
+		same('ftspg schema 3', $s2UpMarker, 'S2 upgrade from v2: marker updated to ftspg schema 3');
+		$s2UpColTypes = [];
+		foreach ($conn->executeQuery("SELECT attname, format_type(atttypid, atttypmod) AS typ FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s2up_index') AND attnum > 0 AND NOT attisdropped")->fetchAll() as $row) {
+			$s2UpColTypes[(string)$row['attname']] = (string)$row['typ'];
+		}
+		foreach (['config', 'provider_id', 'document_id', 'owner_id', 'source', 'hash'] as $col) {
+			same('text', $s2UpColTypes[$col] ?? null, "S2 upgrade from v2: $col migrated to text");
+		}
+		same(true, (bool)$conn->executeQuery("SELECT to_regprocedure('ftspg_s2up_regconfig(text)') IS NOT NULL")->fetchOne(), 'S2 upgrade from v2: ftspg_s2up_regconfig(text) created');
+		same(2, $s2UpSchema->countDocuments(), 'S2 upgrade from v2: row count preserved');
+		same('english', (string)$conn->executeQuery("SELECT config::text FROM ftspg_s2up_index WHERE document_id = 'S2U_EN'")->fetchOne(), 'S2 upgrade from v2: english config preserved');
+		same('turkish', (string)$conn->executeQuery("SELECT config::text FROM ftspg_s2up_index WHERE document_id = 'S2U_TR'")->fetchOne(), 'S2 upgrade from v2: turkish config preserved');
+		try {
+			same(['S2U_EN'], search($s2UpPlatform, 'alice', 'study')['ids'], 'S2 upgrade from v2: English search works after upgrade');
+			same(['S2U_TR'], search($s2UpPlatform, 'alice', 'kitaplarımız')['ids'], 'S2 upgrade from v2: Turkish search works after upgrade');
+		} catch (Throwable $e) {
+			check(false, 'S2 upgrade from v2 search failed: ' . $e->getMessage());
+		}
+
+		// 5. Uninstall (DropIndexTable / dropSchema) drops ftspg_<prefix>regconfig(text) cleanly
+		$s2DropSchema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 's2drop_']), $logger);
+		$s2DropSchema->ensureSchema();
+		if (!(bool)$conn->executeQuery("SELECT to_regprocedure('ftspg_s2drop_regconfig(text)') IS NOT NULL")->fetchOne()) {
+			// On S1 baseline, create the function so DropIndexTable/dropSchema removal is independently verified.
+			$conn->executeStatement('CREATE OR REPLACE FUNCTION ftspg_s2drop_regconfig(text) RETURNS pg_catalog.regconfig LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$SELECT $1::pg_catalog.regconfig$$');
+		}
+		$dropOutput = double(\OCP\Migration\IOutput::class, [
+			'info' => function (string $message) {
+			},
+			'warning' => function (string $message) {
+			},
+		]);
+		(new DropIndexTable($s2DropSchema))->run($dropOutput);
+		$s2DropSchema->dropSchema();
+		same(false, (bool)$conn->executeQuery("SELECT to_regclass('ftspg_s2drop_index') IS NOT NULL")->fetchOne(), 'S2 uninstall: index table dropped');
+		same(false, (bool)$conn->executeQuery("SELECT to_regclass('ftspg_s2drop_words') IS NOT NULL")->fetchOne(), 'S2 uninstall: words table dropped');
+		same(0, (int)$conn->executeQuery("SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = current_schema() AND p.proname = 'ftspg_s2drop_regconfig'")->fetchOne(), 'S2 uninstall: ftspg_s2drop_regconfig(text) dropped');
+
+		// 6. varchar caps lifted (>254 document_id, >64 provider_id/owner_id/source, >128 hash with content === '', plus >254 document_id with content)
+		$longProvider = str_repeat('p', 80);
+		$longDocId = str_repeat('d', 300);
+		$longOwner = str_repeat('o', 80);
+		$longSource = str_repeat('s', 80);
+		$longHash = str_repeat('h', 160);
+		$longDoc = doc($longDocId, $longOwner, 'LongVarcharTitle', '', ['parts' => ['comments' => 'longvarcharneedle']], $longProvider);
+		$longDoc->setSource($longSource);
+		$longDoc->setHash($longHash);
+		$longDocContent = doc($longDocId . '_c', $longOwner, 'LongVarcharContentTitle', 'longvarcharcontentneedle indexed body text', [], $longProvider);
+		try {
+			$res1 = $platform->indexDocument($longDoc);
+			$res2 = $platform->indexDocument($longDocContent);
+			same(true, $res1->isStatus(IIndex::INDEX_DONE), 'S2 varchar caps: indexed doc with >254 doc_id, >64 provider/owner/source, >128 hash');
+			same(true, $res2->isStatus(IIndex::INDEX_DONE), 'S2 varchar caps: indexed doc with >254 doc_id and non-empty content');
+			same([$longDocId], search($platform, $longOwner, 'longvarcharneedle', ['provider' => $longProvider])['ids'], 'S2 varchar caps: search finds >254 document_id by parts');
+			same([$longDocId . '_c'], search($platform, $longOwner, 'longvarcharcontentneedle', ['provider' => $longProvider])['ids'], 'S2 varchar caps: search finds >254 document_id by content');
+			$fetchedLong = $platform->getDocument($longProvider, $longDocId);
+			same($longProvider, $fetchedLong->getProviderId(), 'S2 varchar caps: >64 provider_id round-trips');
+			same($longDocId, $fetchedLong->getId(), 'S2 varchar caps: >254 document_id round-trips');
+			same($longOwner, $fetchedLong->getAccess()->getOwnerId(), 'S2 varchar caps: >64 owner_id round-trips');
+			same($longSource, $fetchedLong->getSource(), 'S2 varchar caps: >64 source round-trips');
+			same($longHash, $fetchedLong->getHash(), 'S2 varchar caps: >128 hash round-trips');
+		} catch (Throwable $e) {
+			check(false, 'S2 varchar caps lifted failed: ' . $e->getMessage());
+		}
+
+		// 7. Multi-language (turkish,english) + fallback 'french' row exercising languageConditions(), headlineSql(), countDocumentsByLanguage(), VocabularyService::rebuild()
+		$config->setConfig(['language' => 'turkish,english', 'typo_correction' => true]);
+		try {
+			$platform->indexDocument(doc('S2ML_TR', 'alice', 'ISPARTA GÜLLERİ', 'İSTANBUL ofisinde ISPARTA çalışma ve projeler arttı.', [], 's2ml'));
+			$platform->indexDocument(doc('S2ML_EN', 'alice', 'Annual study', 'The studies were published in the archive.', [], 's2ml'));
+			$conn->executeStatement(
+				"INSERT INTO ftspg_oc_index (provider_id, document_id, owner_id, access, config, title, content) VALUES ('s2ml', 'S2ML_FR', 'alice', '{u:alice}', 'french', 'Rapport', 'kitapları okuyalım')"
+			);
+			$langCounts = $schema->countDocumentsByLanguage();
+			check(($langCounts['turkish'] ?? 0) >= 1 && ($langCounts['english'] ?? 0) >= 1 && ($langCounts['french'] ?? 0) >= 1, 'S2 multi-lang: countDocumentsByLanguage reports turkish, english, and french');
+
+			$trRes = search($platform, 'alice', 'ısparta', ['provider' => 's2ml']);
+			same(['S2ML_TR'], $trRes['ids'], 'S2 multi-lang: Turkish search finds S2ML_TR');
+			$trExcerpt = isset($trRes['docs'][0]) ? implode(' ', array_column($trRes['docs'][0]->getExcerpts() ?? [], 'excerpt')) : '';
+			check(str_contains($trExcerpt, 'ISPARTA'), 'S2 multi-lang: Turkish headlineSql preserves uppercase I/İ casing in excerpt');
+
+			$enRes = search($platform, 'alice', 'study', ['provider' => 's2ml']);
+			same(['S2ML_EN'], $enRes['ids'], 'S2 multi-lang: English search finds S2ML_EN');
+			$enExcerpt = isset($enRes['docs'][0]) ? implode(' ', array_column($enRes['docs'][0]->getExcerpts() ?? [], 'excerpt')) : '';
+			check($enExcerpt !== '' && str_contains($enExcerpt, 'studies'), 'S2 multi-lang: English headlineSql produces excerpt');
+
+			same(['S2ML_FR'], search($platform, 'alice', 'kitaplarımız', ['provider' => 's2ml'])['ids'], 'S2 multi-lang: fallback french row matched by primary turkish branch (<> ALL text[])');
+
+			$vocabTotal = $vocabulary->rebuild();
+			check($vocabTotal > 0, 'S2 multi-lang: VocabularyService::rebuild() succeeds');
+			same(['S2ML_TR'], search($platform, 'alice', 'calisma', ['provider' => 's2ml'])['ids'], 'S2 multi-lang: Turkish accent variant calisma finds çalışma');
+		} catch (Throwable $e) {
+			check(false, 'S2 multi-lang check failed: ' . $e->getMessage());
+		} finally {
+			$config->setConfig(['language' => 'turkish']);
+		}
+	} finally {
+		$s2Cleanup();
 	}
 } catch (Throwable $e) {
 	$failures++;

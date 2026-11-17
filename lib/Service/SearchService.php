@@ -653,8 +653,8 @@ class SearchService {
 		$conditions = [];
 		foreach ($languages as $i => $language) {
 			$conditions[] = $i === 0
-				? ($others === [] ? ['TRUE', []] : ['d.config <> ALL (CAST(? AS regconfig[]))', ['{' . implode(',', $others) . '}']])
-				: ['d.config = CAST(? AS regconfig)', [$language]];
+				? ($others === [] ? ['TRUE', []] : ['d.config <> ALL (CAST(? AS text[]))', [PgArray::toLiteral($others)]])
+				: ['d.config = ?', [$language]];
 		}
 		return $conditions;
 	}
@@ -1123,15 +1123,15 @@ class SearchService {
 	private function headlineSql(): string {
 		$delimiter = self::FRAGMENT_DELIMITER;
 		return <<<SQL
-			SELECT CASE WHEN m.config = 'turkish'::regconfig THEN array_to_string(ARRAY(
+			SELECT CASE WHEN m.config = 'turkish' THEN array_to_string(ARRAY(
 			           SELECT CASE WHEN strpos(n.text, f.fragment) > 0
 			                       THEN substr(e.source, strpos(n.text, f.fragment), length(f.fragment))
 			                       ELSE f.fragment END
 			           FROM (SELECT translate(e.source, 'Iİ', 'ıi') AS text) n,
-			                unnest(string_to_array(ts_headline(m.config, n.text, m.rank_query, ?), '$delimiter')) WITH ORDINALITY AS f(fragment, i)
+			                unnest(string_to_array(ts_headline(m.config::pg_catalog.regconfig, n.text, m.rank_query, ?), '$delimiter')) WITH ORDINALITY AS f(fragment, i)
 			           ORDER BY f.i
 			       ), '$delimiter')
-			       ELSE ts_headline(m.config, e.source, m.rank_query, ?) END AS excerpt
+			       ELSE ts_headline(m.config::pg_catalog.regconfig, e.source, m.rank_query, ?) END AS excerpt
 			SQL;
 	}
 
