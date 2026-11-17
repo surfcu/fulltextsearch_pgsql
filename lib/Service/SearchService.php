@@ -148,37 +148,38 @@ class SearchService {
 		if ($ownTransaction) {
 			$this->db->beginTransaction();
 		}
-		$timeout = $ownTransaction ? $this->configService->getSearchTimeout() : 0;
-		$hasTrigram = $this->schemaService->hasTrigram();
-		$selectCols = [
-			"current_setting('enable_seqscan')",
-			"current_setting('random_page_cost')",
-			"current_setting('jit')",
-			"current_setting('pg_trgm.similarity_threshold', true)",
-			"set_config('enable_seqscan', 'off', true)",
-			"set_config('random_page_cost', least(current_setting('random_page_cost')::float8, CAST(? AS float8))::text, true)",
-			"set_config('jit', 'off', true)",
-		];
-		$params = [
-			(string)self::SEARCH_RANDOM_PAGE_COST,
-		];
-		if ($hasTrigram) {
-			$selectCols[] = "set_config('pg_trgm.similarity_threshold', CAST(? AS text), true)";
-			$params[] = (string)VocabularyService::TRIGRAM_THRESHOLD;
-		}
-		if ($timeout > 0) {
-			$selectCols[] = "set_config('statement_timeout', CAST(? AS text), true)";
-			$params[] = ($timeout * 1000) . 'ms';
-		}
-		$result = $this->db->executeQuery(
-			'SELECT ' . implode(', ', $selectCols),
-			$params
-		);
-		$previous = $result->fetch(\PDO::FETCH_NUM);
-		$result->closeCursor();
-
 		$failed = true;
+		$previous = false;
+		$hasTrigram = false;
 		try {
+			$timeout = $ownTransaction ? $this->configService->getSearchTimeout() : 0;
+			$hasTrigram = $this->schemaService->hasTrigram();
+
+			// Snapshot previous settings before changing them, inside the try so failures roll back.
+			$prevResult = $this->db->executeQuery(
+				"SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit'), current_setting('pg_trgm.similarity_threshold', true)"
+			);
+			$previous = $prevResult->fetch(\PDO::FETCH_NUM);
+			$prevResult->closeCursor();
+
+			$setCols = [
+				"set_config('enable_seqscan', 'off', true)",
+				"set_config('random_page_cost', least(current_setting('random_page_cost')::float8, CAST(? AS float8))::text, true)",
+				"set_config('jit', 'off', true)",
+			];
+			$params = [
+				(string)self::SEARCH_RANDOM_PAGE_COST,
+			];
+			if ($hasTrigram) {
+				$setCols[] = "set_config('pg_trgm.similarity_threshold', CAST(? AS text), true)";
+				$params[] = (string)VocabularyService::TRIGRAM_THRESHOLD;
+			}
+			if ($timeout > 0) {
+				$setCols[] = "set_config('statement_timeout', CAST(? AS text), true)";
+				$params[] = ($timeout * 1000) . 'ms';
+			}
+			$this->db->executeQuery('SELECT ' . implode(', ', $setCols), $params)->closeCursor();
+
 			$search();
 			$failed = false;
 		} finally {
@@ -192,7 +193,7 @@ class SearchService {
 						"set_config('jit', ?, true)",
 					];
 					$restoreParams = [(string)$previous[0], (string)$previous[1], (string)$previous[2]];
-					if ($hasTrigram && $previous[3] !== null) {
+					if ($hasTrigram && ($previous[3] ?? null) !== null) {
 						$restoreCols[] = "set_config('pg_trgm.similarity_threshold', ?, true)";
 						$restoreParams[] = (string)$previous[3];
 					}
@@ -291,10 +292,23 @@ class SearchService {
 			}
 		}
 
+		if ($rows !== []) {
+			$total = (int)$rows[0]['total'];
+		} elseif ($page > 1) {
+			$total = $this->fullTextCount($queries, $filterSql, $filterParams, $filtersFirst);
+		} else {
+			$total = 0;
+		}
+
 		$titlesSearched = $weights === null || str_contains($weights, 'A');
-		if ($rows === [] && $page === 1 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '' && $query->plainWordsOnly) {
+		if ($total === 0 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '' && $query->plainWordsOnly) {
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
-			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size);
+			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size, ($page - 1) * $size);
+			if ($rows !== []) {
+				$total = (int)$rows[0]['total'];
+			} elseif ($page > 1) {
+				$total = $this->titleSimilarityCount($query->plainText, $filterSql, $filterParams);
+			}
 		}
 
 		$maxScore = 0;
@@ -304,7 +318,7 @@ class SearchService {
 			$result->addDocument($this->toResultDocument($providerId, $row, (string)$score, $access->getViewerId()));
 		}
 
-		$result->setTotal($rows === [] ? 0 : (int)$rows[0]['total']);
+		$result->setTotal($total);
 		$result->setMaxScore($maxScore);
 		$result->setTime((int)round((microtime(true) - $start) * 1000.0));
 		$result->setTimedOut(false);
@@ -997,13 +1011,13 @@ class SearchService {
 				SELECT m.document_id, m.title, m.source, m.hash, m.modified_time, m.rank, m.total,
 					   h.excerpt
 				FROM (
-					SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config, d.body, d.all_match,
+					SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config, d.content, d.parts_text, d.all_match,
 						   $rankQuery AS rank_query,
 						   $rankSql AS rank,
 						   count(*) OVER () AS total
 					FROM (
 						SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config, d.tsv,
-							   CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END AS body,
+							   d.content, d.parts_text,
 							   $allSql AS all_match
 						FROM $t d
 						WHERE $matchSql AND $filterSql
@@ -1031,7 +1045,7 @@ class SearchService {
 					   h.excerpt
 				FROM (
 					SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time, d.config,
-						   CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END AS body,
+						   d.content, d.parts_text,
 						   $rankQuery AS rank_query,
 						   $allSql AS all_match,
 						   $rankSql AS rank,
@@ -1077,12 +1091,11 @@ class SearchService {
 		$lowered = 'lower(' . $this->schemaService->normalized('b.text') . ')';
 		// querytree() prints the lexemes quoted, with quotes inside doubled: 'o''brien':*
 		$lexemes = "SELECT replace((regexp_matches(querytree(m.rank_query)::text, '''((?:[^'']|'''')+)''', 'g'))[1], '''''', '''')";
-		// A long body is detoasted once, into b.text: every function given the column itself
-		// would decompress it again, about 3 ms per 500 KB. octet_length() reads the stored size
-		// without decompressing; a body short in bytes is short in characters too. OFFSET 0 keeps
-		// PostgreSQL from inlining the subqueries, which would repeat the work at every use.
+		// Content and parts_text stay separate until the page-level lateral so inner queries never
+		// detoast non-page rows. A long body is detoasted once into b.text via OFFSET 0.
+		$joined = "CASE WHEN m.content = '' THEN m.parts_text WHEN m.parts_text = '' THEN m.content ELSE m.content || ' ' || m.parts_text END";
 		return <<<SQL
-			SELECT CASE WHEN b.text IS NULL THEN m.body
+			SELECT CASE WHEN b.text IS NULL THEN ($joined)
 			            ELSE substr(b.text, greatest(1, coalesce((
 			                SELECT min(p.pos) FROM (
 			                    SELECT CASE WHEN starts_with(l.lb, w.word) THEN 1
@@ -1092,7 +1105,7 @@ class SearchService {
 			                    WHERE w.word <> ''
 			                ) p WHERE p.pos > 0
 			            ), 1) - $lead), $window) END AS source
-			FROM (SELECT CASE WHEN octet_length(m.body) > $window THEN m.body || '' END AS text OFFSET 0) b
+			FROM (SELECT CASE WHEN octet_length(m.content) + octet_length(m.parts_text) > $window THEN ($joined) || '' END AS text OFFSET 0) b
 			SQL;
 	}
 
@@ -1299,28 +1312,63 @@ class SearchService {
 	}
 
 	/**
+	 * @param non-empty-array<string, ParsedQuery> $queries
+	 * @param list<string> $filterParams
+	 */
+	private function fullTextCount(array $queries, string $filterSql, array $filterParams, bool $filtersFirst): int {
+		$t = $this->schemaService->getTableName();
+		[$matchSql, $matchParams] = $this->matchCondition($queries);
+		if ($filtersFirst) {
+			$matchSql = "($matchSql) IS TRUE";
+		}
+		$result = $this->db->executeQuery(
+			"SELECT count(*) FROM $t d WHERE $matchSql AND $filterSql",
+			[...$matchParams, ...$filterParams]
+		);
+		$count = (int)$result->fetchOne();
+		$result->closeCursor();
+		return $count;
+	}
+
+	/**
 	 * @param list<string> $filterParams
 	 * @return list<array<string, mixed>>
 	 */
-	private function titleSimilaritySearch(string $text, string $filterSql, array $filterParams, int $limit): array {
+	private function titleSimilaritySearch(string $text, string $filterSql, array $filterParams, int $limit, int $offset = 0): array {
 		$t = $this->schemaService->getTableName();
+		$joined = "CASE WHEN d.content = '' THEN d.parts_text WHEN d.parts_text = '' THEN d.content ELSE d.content || ' ' || d.parts_text END";
 		$sql = <<<SQL
 			SELECT d.document_id, d.title, d.source, d.hash, d.modified_time,
 				   word_similarity(?, d.title_search) AS rank,
 				   count(*) OVER () AS total,
-				   left(CASE WHEN d.content <> '' THEN d.content ELSE d.parts_text END, 300) AS excerpt
+				   left($joined, 300) AS excerpt
 			FROM $t d
 			WHERE ? <% d.title_search AND $filterSql
 			ORDER BY rank DESC, d.modified_time DESC, d.id
-			LIMIT ?
+			LIMIT ? OFFSET ?
 			SQL;
 
 		$text = mb_strtolower($text, 'UTF-8');
-		$params = array_merge([$text, $text], $filterParams, [(string)$limit]);
+		$params = array_merge([$text, $text], $filterParams, [(string)$limit, (string)$offset]);
 		$result = $this->db->executeQuery($sql, $params);
 		$rows = $result->fetchAll();
 		$result->closeCursor();
 		return $rows;
+	}
+
+	/**
+	 * @param list<string> $filterParams
+	 */
+	private function titleSimilarityCount(string $text, string $filterSql, array $filterParams): int {
+		$t = $this->schemaService->getTableName();
+		$text = mb_strtolower($text, 'UTF-8');
+		$result = $this->db->executeQuery(
+			"SELECT count(*) FROM $t d WHERE ? <% d.title_search AND $filterSql",
+			array_merge([$text], $filterParams)
+		);
+		$count = (int)$result->fetchOne();
+		$result->closeCursor();
+		return $count;
 	}
 
 	private function fuzzyAvailable(): bool {

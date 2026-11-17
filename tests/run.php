@@ -252,6 +252,22 @@ try {
 	same([], search($platform, 'alice', "+foo\0bar")['ids'], 'NUL byte inside required unmatched word does not throw 42601');
 	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "budget -foo\0bar")['ids']), 'NUL byte inside excluded word does not throw 42601');
 	same(['Q1'], search($platform, 'alice', "\"bud\0get review\"")['ids'], 'NUL byte inside phrase is stripped');
+	same([], search($platform, 'alice', "foo\x01bar")['ids'], 'A4: C0 control char inside unmatched search word does not throw');
+	same([], search($platform, 'alice', "foo\x7fbar")['ids'], 'A4: DEL control char inside unmatched search word does not throw');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "bud\x07get")['ids']), 'A4: BEL control char inside search word is stripped');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "\"bud\x07get\"")['ids']), 'A4: BEL control char inside single-word phrase is stripped');
+	same(['Q1'], search($platform, 'alice', "\"bud\x07get review\"")['ids'], 'A4: BEL control char inside multi-word phrase is stripped');
+	$qbCtrl = new TsQueryBuilder();
+	same(['foobar'], $qbCtrl->searchWords("foo\0bar", 'english'), 'A4: tokenize strips NUL inside word');
+	same(['foobar'], $qbCtrl->searchWords("foo\x01bar", 'english'), 'A4: tokenize strips C0 control char inside word');
+	same(['foobar'], $qbCtrl->searchWords("foo\x7fbar", 'english'), 'A4: tokenize strips DEL control char inside word');
+	same(['budget'], $qbCtrl->searchWords("bud\x07get", 'english'), 'A4: tokenize strips BEL inside word');
+	same(['foo', 'bar'], $qbCtrl->searchWords("foo\tbar", 'english'), 'A4: tab still separates tokens');
+	same(['foo', 'bar'], $qbCtrl->searchWords("foo\nbar", 'english'), 'A4: newline still separates tokens');
+	same(['foo', 'bar'], $qbCtrl->searchWords("foo\rbar", 'english'), 'A4: carriage return still separates tokens');
+	same(['Q1', 'Q3'], search($platform, 'alice', "budget\treview")['ids'], 'A4: tab-separated search matches both words');
+	same(['Q1', 'Q3'], search($platform, 'alice', "budget\nreview")['ids'], 'A4: newline-separated search matches both words');
+	same(['Q1', 'Q3'], search($platform, 'alice', "budget\rreview")['ids'], 'A4: CR-separated search matches both words');
 	same(['Q1', 'Q3'], search($platform, 'alice', '(budget), review!')['ids'], 'edge punctuation ignored; doc with both words first');
 	same(['Q1'], search($platform, 'alice', '+budget +review')['ids'], '+ makes words required');
 	same(['Q1'], search($platform, 'alice', '+budg +revi')['ids'], 'required words still match as prefixes');
@@ -705,6 +721,24 @@ try {
 	$excerpt = (string)(search($platform, 'alice', 'ışık', ['provider' => 'exc'])['docs'][0]?->getExcerpts()[0]['excerpt'] ?? '');
 	check(str_contains($excerpt, 'İSTANBUL ofisinde IŞIK sorunu'), 'Turkish uppercase words are shown as written in excerpts: ' . $excerpt);
 	$config->setConfig(['language' => 'english']);
+	$platform->indexDocument(doc('X_PART_SHORT', 'alice', 'Short note', 'Daily meeting summary without the keyword.', ['parts' => ['comments' => 'Please review the platypus attachment before Friday.']], 'exc'));
+	$rPartShort = search($platform, 'alice', 'platypus', ['provider' => 'exc']);
+	same(['X_PART_SHORT'], $rPartShort['ids'], 'A4: comment match on doc with short content is found');
+	$partShortExcerpt = implode(' … ', array_column($rPartShort['docs'][0]?->getExcerpts() ?? [], 'excerpt'));
+	check(str_contains($partShortExcerpt, 'platypus attachment'), 'A4: excerpt shows matching comment when short content is present: ' . $partShortExcerpt);
+
+	$platform->indexDocument(doc('X_PART_LONG', 'alice', 'Long report', $filler . 'Closing remarks without the keyword.', ['parts' => ['comments' => 'Confirmed capybara figures in appendix three.']], 'exc'));
+	$rPartLong = search($platform, 'alice', 'capybara', ['provider' => 'exc']);
+	same(['X_PART_LONG'], $rPartLong['ids'], 'A4: comment match on doc with >10 KB content is found');
+	$partLongExcerpt = implode(' … ', array_column($rPartLong['docs'][0]?->getExcerpts() ?? [], 'excerpt'));
+	check(str_contains($partLongExcerpt, 'capybara figures'), 'A4: excerpt shows matching comment after >10 KB content: ' . $partLongExcerpt);
+
+	$platform->indexDocument(doc('X_PART_BOUNDARY', 'alice', 'Boundary report', $filler . 'tailword', ['parts' => ['comments' => 'quokka confirmed in final review.']], 'exc'));
+	$rPartBoundary = search($platform, 'alice', 'quokka', ['provider' => 'exc']);
+	same(['X_PART_BOUNDARY'], $rPartBoundary['ids'], 'A4: boundary comment match on doc with >10 KB content without trailing space is found');
+	$partBoundaryExcerpt = implode(' … ', array_column($rPartBoundary['docs'][0]?->getExcerpts() ?? [], 'excerpt'));
+	check(str_contains($partBoundaryExcerpt, 'quokka confirmed'), 'A4: excerpt shows first word of parts_text after >10 KB content without trailing space: ' . $partBoundaryExcerpt);
+
 	$platform->resetIndex('exc');
 
 	section('content extraction');
@@ -2135,6 +2169,137 @@ try {
 
 	// Restore normal timeout
 	$config->setConfig(['search_timeout' => 10]);
+
+	section('search robustness: planner tx safety, past-end paging, multi-page title fallback (A4)');
+	$config->setConfig(['language' => 'english', 'typo_correction' => true, 'search_timeout' => 10]);
+
+	// 1. withSearchPlanning() failure during settings read or set rolls back own transaction
+	$plannerFailState = new class {
+		public string $mode = '';
+	};
+	$plannerFailProxy = new class($conn, $plannerFailState) implements \OCP\IDBConnection {
+		public function __construct(
+			private \OCP\IDBConnection $inner,
+			private object $state,
+		) {
+		}
+		public function executeStatement($sql, array $params = [], array $types = []): int {
+			return $this->inner->executeStatement($sql, $params, $types);
+		}
+		public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+			if ($this->state->mode === 'read' && str_contains($sql, "current_setting('enable_seqscan')")) {
+				throw new \RuntimeException('injected planner settings read failure');
+			}
+			if ($this->state->mode === 'set' && str_contains($sql, "set_config('enable_seqscan', 'off', true)")) {
+				throw new \RuntimeException('injected planner settings set failure');
+			}
+			if ($this->state->mode === 'set_timeout' && str_contains($sql, "set_config('enable_seqscan', 'off', true)")) {
+				$e = new \PDOException('SQLSTATE[57014]: Query canceled: canceling statement due to statement timeout', 57014);
+				$e->errorInfo = ['57014', 7, 'canceling statement due to statement timeout'];
+				throw $e;
+			}
+			return $this->inner->executeQuery($sql, $params, $types);
+		}
+		public function inTransaction(): bool {
+			return $this->inner->inTransaction();
+		}
+		public function beginTransaction(): void {
+			$this->inner->beginTransaction();
+		}
+		public function commit(): void {
+			$this->inner->commit();
+		}
+		public function rollBack(): void {
+			$this->inner->rollBack();
+		}
+		public function getDatabaseProvider(): string {
+			return $this->inner->getDatabaseProvider();
+		}
+	};
+	$plannerFailSearch = new SearchService($plannerFailProxy, $schema, $config, new TsQueryBuilder(), $vocabulary);
+	$plannerFailPlatform = new PostgreSQLPlatform($config, $schema, $indexService, $plannerFailSearch, $logger, $extractor);
+
+	foreach (['read', 'set'] as $failMode) {
+		$plannerFailState->mode = $failMode;
+		$threw = false;
+		$txAfterFail = true;
+		try {
+			search($plannerFailPlatform, 'alice', 'budget');
+		} catch (\RuntimeException) {
+			$threw = true;
+		} finally {
+			$plannerFailState->mode = '';
+			$txAfterFail = $conn->inTransaction();
+			if ($conn->inTransaction()) {
+				$conn->rollBack();
+			}
+		}
+		check($threw, "A4: withSearchPlanning() '$failMode' failure propagates exception");
+		same(false, $txAfterFail, "A4: withSearchPlanning() '$failMode' failure rolls back own transaction");
+	}
+
+	$plannerFailState->mode = 'set_timeout';
+	$txAfterTimeoutSet = true;
+	try {
+		$setTimeoutRes = search($plannerFailPlatform, 'alice', 'budget');
+	} finally {
+		$plannerFailState->mode = '';
+		$txAfterTimeoutSet = $conn->inTransaction();
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+	}
+	same(true, $setTimeoutRes['timedOut'], 'A4: SQLSTATE 57014 on set_config reports timedOut');
+	same(0, $setTimeoutRes['total'], 'A4: SQLSTATE 57014 on set_config reports total 0');
+	same(false, $txAfterTimeoutSet, 'A4: SQLSTATE 57014 on set_config rolls back own transaction');
+	same(1, (int)$conn->executeQuery('SELECT 1')->fetchOne(), 'A4: connection remains usable after withSearchPlanning() rollback');
+
+	$conn->beginTransaction();
+	$plannerFailState->mode = 'read';
+	$callerReadThrew = false;
+	$txAfterCallerFail = false;
+	try {
+		search($plannerFailPlatform, 'alice', 'budget');
+	} catch (\RuntimeException) {
+		$callerReadThrew = true;
+	} finally {
+		$plannerFailState->mode = '';
+		$txAfterCallerFail = $conn->inTransaction();
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+	}
+	check($callerReadThrew, 'A4: withSearchPlanning() read failure inside caller tx propagates exception');
+	same(true, $txAfterCallerFail, 'A4: withSearchPlanning() read failure inside caller tx leaves caller tx open');
+
+	// 2. Past-end page of exact search preserves total
+	$platform->indexDocument(doc('A4_EXACT1', 'alice', 'Albatross report', 'albatross migration', [], 'a4'));
+	$a4PastEnd = search($platform, 'alice', 'albatross', ['provider' => 'a4', 'size' => 2, 'page' => 5]);
+	same([], $a4PastEnd['ids'], 'A4: past-end page of 1-result exact search returns empty ids');
+	same(1, $a4PastEnd['total'], 'A4: past-end page of 1-result exact search preserves total 1');
+	$a4PastEndZero = search($platform, 'alice', 'nonexistentxyz', ['provider' => 'a4', 'size' => 2, 'page' => 5]);
+	same([], $a4PastEndZero['ids'], 'A4: past-end page of 0-result search returns empty ids');
+	same(0, $a4PastEndZero['total'], 'A4: past-end page of 0-result search reports total 0');
+
+	// 3. Multi-page title fallback (including past-end and A2/limit guards)
+	$platform->indexDocument(doc('A4_TF1', 'alice', 'qxzflamengoalpha', 'unrelated alpha body', ['mtime' => 1000], 'a4'));
+	$platform->indexDocument(doc('A4_TF2', 'alice', 'qxzflamengobeta', 'unrelated beta body', ['mtime' => 2000], 'a4'));
+	$tfP1 = search($platform, 'alice', 'qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 1]);
+	$tfP2 = search($platform, 'alice', 'qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 2]);
+	$tfP5 = search($platform, 'alice', 'qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 5]);
+	same(1, count($tfP1['ids']), 'A4: title fallback page 1 returns 1 result');
+	same(2, $tfP1['total'], 'A4: title fallback page 1 reports total 2');
+	same(1, count($tfP2['ids']), 'A4: title fallback page 2 returns 1 result');
+	same(2, $tfP2['total'], 'A4: title fallback page 2 reports total 2');
+	same(['A4_TF1', 'A4_TF2'], sorted([$tfP1['ids'][0] ?? '', $tfP2['ids'][0] ?? '']), 'A4: title fallback page 1 and page 2 cover both results without overlap');
+	same([], $tfP5['ids'], 'A4: title fallback past-end page returns empty ids');
+	same(2, $tfP5['total'], 'A4: title fallback past-end page preserves total 2');
+	same(0, search($platform, 'alice', 'qxzflamenga -alpha', ['provider' => 'a4', 'size' => 1, 'page' => 2])['total'], 'A4: title fallback on page 2 respects A2 exclusion plainWordsOnly');
+	same(0, search($platform, 'alice', '+qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 2])['total'], 'A4: title fallback on page 2 respects A2 required plainWordsOnly');
+	same(0, search($platform, 'alice', '"qxzflamenga"', ['provider' => 'a4', 'size' => 1, 'page' => 2])['total'], 'A4: title fallback on page 2 respects A2 phrase plainWordsOnly');
+	same(0, search($platform, 'alice', 'qxzflamenga', ['provider' => 'a4', 'size' => 1, 'page' => 2, 'limit' => ['content']])['total'], 'A4: title fallback on page 2 respects limit=content ($titlesSearched)');
+	$platform->resetIndex('a4');
+	$config->setConfig(['language' => 'turkish']);
 
 	section('extraction and vocabulary limits (B5)');
 	$b5ToolDir = sys_get_temp_dir() . '/ftspg_b5_tool_' . mt_rand();
