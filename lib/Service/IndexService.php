@@ -284,7 +284,7 @@ class IndexService {
 
 		if ($this->configService->useTypoCorrection()) {
 			try {
-				$this->vocabulary->addDocument($document->getProviderId(), $document->getId());
+				$this->vocabulary->addDocument($document->getProviderId(), $document->getId(), $updateContent, $updateParts);
 			} catch (Throwable $e) {
 				// Typo correction is a nicety; never fail indexing over it.
 				$this->logger->warning('Could not update the typo correction vocabulary', ['exception' => $e]);

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OCA\FullTextSearch_PgSql\Migration;
 
+use OCA\FullTextSearch_PgSql\Service\ConfigService;
 use OCA\FullTextSearch_PgSql\Service\SchemaService;
 use OCA\FullTextSearch_PgSql\Service\VocabularyService;
 use OCP\Migration\IOutput;
@@ -21,6 +22,7 @@ class CreateIndexTable implements IRepairStep {
 	public function __construct(
 		private SchemaService $schemaService,
 		private VocabularyService $vocabulary,
+		private ConfigService $configService,
 	) {
 	}
 
@@ -45,6 +47,9 @@ class CreateIndexTable implements IRepairStep {
 	 * upgrade for small instances; larger ones get a hint to run it at a convenient time.
 	 */
 	private function fillVocabulary(IOutput $output): void {
+		if (!$this->configService->useTypoCorrection()) {
+			return;
+		}
 		if ($this->vocabulary->count() > 0) {
 			return;
 		}
