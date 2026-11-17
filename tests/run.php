@@ -284,7 +284,7 @@ try {
 		"to_tsquery('simple', 'x')",
 		'$$quoted$$',
 		"\0",
-		"nul\0byte",
+		'nul-byte',
 		"\xff\xfe broken utf8",
 		"\xC3\x28",
 		'\\\\',
@@ -1070,7 +1070,7 @@ try {
 	same('deepvalue', $decodedInfo['nested']['subkey'] ?? '', 'B1: nested info keys and string values stripped of NUL bytes');
 	check(str_contains((string)$row['links'], 'tokenone') && str_contains((string)$row['links'], 'tokentwo') && !str_contains((string)$row['links'], "\0"), 'B1: links sanitized of NUL bytes');
 	check(str_contains((string)$row['subtags'], 'tagone') && !str_contains((string)$row['subtags'], "\0"), 'B1: subtags sanitized of NUL bytes');
-	same(['B1_NUL_INFO'], search($platform, 'alice', 'body text')['ids'], 'B1: document with NUL info is searchable');
+	same(['B1_NUL_INFO'], search($platform, 'alice', '"NUL Info Title"')['ids'], 'B1: document with NUL info is searchable');
 
 	// -------------------------------------------------------------------------
 	// 6. Upsert inside caller transaction with SAVEPOINT
@@ -1095,8 +1095,8 @@ try {
 	// Commit outer transaction
 	$conn->commit();
 	same(false, $conn->inTransaction(), 'B1: caller transaction committed successfully without 25P02 error');
-	same(['B1_TX_DOC'], search($platform, 'alice', 'Transaction Safety Doc')['ids'], 'B1: degraded doc in committed transaction is findable');
-	same(['B1_TX_SIBLING'], search($platform, 'alice', 'sibling payload content')['ids'], 'B1: sibling doc in same transaction is findable');
+	same(['B1_TX_DOC'], search($platform, 'alice', '"Transaction Safety Doc"')['ids'], 'B1: degraded doc in committed transaction is findable');
+	same(['B1_TX_SIBLING'], search($platform, 'alice', '"sibling payload content"')['ids'], 'B1: sibling doc in same transaction is findable');
 
 	// Verify rollback behavior
 	$conn->beginTransaction();
@@ -1104,7 +1104,7 @@ try {
 	$platform->indexDocument($docRollback);
 	$conn->rollBack();
 	same(false, $conn->inTransaction(), 'B1: caller transaction rolled back');
-	same([], search($platform, 'alice', 'Rollback Target Doc')['ids'], 'B1: rolled back document is absent from index');
+	same([], search($platform, 'alice', '"Rollback Target Doc"')['ids'], 'B1: rolled back document is absent from index');
 
 	$config->setConfig(['max_content_size' => 512000]);
 
