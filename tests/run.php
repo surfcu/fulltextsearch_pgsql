@@ -123,6 +123,7 @@ function doc(string $id, string $owner, string $title, string $content, array $s
 function search(PostgreSQLPlatform $platform, string $viewer, string $q, array $opts = []): array {
 	$docs = [];
 	$total = -1;
+	$timedOut = false;
 	$request = double(ISearchRequest::class, [
 		'getSearch' => $q,
 		'getSize' => $opts['size'] ?? 20,
@@ -144,13 +145,20 @@ function search(PostgreSQLPlatform $platform, string $viewer, string $q, array $
 		'setTotal' => function (int $t) use (&$total) {
 			$total = $t;
 		},
+		'setTimedOut' => function (bool $t) use (&$timedOut) {
+			$timedOut = $t;
+		},
+		'setTime' => function (int $t) {
+		},
+		'setMaxScore' => function (float $s) {
+		},
 	]);
 	$access = new DocumentAccess();
 	$access->setViewerId($viewer);
 	$access->setGroups($opts['groups'] ?? []);
 	$access->setCircles($opts['circles'] ?? []);
 	$platform->searchRequest($result, $access);
-	return ['ids' => array_map(fn ($d) => $d->getId(), $docs), 'total' => $total, 'docs' => $docs];
+	return ['ids' => array_map(fn ($d) => $d->getId(), $docs), 'total' => $total, 'docs' => $docs, 'timedOut' => $timedOut];
 }
 
 function sorted(array $a): array {
@@ -473,6 +481,17 @@ try {
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '.*\.p(df']]]])['ids'], 'an invalid regex matches nothing instead of failing the search');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '.*\.pdf++']]]])['ids'], 'constructs PostgreSQL reads differently match nothing');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '\bplan.*']]]])['ids'], '\\b (a word boundary in PCRE, a backspace in PostgreSQL) matches nothing');
+	$startT = microtime(true);
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '(a)\1.*']]]])['ids'], 'backreference regex filter returns nothing');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '(?<g>a)\k<g>.*']]]])['ids'], 'named backreference \\k regex filter returns nothing');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '(a)\g1.*']]]])['ids'], 'backreference \\g regex filter returns nothing');
+	check(microtime(true) - $startT < 1.0, 'backreference regex filter returns in under a second');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => 'a{300}.*']]]])['ids'], 'repetition quantifier exceeding 255 returns nothing without SQL error');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => 'a{1,300}.*']]]])['ids'], 'repetition range quantifier exceeding 255 returns nothing without SQL error');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => "plan\0pdf.*"]]]])['ids'], 'pattern with NUL byte is safely skipped');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => "plan\xff\xfepdf.*"]]]])['ids'], 'pattern with invalid UTF-8 is safely skipped');
+	same([], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => "plan\0*"]]]])['ids'], 'wildcard with NUL byte is safely skipped');
+	same([], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => "plan\xff\xfe*"]]]])['ids'], 'wildcard with invalid UTF-8 is safely skipped');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['owner' => '.*']]]])['ids'], 'a field without a column matches nothing');
 	same(['E3'], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => '*.odt']]]])['ids'], 'wildcard filter');
 	same(['E1', 'E2', 'E3'], sorted(search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => 'plan 202?.*']]]])['ids']), '? matches one character, case ignored');
@@ -1666,6 +1685,64 @@ try {
 	)->fetchAll(), 'QUERY PLAN'));
 	check(str_contains($plan, 'ftspg_oc_index_title_search_trgm_idx'), 'title substring search uses the trigram index');
 	$conn->executeStatement('SET enable_seqscan = on');
+
+	section('search statement timeout and cancellation (A1)');
+	same(10, $config->getSearchTimeout(), 'ConfigService::getSearchTimeout() default is 10');
+	$config->setConfig(['search_timeout' => 5]);
+	same(5, $config->getSearchTimeout(), 'ConfigService::getSearchTimeout() returns configured value');
+	same(5, $config->getConfig()['search_timeout'], 'getConfig() includes search_timeout');
+	try {
+		$config->setConfig(['search_timeout' => -1]);
+		check(false, 'negative search_timeout rejected');
+	} catch (\InvalidArgumentException) {
+		check(true, 'negative search_timeout rejected');
+	}
+	try {
+		$config->setConfig(['search_timeout' => 301]);
+		check(false, 'search_timeout > 300 rejected');
+	} catch (\InvalidArgumentException) {
+		check(true, 'search_timeout > 300 rejected');
+	}
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'search_timeout', -10);
+	same(0, $config->getSearchTimeout(), 'getSearchTimeout() clamps negative value to 0');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'search_timeout', 999);
+	same(300, $config->getSearchTimeout(), 'getSearchTimeout() clamps excessive value to 300');
+
+	// Fast search within timeout completes and timedOut is false
+	$config->setConfig(['search_timeout' => 10]);
+	$fastResult = search($platform, 'alice', 'budget');
+	same(false, $fastResult['timedOut'], 'fast search within timeout completes and timedOut is false');
+
+	// Search inside active caller transaction does not override caller statement_timeout
+	$conn->beginTransaction();
+	$conn->executeStatement("SET LOCAL statement_timeout = '42s'");
+	$callerSearch = search($platform, 'alice', 'budget');
+	same('42s', (string)$conn->executeQuery('SHOW statement_timeout')->fetchOne(), 'search inside active caller transaction does not override caller statement_timeout');
+	$conn->rollBack();
+
+	// Exclusive table lock with search_timeout = 1 causes query cancellation (SQLSTATE 57014)
+	$conn2 = new PDO($dsn);
+	$conn2->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+	$config->setConfig(['search_timeout' => 1]);
+	$conn2->beginTransaction();
+	$conn2->exec('LOCK TABLE ftspg_oc_index IN ACCESS EXCLUSIVE MODE');
+	$timedSearch = search($platform, 'alice', 'budget');
+	$conn2->rollBack();
+	same(true, $timedSearch['timedOut'], 'exclusive table lock with search_timeout = 1 causes query cancellation (timedOut is true)');
+	same(0, $timedSearch['total'], 'timed out search has total 0');
+	same([], $timedSearch['ids'], 'timed out search returns empty ids');
+
+	// Statement timeout during spelling correction returns timed-out result without transaction-aborted RESET errors
+	$config->setConfig(['search_timeout' => 1, 'typo_correction' => true]);
+	$conn2->beginTransaction();
+	$conn2->exec('LOCK TABLE ftspg_oc_words IN ACCESS EXCLUSIVE MODE');
+	$timedCorrection = search($platform, 'alice', 'budgett');
+	$conn2->rollBack();
+	same(true, $timedCorrection['timedOut'], 'statement timeout during spelling correction returns timed out result');
+	same(0, $timedCorrection['total'], 'spelling correction timeout has total 0');
+
+	// Restore normal timeout
+	$config->setConfig(['search_timeout' => 10]);
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";

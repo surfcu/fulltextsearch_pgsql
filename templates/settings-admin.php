@@ -71,6 +71,11 @@ $config = $_['config'];
 			<input type="number" id="ftspg-max-results" name="max_results" min="1" max="10000" required
 				value="<?php p((string)$config['max_results']); ?>">
 		</p>
+		<p class="ftspg-field">
+			<label for="ftspg-search-timeout"><?php p($l->t('Search timeout (seconds, 0 disables)')); ?></label>
+			<input type="number" id="ftspg-search-timeout" name="search_timeout" min="0" max="300" required
+				value="<?php p((string)$config['search_timeout']); ?>">
+		</p>
 
 		<h3><?php p($l->t('Content extraction')); ?></h3>
 		<p class="ftspg-field">

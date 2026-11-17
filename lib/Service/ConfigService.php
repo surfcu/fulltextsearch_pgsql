@@ -22,6 +22,7 @@ class ConfigService {
 	public const TYPO_CORRECTION = 'typo_correction';
 	public const MAX_RESULTS = 'max_results';
 	public const MAX_CONTENT_SIZE = 'max_content_size';
+	public const SEARCH_TIMEOUT = 'search_timeout';
 	public const PDFTOTEXT_PATH = 'pdftotext_path';
 	public const PDF_EXTRACTOR = 'pdf_extractor';
 
@@ -41,6 +42,7 @@ class ConfigService {
 		self::MAX_RESULTS => 100,
 		// Bytes of extracted text kept per document. PostgreSQL refuses tsvectors over 1 MB.
 		self::MAX_CONTENT_SIZE => 512000,
+		self::SEARCH_TIMEOUT => 10,
 		// Empty means "look for pdftotext on PATH".
 		self::PDFTOTEXT_PATH => '',
 		self::PDF_EXTRACTOR => 'auto',
@@ -64,6 +66,7 @@ class ConfigService {
 			self::TYPO_CORRECTION => $this->useTypoCorrection(),
 			self::MAX_RESULTS => $this->getMaxResults(),
 			self::MAX_CONTENT_SIZE => $this->getMaxContentSize(),
+			self::SEARCH_TIMEOUT => $this->getSearchTimeout(),
 			self::PDFTOTEXT_PATH => $this->getPdfToTextPath(),
 			self::PDF_EXTRACTOR => $this->getPdfExtractor(),
 		];
@@ -128,7 +131,7 @@ class ConfigService {
 			$writes[] = fn () => $this->appConfig->setValueBool(Application::APP_ID, $key, $value);
 		}
 
-		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, 1000000]] as $key => [$min, $max]) {
+		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, 1000000], self::SEARCH_TIMEOUT => [0, 300]] as $key => [$min, $max]) {
 			if (!array_key_exists($key, $config)) {
 				continue;
 			}
@@ -252,6 +255,11 @@ class ConfigService {
 
 	public function getMaxContentSize(): int {
 		return max(0, $this->appConfig->getValueInt(Application::APP_ID, self::MAX_CONTENT_SIZE, self::DEFAULTS[self::MAX_CONTENT_SIZE]));
+	}
+
+	public function getSearchTimeout(): int {
+		$value = $this->appConfig->getValueInt(Application::APP_ID, self::SEARCH_TIMEOUT, self::DEFAULTS[self::SEARCH_TIMEOUT]);
+		return max(0, min(300, $value));
 	}
 
 	public function getPdfToTextPath(): string {

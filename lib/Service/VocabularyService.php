@@ -32,7 +32,7 @@ class VocabularyService {
 	private const MAX_VARIANTS = 3;
 	private const MAX_CORRECTIONS = 2;
 	/** Loose on purpose: transpositions score low. The edit distance is the real filter. */
-	private const TRIGRAM_THRESHOLD = 0.2;
+	public const TRIGRAM_THRESHOLD = 0.2;
 	private const SHORTLIST = 20;
 
 	public function __construct(
@@ -165,19 +165,14 @@ class VocabularyService {
 		$length = mb_strlen($folded);
 		$maxDistance = $length >= 7 ? 2 : 1;
 
-		$this->db->executeStatement('SET pg_trgm.similarity_threshold = ' . self::TRIGRAM_THRESHOLD);
-		try {
-			$result = $this->db->executeQuery(
-				"SELECT word, folded, similarity(folded, ?) AS score FROM $w
-				 WHERE folded % ? AND length(folded) BETWEEN ? AND ?
-				 ORDER BY score DESC, word LIMIT " . self::SHORTLIST,
-				[$folded, $folded, (string)($length - $maxDistance), (string)($length + $maxDistance)]
-			);
-			$rows = $result->fetchAll();
-			$result->closeCursor();
-		} finally {
-			$this->db->executeStatement('RESET pg_trgm.similarity_threshold');
-		}
+		$result = $this->db->executeQuery(
+			"SELECT word, folded, similarity(folded, ?) AS score FROM $w
+			 WHERE folded % ? AND length(folded) BETWEEN ? AND ?
+			 ORDER BY score DESC, word LIMIT " . self::SHORTLIST,
+			[$folded, $folded, (string)($length - $maxDistance), (string)($length + $maxDistance)]
+		);
+		$rows = $result->fetchAll();
+		$result->closeCursor();
 
 		$scored = [];
 		foreach ($rows as $row) {

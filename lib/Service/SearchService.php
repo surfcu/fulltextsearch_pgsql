@@ -53,7 +53,46 @@ class SearchService {
 	}
 
 	public function searchRequest(ISearchResult $result, IDocumentAccess $access): void {
-		$this->withSearchPlanning(fn () => $this->search($result, $access));
+		try {
+			$this->withSearchPlanning(fn () => $this->search($result, $access));
+		} catch (\Throwable $e) {
+			if (self::isTimeoutException($e)) {
+				$result->setTimedOut(true);
+				$result->setTotal(0);
+				return;
+			}
+			throw $e;
+		}
+	}
+
+	/**
+	 * Detect whether an exception represents PostgreSQL SQLSTATE 57014
+	 * (ERRCODE_QUERY_CANCELED, statement_timeout).
+	 */
+	public static function isTimeoutException(\Throwable $e): bool {
+		for ($curr = $e; $curr !== null; $curr = $curr->getPrevious()) {
+			if (method_exists($curr, 'getSQLState')) {
+				/** @var mixed $sqlState */
+				$sqlState = call_user_func([$curr, 'getSQLState']);
+				if ($sqlState === '57014') {
+					return true;
+				}
+			}
+			if ((string)$curr->getCode() === '57014') {
+				return true;
+			}
+			if ($curr instanceof \PDOException && isset($curr->errorInfo[0]) && (string)$curr->errorInfo[0] === '57014') {
+				return true;
+			}
+			$msg = $curr->getMessage();
+			if (stripos($msg, 'canceling statement due to statement timeout') !== false) {
+				return true;
+			}
+			if (preg_match('/(?:SQLSTATE\[57014\]|\bSQLSTATE\s+57014\b|query_canceled)/i', $msg) === 1) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -83,12 +122,27 @@ class SearchService {
 		if ($ownTransaction) {
 			$this->db->beginTransaction();
 		}
+		$timeout = $ownTransaction ? $this->configService->getSearchTimeout() : 0;
+		$selectCols = [
+			"current_setting('enable_seqscan')",
+			"current_setting('random_page_cost')",
+			"current_setting('jit')",
+			"set_config('enable_seqscan', 'off', true)",
+			"set_config('random_page_cost', least(current_setting('random_page_cost')::float8, CAST(? AS float8))::text, true)",
+			"set_config('jit', 'off', true)",
+			"set_config('pg_trgm.similarity_threshold', CAST(? AS text), true)",
+		];
+		$params = [
+			(string)self::SEARCH_RANDOM_PAGE_COST,
+			(string)VocabularyService::TRIGRAM_THRESHOLD,
+		];
+		if ($timeout > 0) {
+			$selectCols[] = "set_config('statement_timeout', CAST(? AS text), true)";
+			$params[] = ($timeout * 1000) . 'ms';
+		}
 		$result = $this->db->executeQuery(
-			"SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit'),
-			        set_config('enable_seqscan', 'off', true),
-			        set_config('random_page_cost', least(current_setting('random_page_cost')::float8, CAST(? AS float8))::text, true),
-			        set_config('jit', 'off', true)",
-			[(string)self::SEARCH_RANDOM_PAGE_COST]
+			'SELECT ' . implode(', ', $selectCols),
+			$params
 		);
 		$previous = $result->fetch(\PDO::FETCH_NUM);
 		$result->closeCursor();
@@ -383,6 +437,9 @@ class SearchService {
 			if ($column === null || !is_string($pattern) || $pattern === '' || strlen($pattern) > self::MAX_FILTER_PATTERN) {
 				continue;
 			}
+			if (str_contains($pattern, "\0") || !mb_check_encoding($pattern, 'UTF-8')) {
+				continue;
+			}
 			if ($regex) {
 				if (!self::isPortableRegex($pattern)) {
 					continue;
@@ -402,11 +459,27 @@ class SearchService {
 		/*
 		 * Rejected: \K, \Q…\E, \R, \h, \v, \X, \A, \z, \Z, \G, and \b, \B (a backspace in PostgreSQL,
 		 * not a word boundary) – missing or different there;
+		 * backreferences \1–\9, \k, \g;
 		 * groups starting with "(?" other than (?:, (?= and (?! (named and atomic groups, branch
 		 * reset, inline flags); possessive quantifiers such as a++.
 		 */
-		if (preg_match('/\\\\[KXRhHvVQEGAzZbB]|\\(\\?[^:=!]|[*+?}]\\+/', $pattern)) {
+		if (preg_match('/(?<!\\\\)(?:\\\\\\\\)*\\\\[1-9kgKGKXRhHvVQEGAzZbB]|\\(\\?[^:=!]|[*+?}]\\+/', $pattern)) {
 			return false;
+		}
+		if (preg_match_all('/(?<!\\\\)(?:\\\\\\\\)*\\{(\\d+)?(?:,(\\d*))?\\}/', $pattern, $matches, PREG_SET_ORDER)) {
+			foreach ($matches as $match) {
+				$n1 = isset($match[1]) && $match[1] !== '' ? $match[1] : null;
+				$n2 = isset($match[2]) && $match[2] !== '' ? $match[2] : null;
+				if ($n1 === null && $n2 === null) {
+					continue;
+				}
+				if ($n1 !== null && (strlen($n1) > 3 || (int)$n1 > 255)) {
+					return false;
+				}
+				if ($n2 !== null && (strlen($n2) > 3 || (int)$n2 > 255)) {
+					return false;
+				}
+			}
 		}
 		return @preg_match('/' . str_replace('/', '\\/', $pattern) . '/u', '') !== false;
 	}

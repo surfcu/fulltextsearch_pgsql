@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Search timeout setting (`search_timeout`, default 10 seconds, 0 to 300) in administration settings and CLI, cancelling long-running search statements transaction-locally and flagging the result as timed out.
 - Synthetic benchmark harness (`tests/bench/run.php`) measuring search throughput and planning costs against a 100,000-document corpus.
 - Query fuzzing suite in `tests/run.php` verifying robust query compilation across >= 2,500 random operator and Unicode permutations without SQL errors.
 - PostgreSQL 18 added to CI integration and live Nextcloud test matrices.
@@ -22,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Committed `composer.lock` for reproducible App Store builds.
 
 ### Fixed
+- Regular expression filter hardening: reject backreferences, quantifiers exceeding PostgreSQL repetition bounds, NUL bytes, and invalid UTF-8 byte sequences without search errors.
+- Atomic transaction-local trigram similarity threshold in search planning without post-execution resets interfering with aborted transactions.
 - Preserve angle brackets in plain text and prevent word fusion across HTML block tags. Re-indexing of text files is needed to benefit.
 - Safe upsert retry and size caps: restrict degradation strictly to tsvector limits (SQLSTATE 54000) with savepoint isolation in transactions, gracefully degrade oversized documents in five bounded steps, enforce pre-flight size limits on parts and tags, and sanitize NUL bytes from metadata.
 - Restrict pdftotext_path configuration to CLI/occ with strict binary name, executable, and version validation, removing editable path from admin web settings and rejecting web updates with HTTP 400.
