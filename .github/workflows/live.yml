@@ -39,24 +39,24 @@ jobs:
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - name: Checkout Nextcloud server
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: nextcloud/server
           ref: ${{ matrix.server }}
           submodules: true
           path: server
       - name: Checkout this app
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: server/apps/fulltextsearch_pgsql
       - name: Checkout Full Text Search
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: nextcloud/fulltextsearch
           ref: ${{ matrix.fulltextsearch }}
           path: server/apps/fulltextsearch
       - name: Checkout Full Text Search - Files
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: nextcloud/files_fulltextsearch
           ref: ${{ matrix.files }}
