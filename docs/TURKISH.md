@@ -149,13 +149,7 @@ Türkçe ve İngilizce belgeler karışıksa, kök bulma yapmayan `simple` yapı
 
 ## PostgreSQL sürüm yükseltme
 
-1.6.0 sürümüne kadar dizin tablosu PostgreSQL'in `regconfig` sütun tipini kullandığından `pg_upgrade` büyük sürüm geçişini reddeder. `pg_upgrade` çalıştırmadan önce iki tabloyu silip (tablo önekiniz `oc_` değilse uyarlayın) yükseltme sonrasında dizini yeniden oluşturun:
-
-```sql
-DROP TABLE IF EXISTS ftspg_oc_index, ftspg_oc_words;
-```
-
-Yükseltme sonrasında `occ fulltextsearch:test && occ fulltextsearch:index` çalıştırın; ya da tabloları koruyan `pg_dump` / `pg_restore` yöntemini kullanın.
+1.6.0 sürümünden (Şema Sürümü 3) itibaren dizin tablosu `config` sütununu `regconfig` yerine `text` olarak saklar; bu nedenle `pg_upgrade` büyük PostgreSQL sürüm geçişlerinde tabloları silmeden ve dizini yeniden oluşturmadan doğrudan çalışır.
 
 ## Sorun giderme
 

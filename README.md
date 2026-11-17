@@ -120,7 +120,11 @@ occ fulltextsearch:reset && occ fulltextsearch:index
 
 ## Upgrading
 
-Nextcloud runs the app's repair step on upgrade; the index table and its documents are kept. Some improvements only apply to documents indexed after them:
+Nextcloud runs the app's repair step on upgrade; the index table and its documents are kept.
+
+Upgrading to **1.6.0** (Schema Version 3) performs a one-time table rewrite to convert `config` and the identifier columns to `text` and rebuild the generated columns; **no re-indexing is needed**. Before rebuilding, `occ upgrade` or `occ maintenance:repair` prints the indexed document count and a notice that the index table is locked while it runs, so upgrade large instances during a quiet period. Until that repair step runs, loading the search platform fails with an error directing you to run `occ upgrade` or `occ maintenance:repair`.
+
+Some improvements only apply to documents indexed after them:
 
 - **Plain text angle brackets and HTML block spacing** — re-index plain text files so `<email>`, `<url>` and code generics are preserved.
 - **Office text extraction** (words split across formatting runs, spreadsheet numbers, comments, text boxes, OpenDocument notes and `styles.xml` headers/footers) and **Office 97–2003 files** — re-index office documents.
@@ -136,13 +140,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## Upgrading PostgreSQL
 
-Until version 1.6.0, the index table uses PostgreSQL's `regconfig` column type, which `pg_upgrade` refuses to carry across major PostgreSQL versions. Before running `pg_upgrade`, drop the app's two tables (adjust `oc_` if your Nextcloud `dbtableprefix` differs) and rebuild the index afterwards:
-
-```sql
-DROP TABLE IF EXISTS ftspg_oc_index, ftspg_oc_words;
-```
-
-After `pg_upgrade`, run `occ fulltextsearch:test && occ fulltextsearch:index` to recreate the tables and rebuild the index. Alternatively, upgrade PostgreSQL with `pg_dump` / `pg_restore`, which preserves the tables without re-indexing.
+As of version 1.6.0 (Schema Version 3), the index table stores `config` as `text` instead of `regconfig`, so `pg_upgrade` works directly across major PostgreSQL versions without dropping tables or re-indexing.
 
 ## Turkish
 
