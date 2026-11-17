@@ -168,7 +168,7 @@ $tableName = $schema->getTableName();
 $wordsTableName = $schema->getWordsTableName();
 
 // Check existing document count
-$stmt = $pdo->query("SELECT count(*) FROM $tableName");
+$stmt = $pdo->query("SELECT count(*) FROM $tableName WHERE provider_id = 'files' AND owner_id = 'bench_user'");
 $currentDocs = (int)$stmt->fetchColumn();
 
 if ($forceGenerate || $currentDocs < $targetDocs) {
@@ -231,6 +231,8 @@ if ($forceGenerate || $currentDocs < $targetDocs) {
 		}
 	}
 
+	ensureExtraDocs($pdo, $tableName, $wordsTableName, $targetDocs, $seed, false);
+
 	echo "Rebuilding GIN indexes and vocabulary...\n";
 	$pdo->exec("CREATE INDEX {$tableName}_tsv_idx ON $tableName USING GIN (tsv)");
 	$pdo->exec("CREATE INDEX {$tableName}_access_idx ON $tableName USING GIN (access)");
@@ -252,15 +254,98 @@ if ($forceGenerate || $currentDocs < $targetDocs) {
 	echo sprintf("Dataset generated in %.2f seconds.\n\n", $tGenSec);
 } else {
 	echo "Reusing existing dataset with $currentDocs documents.\n\n";
+	ensureExtraDocs($pdo, $tableName, $wordsTableName, $targetDocs, $seed, true);
+}
+
+function ensureExtraDocs(
+	PDO $pdo,
+	string $tableName,
+	string $wordsTableName,
+	int $targetDocs,
+	int $seed,
+	bool $analyzeIfChanged,
+): void {
+	$inserted = false;
+
+	$privCount = (int)$pdo->query("SELECT count(*) FROM $tableName WHERE provider_id = 'files' AND owner_id = 'other_user'")->fetchColumn();
+	if ($privCount === 0) {
+		$privDocs = min(5000, max(100, intdiv($targetDocs, 20)));
+		echo "Seeding $privDocs private documents for A3 worst-case scenario...\n";
+		$privContent = trim(str_repeat('privatetoken ', 10));
+		$batchSize = 1000;
+		$batches = (int)ceil($privDocs / $batchSize);
+		$docNum = 1;
+		for ($b = 0; $b < $batches; $b++) {
+			$pdo->beginTransaction();
+			$currentBatchSize = min($batchSize, $privDocs - ($b * $batchSize));
+			$placeholders = [];
+			$params = [];
+			for ($i = 0; $i < $currentBatchSize; $i++) {
+				$content = ($docNum === 1 ? 'privatetokem ' : '') . $privContent;
+				$placeholders[] = "(?, ?, ?, ?::text[], 'english'::regconfig, ?, ?)";
+				array_push($params, 'files', "bench_priv_$docNum", 'other_user', '{u:other_user}', "Private $docNum", $content);
+				$docNum++;
+			}
+			$sql = "INSERT INTO $tableName (provider_id, document_id, owner_id, access, config, title, content) VALUES " . implode(', ', $placeholders);
+			$pdo->prepare($sql)->execute($params);
+			$pdo->commit();
+		}
+		$pdo->exec("INSERT INTO $wordsTableName (word) VALUES ('privatetoken'), ('privatetokem') ON CONFLICT (word) DO NOTHING");
+		$inserted = true;
+	}
+
+	$a4Count = (int)$pdo->query("SELECT count(*) FROM $tableName WHERE provider_id = 'bench_a4'")->fetchColumn();
+	if ($a4Count === 0) {
+		echo "Seeding 20x ~1.1 MB documents for A4 excerpt scenario...\n";
+		$a4Prng = new XorShift32($seed + 1);
+		$fillerPool = [];
+		for ($k = 0; $k < 256; $k++) {
+			$fillerPool[] = 'ex' . chr(97 + intdiv($k, 26)) . chr(97 + ($k % 26)) . 'aa';
+		}
+		$a4Docs = 20;
+		$batchSize = 5;
+		$docNum = 1;
+		for ($b = 0; $b < (int)ceil($a4Docs / $batchSize); $b++) {
+			$pdo->beginTransaction();
+			$currentBatchSize = min($batchSize, $a4Docs - ($b * $batchSize));
+			$placeholders = [];
+			$params = [];
+			for ($i = 0; $i < $currentBatchSize; $i++) {
+				$words = [];
+				for ($w = 0; $w < 160000; $w++) {
+					$words[] = ($w === 120000) ? 'excerptneedle' : $fillerPool[$a4Prng->nextInt() & 255];
+				}
+				$placeholders[] = "(?, ?, ?, ?::text[], 'english'::regconfig, ?, ?)";
+				array_push($params, 'bench_a4', "bench_a4_$docNum", 'bench_user', '{u:__all,u:bench_user}', "Excerpt Benchmark Document $docNum", implode(' ', $words));
+				$docNum++;
+			}
+			$sql = "INSERT INTO $tableName (provider_id, document_id, owner_id, access, config, title, content) VALUES " . implode(', ', $placeholders);
+			$pdo->prepare($sql)->execute($params);
+			$pdo->commit();
+		}
+		$pdo->exec("INSERT INTO $wordsTableName (word) VALUES ('excerptneedle') ON CONFLICT (word) DO NOTHING");
+		$inserted = true;
+	}
+
+	if ($inserted && $analyzeIfChanged) {
+		$pdo->exec("ANALYZE $tableName");
+		$pdo->exec("ANALYZE $wordsTableName");
+	}
 }
 
 // Helper search function
-function runSearch(PostgreSQLPlatform $platform, string $query): array {
+function runSearch(
+	PostgreSQLPlatform $platform,
+	string $query,
+	string $providerId = 'files',
+	string $viewerId = 'bench_user',
+	int $size = 20,
+): array {
 	$docs = [];
 	$total = 0;
 	$request = double(ISearchRequest::class, [
 		'getSearch' => $query,
-		'getSize' => 20,
+		'getSize' => $size,
 		'getPage' => 1,
 		'getMetaTags' => [],
 		'getSubTags' => [],
@@ -269,7 +354,7 @@ function runSearch(PostgreSQLPlatform $platform, string $query): array {
 		'getWildcardFilters' => [],
 		'getLimitFields' => [],
 	]);
-	$provider = double(IFullTextSearchProvider::class, ['getId' => 'files']);
+	$provider = double(IFullTextSearchProvider::class, ['getId' => $providerId]);
 	$result = double(ISearchResult::class, [
 		'getRequest' => $request,
 		'getProvider' => $provider,
@@ -283,8 +368,8 @@ function runSearch(PostgreSQLPlatform $platform, string $query): array {
 		'setMaxScore' => fn (int $s) => null,
 		'setTimedOut' => fn (bool $to) => null,
 	]);
-	$access = new DocumentAccess('bench_user');
-	$access->setViewerId('bench_user');
+	$access = new DocumentAccess($viewerId);
+	$access->setViewerId($viewerId);
 	$platform->searchRequest($result, $access);
 	return ['count' => count($docs), 'total' => $total];
 }
@@ -316,6 +401,23 @@ $scenarios = [
 		'name' => 'two or three words, one in 90% of documents',
 		'query' => ZipfGenerator::wordForIndex(14) . ' ' . ZipfGenerator::wordForIndex(199), // rank 15 + rank 200
 	],
+	[
+		'id' => 'a5-stopword',
+		'name' => 'stopword multi-word (A5)',
+		'query' => 'the ' . ZipfGenerator::wordForIndex(199) . ' for ' . ZipfGenerator::wordForIndex(249),
+	],
+	[
+		'id' => 'a3-worst-case',
+		'name' => 'absent private word (A3 worst case)',
+		'query' => 'privatetoken',
+	],
+	[
+		'id' => 'a4-excerpt',
+		'name' => '20x large excerpts (A4)',
+		'query' => 'excerptneedle',
+		'provider' => 'bench_a4',
+		'size' => 20,
+	],
 ];
 
 $results = [];
@@ -325,10 +427,14 @@ foreach ($scenarios as $sc) {
 		continue;
 	}
 
+	$providerId = $sc['provider'] ?? 'files';
+	$viewerId = $sc['viewer'] ?? 'bench_user';
+	$size = $sc['size'] ?? 20;
+
 	// Warmup
 	$warmupRes = null;
 	for ($w = 0; $w < $warmup; $w++) {
-		$warmupRes = runSearch($platform, $sc['query']);
+		$warmupRes = runSearch($platform, $sc['query'], $providerId, $viewerId, $size);
 	}
 
 	// Timed runs
@@ -336,7 +442,7 @@ foreach ($scenarios as $sc) {
 	$lastTotal = $warmupRes['total'] ?? 0;
 	for ($r = 0; $r < $runs; $r++) {
 		$t0 = hrtime(true);
-		$res = runSearch($platform, $sc['query']);
+		$res = runSearch($platform, $sc['query'], $providerId, $viewerId, $size);
 		$t1 = hrtime(true);
 		$times[] = ($t1 - $t0) / 1e6;
 		$lastTotal = $res['total'];
@@ -396,9 +502,18 @@ if ($format === 'json') {
 				if ($pct > 10.0) {
 					$status = 'REGRESSION (>10%)';
 				}
-				if ($checkBudget === 'a3' && $r['id'] === 'rare') {
-					if ($delta > 2.0 || ($b['median_ms'] > 0 && ($r['median_ms'] / $b['median_ms']) > 2.0)) {
+				if ($checkBudget === 'a3') {
+					if (
+						$r['id'] === 'rare'
+						&& ($delta > 2.0 || ($b['median_ms'] > 0 && ($r['median_ms'] / $b['median_ms']) > 2.0))
+					) {
 						$status = 'BREACH (>+2ms or >2x)';
+					} elseif (
+						$r['id'] === 'a3-worst-case'
+						&& $b['median_ms'] > 0
+						&& ($r['median_ms'] / $b['median_ms']) > 2.0
+					) {
+						$status = 'BREACH (>2x)';
 					}
 				}
 				$sign = $delta >= 0 ? '+' : '';
