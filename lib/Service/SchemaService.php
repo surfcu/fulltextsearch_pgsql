@@ -27,6 +27,8 @@ class SchemaService {
 	private const SCHEMA_MARKER = 'ftspg schema 3';
 
 	private ?bool $trigram = null;
+	private ?string $trigramSchema = null;
+	private ?string $schema = null;
 	/** @var string[]|null */
 	private ?array $textSearchConfigs = null;
 	private ?bool $localeFolding = null;
@@ -64,12 +66,29 @@ class SchemaService {
 		return substr($this->getTableName(), 0, -strlen('index')) . 'regconfig';
 	}
 
+	public function getQualifiedTableName(): string {
+		return $this->quoteIdent($this->getSchemaName()) . '.' . $this->quoteIdent($this->getTableName());
+	}
+
+	public function getQualifiedWordsTableName(): string {
+		return $this->quoteIdent($this->getSchemaName()) . '.' . $this->quoteIdent($this->getWordsTableName());
+	}
+
+	public function getQualifiedRegconfigFunctionName(): string {
+		return $this->quoteIdent($this->getSchemaName()) . '.' . $this->quoteIdent($this->getRegconfigFunctionName());
+	}
+
+	public function getTrigramSchema(): ?string {
+		$this->hasTrigram();
+		return $this->trigramSchema;
+	}
+
 	/** True when the table exists and its generated columns match this version of the app. */
 	public function isCurrent(): bool {
-		$t = $this->getTableName();
+		$qt = $this->getQualifiedTableName();
 		$result = $this->db->executeQuery(
-			"SELECT col_description(to_regclass(?), attnum) FROM pg_attribute WHERE attrelid = to_regclass(?) AND attname = 'tsv' AND NOT attisdropped",
-			[$t, $t]
+			"SELECT col_description(pg_catalog.to_regclass(?), attnum) FROM pg_catalog.pg_attribute WHERE attrelid = pg_catalog.to_regclass(?) AND attname = 'tsv' AND NOT attisdropped",
+			[$qt, $qt]
 		);
 		$marker = $result->fetchOne();
 		$result->closeCursor();
@@ -77,7 +96,7 @@ class SchemaService {
 	}
 
 	public function tableExists(): bool {
-		$result = $this->db->executeQuery('SELECT to_regclass(?) IS NOT NULL', [$this->getTableName()]);
+		$result = $this->db->executeQuery('SELECT pg_catalog.to_regclass(?) IS NOT NULL', [$this->getQualifiedTableName()]);
 		$exists = (bool)$result->fetchOne();
 		$result->closeCursor();
 		return $exists;
@@ -93,10 +112,15 @@ class SchemaService {
 
 		// Keep extension setup outside the transaction so a permission error never aborts the rebuild.
 		$this->trigram = null;
+		$this->trigramSchema = null;
+		$this->schema = null;
 		$this->tryCreateTrigramExtension();
 
 		$t = $this->getTableName();
 		$w = $this->getWordsTableName();
+		$qs = $this->quoteIdent($this->getSchemaName());
+		$qt = $this->getQualifiedTableName();
+		$qfn = $this->getQualifiedRegconfigFunctionName();
 		$ownTransaction = !$this->db->inTransaction();
 		$savepoint = 'ftspg_ensure_schema';
 		if ($ownTransaction) {
@@ -113,15 +137,15 @@ class SchemaService {
 
 			if (!$this->isCurrent()) {
 				$this->dropLegacyTable();
-				$this->createIndexTable($t);
-				$this->ensureRegconfigFunction($this->getRegconfigFunctionName());
+				$this->createIndexTable($t, $qt);
+				$this->ensureRegconfigFunction($qfn);
 				$this->ensureGeneratedColumns();
-				$this->ensureIndexTableIndexes($t);
+				$this->ensureIndexTableIndexes($t, $qt);
 				$this->ensureWordsTable();
-				$this->db->executeStatement("ANALYZE $t");
-			} elseif (!$this->hasAllIndexesAndWords($t, $w)) {
-				$this->ensureRegconfigFunction($this->getRegconfigFunctionName());
-				$this->ensureIndexTableIndexes($t);
+				$this->db->executeStatement("ANALYZE $qt");
+			} elseif (!$this->hasAllIndexesAndWords($qs, $t, $w, $qfn)) {
+				$this->ensureRegconfigFunction($qfn);
+				$this->ensureIndexTableIndexes($t, $qt);
 				$this->ensureWordsTable();
 			}
 
@@ -149,15 +173,15 @@ class SchemaService {
 		}
 	}
 
-	private function ensureRegconfigFunction(string $fn): void {
+	private function ensureRegconfigFunction(string $qfn): void {
 		$this->db->executeStatement(
-			"CREATE OR REPLACE FUNCTION {$fn}(text) RETURNS pg_catalog.regconfig LANGUAGE sql IMMUTABLE PARALLEL SAFE AS \$\$SELECT \$1::pg_catalog.regconfig\$\$"
+			"CREATE OR REPLACE FUNCTION {$qfn}(text) RETURNS pg_catalog.regconfig LANGUAGE sql IMMUTABLE PARALLEL SAFE AS \$\$SELECT \$1::pg_catalog.regconfig\$\$"
 		);
 	}
 
-	private function createIndexTable(string $t): void {
+	private function createIndexTable(string $t, string $qt): void {
 		$this->db->executeStatement(<<<SQL
-			CREATE TABLE IF NOT EXISTS $t (
+			CREATE TABLE IF NOT EXISTS $qt (
 				id            bigserial    PRIMARY KEY,
 				provider_id   text         NOT NULL,
 				document_id   text         NOT NULL,
@@ -183,35 +207,36 @@ class SchemaService {
 			SQL);
 	}
 
-	private function ensureIndexTableIndexes(string $t): void {
-		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_tsv_idx ON $t USING GIN (tsv)");
-		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_access_idx ON $t USING GIN (access)");
-		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_metatags_idx ON $t USING GIN (metatags)");
-		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_subtags_idx ON $t USING GIN (subtags)");
+	private function ensureIndexTableIndexes(string $t, string $qt): void {
+		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_tsv_idx ON $qt USING GIN (tsv)");
+		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_access_idx ON $qt USING GIN (access)");
+		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_metatags_idx ON $qt USING GIN (metatags)");
+		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_subtags_idx ON $qt USING GIN (subtags)");
 
-		if ($this->hasTrigram()) {
+		$ts = $this->getTrigramSchema();
+		if ($ts !== null) {
 			// Titles only: a trigram index over full content would be very large for little gain.
 			// Serves substring matching (LIKE '%…%') and typo-tolerant matching (<%).
-			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_title_search_trgm_idx ON $t USING GIN (title_search gin_trgm_ops)");
+			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_title_search_trgm_idx ON $qt USING GIN (title_search {$ts}.gin_trgm_ops)");
 		}
 	}
 
-	private function hasAllIndexesAndWords(string $t, string $w): bool {
+	private function hasAllIndexesAndWords(string $qs, string $t, string $w, string $qfn): bool {
 		$relations = [
-			"{$t}_tsv_idx",
-			"{$t}_access_idx",
-			"{$t}_metatags_idx",
-			"{$t}_subtags_idx",
-			$w,
-			"{$w}_folded_idx",
+			"{$qs}.{$t}_tsv_idx",
+			"{$qs}.{$t}_access_idx",
+			"{$qs}.{$t}_metatags_idx",
+			"{$qs}.{$t}_subtags_idx",
+			"{$qs}.{$w}",
+			"{$qs}.{$w}_folded_idx",
 		];
 		if ($this->hasTrigram()) {
-			$relations[] = "{$t}_title_search_trgm_idx";
-			$relations[] = "{$w}_folded_trgm_idx";
+			$relations[] = "{$qs}.{$t}_title_search_trgm_idx";
+			$relations[] = "{$qs}.{$w}_folded_trgm_idx";
 		}
 		$result = $this->db->executeQuery(
-			'SELECT bool_and(to_regclass(name) IS NOT NULL) AND to_regprocedure(?) IS NOT NULL FROM unnest(CAST(? AS text[])) AS name',
-			[$this->getRegconfigFunctionName() . '(text)', PgArray::toLiteral($relations)]
+			'SELECT bool_and(pg_catalog.to_regclass(name) IS NOT NULL) AND pg_catalog.to_regprocedure(?) IS NOT NULL FROM unnest(CAST(? AS text[])) AS name',
+			[$qfn . '(text)', PgArray::toLiteral($relations)]
 		);
 		$allPresent = (bool)$result->fetchOne();
 		$result->closeCursor();
@@ -224,15 +249,17 @@ class SchemaService {
 	 */
 	private function ensureWordsTable(): void {
 		$w = $this->getWordsTableName();
+		$qw = $this->getQualifiedWordsTableName();
 		$this->db->executeStatement(sprintf(<<<'SQL'
 			CREATE TABLE IF NOT EXISTS %1$s (
 				word   text COLLATE "C" PRIMARY KEY,
 				folded text COLLATE "C" GENERATED ALWAYS AS (translate(word, '%2$s', '%3$s')) STORED
 			)
-			SQL, $w, Fold::FROM, Fold::TO));
-		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$w}_folded_idx ON $w (folded)");
-		if ($this->hasTrigram()) {
-			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$w}_folded_trgm_idx ON $w USING GIN (folded gin_trgm_ops)");
+			SQL, $qw, Fold::FROM, Fold::TO));
+		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$w}_folded_idx ON $qw (folded)");
+		$ts = $this->getTrigramSchema();
+		if ($ts !== null) {
+			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$w}_folded_trgm_idx ON $qw USING GIN (folded {$ts}.gin_trgm_ops)");
 		}
 	}
 
@@ -245,21 +272,23 @@ class SchemaService {
 		if ($this->isCurrent()) {
 			return;
 		}
+		$qs = $this->quoteIdent($this->getSchemaName());
 		$t = $this->getTableName();
-		$fn = $this->getRegconfigFunctionName();
-		$this->ensureRegconfigFunction($fn);
+		$qt = $this->getQualifiedTableName();
+		$qfn = $this->getQualifiedRegconfigFunctionName();
+		$this->ensureRegconfigFunction($qfn);
 
-		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_tsv_idx");
-		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_title_trgm_idx");
-		$this->db->executeStatement("DROP INDEX IF EXISTS {$t}_title_search_trgm_idx");
-		$this->db->executeStatement("ALTER TABLE $t DROP COLUMN IF EXISTS tsv, DROP COLUMN IF EXISTS title_search");
+		$this->db->executeStatement("DROP INDEX IF EXISTS {$qs}.{$t}_tsv_idx");
+		$this->db->executeStatement("DROP INDEX IF EXISTS {$qs}.{$t}_title_trgm_idx");
+		$this->db->executeStatement("DROP INDEX IF EXISTS {$qs}.{$t}_title_search_trgm_idx");
+		$this->db->executeStatement("ALTER TABLE $qt DROP COLUMN IF EXISTS tsv, DROP COLUMN IF EXISTS title_search");
 
 		$columns = ['provider_id', 'document_id', 'owner_id', 'source', 'hash', 'config'];
 		$typeResult = $this->db->executeQuery(
 			'SELECT attname, format_type(atttypid, atttypmod) AS type'
-			. ' FROM pg_attribute'
-			. ' WHERE attrelid = to_regclass(?) AND attnum > 0 AND NOT attisdropped AND attname = ANY (CAST(? AS text[]))',
-			[$t, PgArray::toLiteral($columns)]
+			. ' FROM pg_catalog.pg_attribute'
+			. ' WHERE attrelid = pg_catalog.to_regclass(?) AND attnum > 0 AND NOT attisdropped AND attname = ANY (CAST(? AS text[]))',
+			[$qt, PgArray::toLiteral($columns)]
 		);
 		$currentTypes = [];
 		foreach ($typeResult->fetchAll() as $row) {
@@ -279,17 +308,17 @@ class SchemaService {
 		$title = $this->normalized('title');
 		$alterClauses[] = <<<SQL
 			ADD COLUMN tsv tsvector GENERATED ALWAYS AS (
-				setweight(to_tsvector({$fn}(config), $title), 'A')
-				|| setweight(to_tsvector({$fn}(config), {$this->splitWords($title)}), 'A')
-				|| setweight(to_tsvector({$fn}(config), {$this->normalized('tags_text')}), 'B')
-				|| setweight(to_tsvector({$fn}(config), {$this->normalized('parts_text')}), 'C')
-				|| setweight(to_tsvector({$fn}(config), {$this->normalized('content')}), 'D')
+				setweight(to_tsvector({$qfn}(config), $title), 'A')
+				|| setweight(to_tsvector({$qfn}(config), {$this->splitWords($title)}), 'A')
+				|| setweight(to_tsvector({$qfn}(config), {$this->normalized('tags_text')}), 'B')
+				|| setweight(to_tsvector({$qfn}(config), {$this->normalized('parts_text')}), 'C')
+				|| setweight(to_tsvector({$qfn}(config), {$this->normalized('content')}), 'D')
 			) STORED
 			SQL;
 		$alterClauses[] = "ADD COLUMN title_search text GENERATED ALWAYS AS (lower($title)) STORED";
 
-		$this->db->executeStatement("ALTER TABLE $t\n" . implode(",\n", $alterClauses));
-		$this->db->executeStatement("COMMENT ON COLUMN $t.tsv IS '" . self::SCHEMA_MARKER . "'");
+		$this->db->executeStatement("ALTER TABLE $qt\n" . implode(",\n", $alterClauses));
+		$this->db->executeStatement("COMMENT ON COLUMN $qt.tsv IS '" . self::SCHEMA_MARKER . "'");
 	}
 
 	/**
@@ -315,19 +344,23 @@ class SchemaService {
 	}
 
 	public function dropSchema(): void {
-		$this->db->executeStatement('DROP TABLE IF EXISTS ' . $this->getTableName());
-		$this->db->executeStatement('DROP TABLE IF EXISTS ' . $this->getWordsTableName());
-		$this->db->executeStatement('DROP FUNCTION IF EXISTS ' . $this->getRegconfigFunctionName() . '(text)');
+		$qt = $this->getQualifiedTableName();
+		$qw = $this->getQualifiedWordsTableName();
+		$qfn = $this->getQualifiedRegconfigFunctionName();
+		$this->db->executeStatement('DROP TABLE IF EXISTS ' . $qt);
+		$this->db->executeStatement('DROP TABLE IF EXISTS ' . $qw);
+		$this->db->executeStatement('DROP FUNCTION IF EXISTS ' . $qfn . '(text)');
+		$this->schema = null;
 	}
 
 	/** Remove every indexed document and the vocabulary, keeping the tables. */
 	public function truncate(): void {
-		$this->db->executeStatement('TRUNCATE ' . $this->getTableName() . ', ' . $this->getWordsTableName());
+		$this->db->executeStatement('TRUNCATE ' . $this->getQualifiedTableName() . ', ' . $this->getQualifiedWordsTableName());
 	}
 
 	/** @return array<string, int> language => documents indexed in it */
 	public function countDocumentsByLanguage(): array {
-		$result = $this->db->executeQuery('SELECT config AS language, count(*) AS documents FROM ' . $this->getTableName() . ' GROUP BY config ORDER BY count(*) DESC');
+		$result = $this->db->executeQuery('SELECT config AS language, count(*) AS documents FROM ' . $this->getQualifiedTableName() . ' GROUP BY config ORDER BY count(*) DESC');
 		$counts = [];
 		foreach ($result->fetchAll() as $row) {
 			$counts[(string)$row['language']] = (int)$row['documents'];
@@ -337,7 +370,7 @@ class SchemaService {
 	}
 
 	public function countDocuments(): int {
-		$result = $this->db->executeQuery('SELECT count(*) FROM ' . $this->getTableName());
+		$result = $this->db->executeQuery('SELECT count(*) FROM ' . $this->getQualifiedTableName());
 		$count = (int)$result->fetchOne();
 		$result->closeCursor();
 		return $count;
@@ -345,9 +378,18 @@ class SchemaService {
 
 	public function hasTrigram(): bool {
 		if ($this->trigram === null) {
-			$result = $this->db->executeQuery("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'");
-			$this->trigram = $result->fetchOne() !== false;
+			$result = $this->db->executeQuery(
+				"SELECT n.nspname FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pg_trgm'"
+			);
+			$nsp = $result->fetchOne();
 			$result->closeCursor();
+			if (is_string($nsp) && $nsp !== '') {
+				$this->trigram = true;
+				$this->trigramSchema = $this->quoteIdent($nsp);
+			} else {
+				$this->trigram = false;
+				$this->trigramSchema = null;
+			}
 		}
 		return $this->trigram;
 	}
@@ -355,7 +397,7 @@ class SchemaService {
 	/** @return string[] text search configurations installed on this server, e.g. english, turkish, simple */
 	public function getTextSearchConfigs(): array {
 		if ($this->textSearchConfigs === null) {
-			$result = $this->db->executeQuery('SELECT cfgname FROM pg_ts_config ORDER BY cfgname');
+			$result = $this->db->executeQuery('SELECT cfgname FROM pg_catalog.pg_ts_config ORDER BY cfgname');
 			$this->textSearchConfigs = array_map('strval', array_column($result->fetchAll(), 'cfgname'));
 			$result->closeCursor();
 		}
@@ -389,8 +431,13 @@ class SchemaService {
 		}
 		try {
 			// pg_trgm is a "trusted" extension since PostgreSQL 13, so the database owner can create it.
-			$this->db->executeStatement('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+			$currentSchema = $this->db->executeQuery('SELECT pg_catalog.current_schema()')->fetchOne();
+			$sql = is_string($currentSchema) && $currentSchema !== ''
+				? 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+				: 'CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA ' . $this->quoteIdent($this->getSchemaName());
+			$this->db->executeStatement($sql);
 			$this->trigram = null;
+			$this->trigramSchema = null;
 		} catch (Throwable $e) {
 			$this->logger->info('pg_trgm extension not available, fuzzy title matching disabled: ' . $e->getMessage());
 		}
@@ -401,6 +448,36 @@ class SchemaService {
 	 * succeeded it breaks Doctrine schema introspection, and its content is unusable anyway.
 	 */
 	private function dropLegacyTable(): void {
-		$this->db->executeStatement('DROP TABLE IF EXISTS *PREFIX*fts_pgsql_index');
+		$qs = $this->quoteIdent($this->getSchemaName());
+		$this->db->executeStatement("DROP TABLE IF EXISTS {$qs}.*PREFIX*fts_pgsql_index");
+	}
+
+	private function getSchemaName(): string {
+		if ($this->schema !== null) {
+			return $this->schema;
+		}
+		$t = $this->getTableName();
+		$result = $this->db->executeQuery(
+			"SELECT coalesce(
+				(SELECT n.nspname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = pg_catalog.to_regclass(?)),
+				(SELECT n.nspname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+				 WHERE c.relname = ? AND c.relkind IN ('r', 'p')
+				   AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\' AND n.nspname <> 'information_schema'
+				 ORDER BY (n.nspname = 'public') DESC, n.nspname LIMIT 1)
+			) AS found_schema, pg_catalog.current_schema() AS curr_schema",
+			[$t, $t]
+		);
+		$row = $result->fetch();
+		$result->closeCursor();
+		$found = is_array($row) ? ($row['found_schema'] ?? null) : null;
+		if (is_string($found) && $found !== '') {
+			return $this->schema = $found;
+		}
+		$curr = is_array($row) ? ($row['curr_schema'] ?? null) : null;
+		return is_string($curr) && $curr !== '' ? $curr : 'public';
+	}
+
+	private function quoteIdent(string $ident): string {
+		return '"' . str_replace('"', '""', $ident) . '"';
 	}
 }

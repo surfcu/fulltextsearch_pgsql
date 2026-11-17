@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Upgrade-path and `pg_upgrade` test coverage in `tests/run.php` and CI: `1.4.2`/`1.5.x` Schema Version 2 to Version 3 upgrade fixture, `pg_catalog` assertion forbidding `reg*` columns on `ftspg_` tables, `pg_dump`/`pg_restore` search verification under empty `search_path` (with schema-qualified queries across all services), and a CI `pg_upgrade --check` job upgrading a populated PostgreSQL 17 cluster to PostgreSQL 18.
+
 ### Changed
 - Bump schema version to 3 (`ftspg schema 3`), replace the `config` `regconfig` column and `varchar` caps on `provider_id`, `document_id`, `owner_id`, `source`, and `hash` with `text` plus an `IMMUTABLE PARALLEL SAFE` `ftspg_<prefix>regconfig(text)` SQL wrapper and post-rebuild `ANALYZE` to unblock `pg_upgrade` (one-time `ensureSchema()` rewrite measured at 51.7 s on the 100,000-document synthetic index); no re-indexing is needed.
 - Update documentation (`README.md`, `docs/MIGRATION.md`, `docs/ARCHITECTURE.md`, `docs/RELEASING.md`) with PostgreSQL upgrade instructions prior to 1.6.0, database locale requirements, ignored search-request fields under limitations, viewer-scoped typo correction behavior, and current extraction/ranking capabilities.
