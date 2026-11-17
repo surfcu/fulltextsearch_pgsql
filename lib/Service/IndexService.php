@@ -13,6 +13,11 @@ use Throwable;
 
 class IndexService {
 
+	private const MAX_TAGS_BYTES = 65536;
+	private const STEP4_PARTS_BYTES = 65536;
+	private const STEP5_TAGS_BYTES = 16384;
+	private const STEP5_TITLE_CHARS = 4000;
+
 	public function __construct(
 		private IDBConnection $db,
 		private SchemaService $schemaService,
@@ -56,20 +61,219 @@ class IndexService {
 			? $this->languageDetector->detect($content, implode(' ', $this->strings($document->getParts())), $document->getTitle())
 			: $this->configService->getLanguage();
 
+		$extractor = $this->extractor;
+		$access = $document->getAccess();
+
+		$tags = array_map([$extractor, 'sanitize'], $this->strings($document->getTags()));
+		$metaTags = array_map([$extractor, 'sanitize'], $this->strings($document->getMetaTags()));
+		$subtags = array_map([$extractor, 'sanitize'], $this->strings($document->getSubTags(true)));
+		$links = array_map([$extractor, 'sanitize'], $this->strings($access->getLinks()));
+
+		$parts = [];
+		foreach ($document->getParts() as $name => $value) {
+			$val = (string)$value;
+			$strip = $extractor->looksLikeMarkup($val, '', true);
+			$parts[(string)$name] = $extractor->clean($val, $strip);
+		}
+
+		$partsText = implode(' ', $parts);
+		$maxContentSize = $this->configService->getMaxContentSize();
+		if ($maxContentSize > 0 && strlen($partsText) > $maxContentSize) {
+			$partsText = mb_strcut($partsText, 0, $maxContentSize);
+		}
+
+		$tagsText = $extractor->clean(implode(' ', array_merge($tags, $metaTags)));
+		if (strlen($tagsText) > self::MAX_TAGS_BYTES) {
+			$tagsText = mb_strcut($tagsText, 0, self::MAX_TAGS_BYTES);
+		}
+
+		$title = $extractor->sanitize($document->getTitle());
+		$cleanInfo = $this->cleanInfoMap($document->getInfoAll());
+		$partsJson = json_encode((object)$parts, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+		$infoJson = json_encode((object)$cleanInfo, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+
+		$savepoint0 = 'ftspg_upsert_0';
+		$this->createSavepoint($savepoint0);
+
 		try {
-			$this->upsert($document, $content, $updateContent, $updateParts, $language);
+			$this->upsert(
+				$document,
+				$language,
+				$content,
+				$updateContent,
+				$partsText,
+				$partsJson,
+				$updateParts,
+				$tagsText,
+				$title,
+				$infoJson,
+				$tags,
+				$metaTags,
+				$subtags,
+				$links,
+			);
+			$this->releaseSavepoint($savepoint0);
 		} catch (Throwable $e) {
-			if ($content === '') {
+			$this->rollbackSavepoint($savepoint0);
+			if (!$this->isProgramLimitExceeded($e)) {
 				throw $e;
 			}
-			// Most likely "string is too long for tsvector": keep the document findable by title.
-			$this->logger->warning('Indexing content failed, retrying without content', [
+
+			$this->logger->warning('Indexing document exceeded tsvector limit (54000), starting degradation ladder', [
 				'provider' => $document->getProviderId(),
 				'document' => $document->getId(),
 				'exception' => $e,
 			]);
-			$this->upsert($document, '', true, $updateParts, $language);
-			$warnings[] = 'indexed without content: ' . $e->getMessage();
+
+			$lastException = $e;
+			$degraded = false;
+			$curContent = $content;
+			$curUpdateContent = $updateContent;
+			$curPartsText = $partsText;
+			$curPartsJson = $partsJson;
+			$curUpdateParts = $updateParts;
+			$curTagsText = $tagsText;
+			$curTitle = $title;
+
+			for ($step = 1; $step <= 5; $step++) {
+				$stepWarnings = [];
+
+				switch ($step) {
+					case 1:
+						if ($content === '') {
+							continue 2;
+						}
+						$curContent = mb_strcut($content, 0, (int)(strlen($content) / 2));
+						$curUpdateContent = true;
+						$stepWarnings[] = 'indexed with content cut to half: ' . $lastException->getMessage();
+						break;
+
+					case 2:
+						if ($content === '') {
+							continue 2;
+						}
+						$curContent = mb_strcut($content, 0, (int)(strlen($content) / 4));
+						$curUpdateContent = true;
+						$stepWarnings[] = 'indexed with content cut to a quarter: ' . $lastException->getMessage();
+						break;
+
+					case 3:
+						if ($content === '') {
+							continue 2;
+						}
+						$curContent = '';
+						$curUpdateContent = true;
+						$stepWarnings[] = 'indexed without content: ' . $lastException->getMessage();
+						break;
+
+					case 4:
+						if ($content !== '') {
+							$curContent = '';
+							$curUpdateContent = true;
+							$stepWarnings[] = 'indexed without content: ' . $lastException->getMessage();
+						}
+						$curPartsText = mb_strcut($partsText, 0, self::STEP4_PARTS_BYTES);
+						$curPartsJson = $this->truncatePartsJson($parts, self::STEP4_PARTS_BYTES);
+						$curUpdateParts = true;
+						$stepWarnings[] = 'indexed with parts cut to 64 KB: ' . $lastException->getMessage();
+						break;
+
+					case 5:
+						$curPartsText = mb_strcut($partsText, 0, self::STEP4_PARTS_BYTES);
+						$curPartsJson = $this->truncatePartsJson($parts, self::STEP4_PARTS_BYTES);
+						$curUpdateParts = true;
+						$curTagsText = mb_strcut($tagsText, 0, self::STEP5_TAGS_BYTES);
+						$curTitle = mb_substr($title, 0, self::STEP5_TITLE_CHARS);
+						$curContent = $content;
+						$curUpdateContent = $updateContent;
+						$stepWarnings[] = 'indexed with tags cut to 16 KB and title cut to 4000 characters: ' . $lastException->getMessage();
+						break;
+				}
+
+				$savepointStep = 'ftspg_upsert_' . $step;
+				$this->createSavepoint($savepointStep);
+
+				try {
+					$this->upsert(
+						$document,
+						$language,
+						$curContent,
+						$curUpdateContent,
+						$curPartsText,
+						$curPartsJson,
+						$curUpdateParts,
+						$curTagsText,
+						$curTitle,
+						$infoJson,
+						$tags,
+						$metaTags,
+						$subtags,
+						$links,
+					);
+					$this->releaseSavepoint($savepointStep);
+					foreach ($stepWarnings as $w) {
+						$warnings[] = $w;
+					}
+					$degraded = true;
+					break;
+				} catch (Throwable $stepEx) {
+					$this->rollbackSavepoint($savepointStep);
+					if (!$this->isProgramLimitExceeded($stepEx)) {
+						throw $stepEx;
+					}
+					if ($step === 5 && $curContent !== '') {
+						$curContent = '';
+						$curUpdateContent = true;
+						$stepWarnings = [
+							'indexed without content: ' . $stepEx->getMessage(),
+							'indexed with tags cut to 16 KB and title cut to 4000 characters: ' . $stepEx->getMessage(),
+						];
+						$savepoint5b = 'ftspg_upsert_5b';
+						$this->createSavepoint($savepoint5b);
+						try {
+							$this->upsert(
+								$document,
+								$language,
+								$curContent,
+								$curUpdateContent,
+								$curPartsText,
+								$curPartsJson,
+								$curUpdateParts,
+								$curTagsText,
+								$curTitle,
+								$infoJson,
+								$tags,
+								$metaTags,
+								$subtags,
+								$links,
+							);
+							$this->releaseSavepoint($savepoint5b);
+							foreach ($stepWarnings as $w) {
+								$warnings[] = $w;
+							}
+							$degraded = true;
+							break;
+						} catch (Throwable $step5bEx) {
+							$this->rollbackSavepoint($savepoint5b);
+							if (!$this->isProgramLimitExceeded($step5bEx)) {
+								throw $step5bEx;
+							}
+							$lastException = $step5bEx;
+						}
+					} else {
+						$lastException = $stepEx;
+					}
+				}
+			}
+
+			if (!$degraded) {
+				$this->logger->warning('Indexing document failed after all degradation attempts', [
+					'provider' => $document->getProviderId(),
+					'document' => $document->getId(),
+					'exception' => $lastException,
+				]);
+				throw $lastException;
+			}
 		}
 
 		if ($this->configService->useTypoCorrection()) {
@@ -102,19 +306,29 @@ class IndexService {
 		);
 	}
 
-	private function upsert(IIndexDocument $document, string $content, bool $updateContent, bool $updateParts, string $language): void {
+	/**
+	 * @param list<string> $tags
+	 * @param list<string> $metaTags
+	 * @param list<string> $subtags
+	 * @param list<string> $links
+	 */
+	private function upsert(
+		IIndexDocument $document,
+		string $language,
+		string $content,
+		bool $updateContent,
+		string $partsText,
+		string $partsJson,
+		bool $updateParts,
+		string $tagsText,
+		string $title,
+		string $infoJson,
+		array $tags,
+		array $metaTags,
+		array $subtags,
+		array $links,
+	): void {
 		$access = $document->getAccess();
-		$extractor = $this->extractor;
-
-		$tags = array_map([$extractor, 'sanitize'], $this->strings($document->getTags()));
-		$metaTags = array_map([$extractor, 'sanitize'], $this->strings($document->getMetaTags()));
-		$parts = [];
-		foreach ($document->getParts() as $name => $value) {
-			$val = (string)$value;
-			$strip = $extractor->looksLikeMarkup($val, '', true);
-			$parts[(string)$name] = $extractor->clean($val, $strip);
-		}
-
 		$t = $this->schemaService->getTableName();
 		$this->db->executeStatement(<<<SQL
 			INSERT INTO $t AS d (
@@ -150,27 +364,122 @@ class IndexService {
 				$document->getId(),
 				$access->getOwnerId(),
 				PgArray::toLiteral(AccessTokens::forDocument($access)),
-				PgArray::toLiteral($this->strings($access->getLinks())),
+				PgArray::toLiteral($links),
 				PgArray::toLiteral($tags),
 				PgArray::toLiteral($metaTags),
-				PgArray::toLiteral($this->strings($document->getSubTags(true))),
+				PgArray::toLiteral($subtags),
 				$document->getSource(),
 				$document->getHash(),
 				(string)$document->getModifiedTime(),
 				(string)time(),
 				$language,
-				$extractor->sanitize($document->getTitle()),
-				$extractor->clean(implode(' ', array_merge($tags, $metaTags))),
-				json_encode((object)$parts, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE),
-				implode(' ', $parts),
+				$title,
+				$tagsText,
+				$partsJson,
+				$partsText,
 				$content,
-				json_encode((object)$document->getInfoAll(), JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE),
+				$infoJson,
 				$updateContent ? 'true' : 'false',
 				$updateParts ? 'true' : 'false',
 				$updateParts ? 'true' : 'false',
 				$updateContent ? 'true' : 'false',
 			]
 		);
+	}
+
+	private function createSavepoint(string $savepoint): void {
+		if ($this->db->inTransaction()) {
+			$this->db->executeStatement("SAVEPOINT $savepoint");
+		}
+	}
+
+	private function rollbackSavepoint(string $savepoint): void {
+		if ($this->db->inTransaction()) {
+			try {
+				$this->db->executeStatement("ROLLBACK TO SAVEPOINT $savepoint");
+			} catch (Throwable) {
+			}
+		}
+	}
+
+	private function releaseSavepoint(string $savepoint): void {
+		if ($this->db->inTransaction()) {
+			try {
+				$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+			} catch (Throwable) {
+			}
+		}
+	}
+
+	/**
+	 * Detect whether an exception represents PostgreSQL SQLSTATE 54000
+	 * (ERRCODE_PROGRAM_LIMIT_EXCEEDED, e.g. "string is too long for tsvector").
+	 */
+	private function isProgramLimitExceeded(Throwable $e): bool {
+		for ($curr = $e; $curr !== null; $curr = $curr->getPrevious()) {
+			if (method_exists($curr, 'getSQLState')) {
+				/** @var mixed $sqlState */
+				$sqlState = call_user_func([$curr, 'getSQLState']);
+				if ($sqlState === '54000') {
+					return true;
+				}
+			}
+			if ((string)$curr->getCode() === '54000') {
+				return true;
+			}
+			if ($curr instanceof \PDOException && isset($curr->errorInfo[0]) && (string)$curr->errorInfo[0] === '54000') {
+				return true;
+			}
+			$msg = $curr->getMessage();
+			if (stripos($msg, 'string is too long for tsvector') !== false) {
+				return true;
+			}
+			if (preg_match('/(?:SQLSTATE\[54000\]|\bSQLSTATE\s+54000\b|program_limit_exceeded)/i', $msg) === 1) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Recursively strip NUL bytes (\0) from info map keys and string values
+	 * to prevent PostgreSQL SQLSTATE 22P05 when casting to jsonb.
+	 *
+	 * @param array<mixed, mixed> $info
+	 * @return array<mixed, mixed>
+	 */
+	private function cleanInfoMap(array $info): array {
+		$clean = [];
+		foreach ($info as $key => $value) {
+			$cleanKey = is_string($key) ? str_replace("\0", '', $key) : $key;
+			if (is_array($value)) {
+				$clean[$cleanKey] = $this->cleanInfoMap($value);
+			} elseif (is_string($value)) {
+				$clean[$cleanKey] = str_replace("\0", '', $value);
+			} else {
+				$clean[$cleanKey] = $value;
+			}
+		}
+		return $clean;
+	}
+
+	/**
+	 * Truncate parts array values to ensure jsonb representation fits within maxBytes.
+	 *
+	 * @param array<string, string> $parts
+	 */
+	private function truncatePartsJson(array $parts, int $maxBytes): string {
+		$truncated = [];
+		$remaining = $maxBytes;
+		foreach ($parts as $name => $value) {
+			if ($remaining <= 0) {
+				break;
+			}
+			$cut = mb_strcut($value, 0, $remaining);
+			$truncated[$name] = $cut;
+			$remaining -= strlen($cut);
+		}
+		return json_encode((object)$truncated, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
 	}
 
 	/** @return list<string> */
