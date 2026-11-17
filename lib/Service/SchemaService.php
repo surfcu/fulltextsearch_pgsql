@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\FullTextSearch_PgSql\Service;
 
 use OCA\FullTextSearch_PgSql\Tools\Fold;
+use OCA\FullTextSearch_PgSql\Tools\PgArray;
 use OCP\IConfig;
 use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
@@ -78,17 +79,69 @@ class SchemaService {
 	}
 
 	/**
-	 * Create the table and indexes if they are missing. Idempotent; safe to call often.
+	 * Create the table and indexes if they are missing. Serialized and atomic.
 	 */
 	public function ensureSchema(): void {
 		if (!$this->isPostgres()) {
 			throw new RuntimeException('fulltextsearch_pgsql requires Nextcloud to run on PostgreSQL');
 		}
 
-		$this->dropLegacyTable();
+		// Keep extension setup outside the transaction so a permission error never aborts the rebuild.
+		$this->trigram = null;
 		$this->tryCreateTrigramExtension();
 
 		$t = $this->getTableName();
+		$w = $this->getWordsTableName();
+		$ownTransaction = !$this->db->inTransaction();
+		$savepoint = 'ftspg_ensure_schema';
+		if ($ownTransaction) {
+			$this->db->beginTransaction();
+		} else {
+			$this->db->executeStatement("SAVEPOINT $savepoint");
+		}
+
+		try {
+			$this->db->executeQuery(
+				'SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))',
+				['fulltextsearch_pgsql', $t]
+			)->closeCursor();
+
+			if (!$this->isCurrent()) {
+				$this->dropLegacyTable();
+				$this->createIndexTable($t);
+				$this->ensureGeneratedColumns();
+				$this->ensureIndexTableIndexes($t);
+				$this->ensureWordsTable();
+			} elseif (!$this->hasAllIndexesAndWords($t, $w)) {
+				$this->ensureIndexTableIndexes($t);
+				$this->ensureWordsTable();
+			}
+
+			if ($ownTransaction) {
+				$this->db->commit();
+			} else {
+				$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+			}
+		} catch (Throwable $e) {
+			if ($ownTransaction) {
+				if ($this->db->inTransaction()) {
+					try {
+						$this->db->rollBack();
+					} catch (Throwable) {
+					}
+				}
+			} elseif ($this->db->inTransaction()) {
+				try {
+					$this->db->executeStatement("ROLLBACK TO SAVEPOINT $savepoint");
+					$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+				} catch (Throwable) {
+				}
+			}
+			throw $e;
+		}
+	}
+
+	private function createIndexTable(string $t): void {
 		$this->db->executeStatement(<<<SQL
 			CREATE TABLE IF NOT EXISTS $t (
 				id            bigserial    PRIMARY KEY,
@@ -114,9 +167,9 @@ class SchemaService {
 				CONSTRAINT {$t}_doc_uniq UNIQUE (provider_id, document_id)
 			)
 			SQL);
+	}
 
-		$this->ensureGeneratedColumns();
-
+	private function ensureIndexTableIndexes(string $t): void {
 		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_tsv_idx ON $t USING GIN (tsv)");
 		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_access_idx ON $t USING GIN (access)");
 		$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_metatags_idx ON $t USING GIN (metatags)");
@@ -127,8 +180,28 @@ class SchemaService {
 			// Serves substring matching (LIKE '%…%') and typo-tolerant matching (<%).
 			$this->db->executeStatement("CREATE INDEX IF NOT EXISTS {$t}_title_search_trgm_idx ON $t USING GIN (title_search gin_trgm_ops)");
 		}
+	}
 
-		$this->ensureWordsTable();
+	private function hasAllIndexesAndWords(string $t, string $w): bool {
+		$relations = [
+			"{$t}_tsv_idx",
+			"{$t}_access_idx",
+			"{$t}_metatags_idx",
+			"{$t}_subtags_idx",
+			$w,
+			"{$w}_folded_idx",
+		];
+		if ($this->hasTrigram()) {
+			$relations[] = "{$t}_title_search_trgm_idx";
+			$relations[] = "{$w}_folded_trgm_idx";
+		}
+		$result = $this->db->executeQuery(
+			'SELECT bool_and(to_regclass(name) IS NOT NULL) FROM unnest(CAST(? AS text[])) AS name',
+			[PgArray::toLiteral($relations)]
+		);
+		$allPresent = (bool)$result->fetchOne();
+		$result->closeCursor();
+		return $allPresent;
 	}
 
 	/**

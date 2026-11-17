@@ -169,8 +169,20 @@ function sorted(array $a): array {
 // ---------------------------------------------------------------- tests
 try {
 	section('schema');
-	$conn->executeStatement('DROP TABLE IF EXISTS ftspg_oc_index');
+	$conn->executeStatement('DROP TABLE IF EXISTS ftspg_oc_index, ftspg_oc_words');
 	$conn->executeStatement('DROP TABLE IF EXISTS oc_fts_pgsql_index');
+	same(false, $schema->tableExists(), 'index table missing before loadPlatform');
+	$platform->loadPlatform();
+	same(true, $schema->tableExists(), 'loadPlatform creates missing index table');
+	same(true, $schema->isCurrent(), 'loadPlatform creates current schema when table is missing');
+	$conn->statements = [];
+	$platform->loadPlatform();
+	$loadDdl = array_values(array_filter(
+		$conn->statements,
+		static fn (string $sql): bool => preg_match('/\b(CREATE TABLE|ALTER TABLE|CREATE INDEX|COMMENT ON)\b/i', $sql) === 1
+	));
+	same([], $loadDdl, 'loadPlatform issues no DDL when schema is already current');
+	$conn->executeStatement('DROP TABLE IF EXISTS ftspg_oc_index, ftspg_oc_words');
 	$conn->executeStatement('CREATE TABLE oc_fts_pgsql_index (id int, content_tsv tsvector)');
 	same(true, $platform->testPlatform(), 'testPlatform creates the schema and succeeds');
 	same('ftspg_oc_index', $schema->getTableName(), 'table name does not start with the Nextcloud prefix');
@@ -1932,12 +1944,23 @@ try {
 	same(3, VocabularyService::editDistance('ışık', 'isik'), 'multibyte letters count once each (3 substitutions)');
 	$conn->executeStatement('TRUNCATE ftspg_oc_words');
 	$progress = 0;
-	$repairOutput = double(\OCP\Migration\IOutput::class, ['advance' => function (int $step = 1) use (&$progress) {
-		$progress += $step;
-	}]);
+	$repairInfos = [];
+	$repairWarnings = [];
+	$repairOutput = double(\OCP\Migration\IOutput::class, [
+		'advance' => function (int $step = 1) use (&$progress) {
+			$progress += $step;
+		},
+		'info' => function (string $message) use (&$repairInfos) {
+			$repairInfos[] = $message;
+		},
+		'warning' => function (string $message) use (&$repairWarnings) {
+			$repairWarnings[] = $message;
+		},
+	]);
 	(new CreateIndexTable($schema, $vocabulary, $config))->run($repairOutput);
 	check($vocabulary->count() > 20, 'upgrade step fills an empty vocabulary on small instances');
 	same($schema->countDocuments(), $progress, 'and reports progress per document');
+	same(false, stripos(implode("\n", array_merge($repairInfos, $repairWarnings)), 'lock') !== false, 'repair step omits lock notice when schema is already current');
 
 	section('upgrading a 1.1.x table in place');
 	$t = $schema->getTableName();
@@ -1948,8 +1971,43 @@ try {
 		$conn->executeStatement("CREATE INDEX {$t}_title_trgm_idx ON $t USING GIN (title gin_trgm_ops)");
 	}
 	same(false, $schema->isCurrent(), '1.1.x schema detected as outdated');
-	$platform->loadPlatform();
-	same(true, $schema->isCurrent(), 'loadPlatform upgrades it');
+	$expectedRowCount = $schema->countDocuments();
+	check($expectedRowCount > 0, 'existing rows present before upgrade');
+	$loadThrew = false;
+	$loadError = '';
+	try {
+		$platform->loadPlatform();
+	} catch (\RuntimeException $e) {
+		$loadThrew = true;
+		$loadError = $e->getMessage();
+	}
+	same(true, $loadThrew, 'loadPlatform refuses to upgrade an existing outdated table');
+	check(str_contains($loadError, 'occ upgrade') && str_contains($loadError, 'occ maintenance:repair'), 'loadPlatform error directs admin to occ upgrade / occ maintenance:repair');
+	same(false, $schema->isCurrent(), 'loadPlatform leaves outdated schema untouched');
+	$colsAfterLoad = $conn->executeQuery(
+		'SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?',
+		[$t]
+	)->fetchAll(PDO::FETCH_COLUMN);
+	same(false, in_array('title_search', $colsAfterLoad, true), 'loadPlatform leaves 1.1.x columns unchanged');
+	if ($schema->hasTrigram()) {
+		$idxAfterLoad = $conn->executeQuery('SELECT indexname FROM pg_indexes WHERE tablename = ?', [$t])->fetchAll(PDO::FETCH_COLUMN);
+		same(true, in_array("{$t}_title_trgm_idx", $idxAfterLoad, true), 'loadPlatform leaves 1.1.x trigram index unchanged');
+	}
+	$upgradeInfos = [];
+	$upgradeWarnings = [];
+	$upgradeOutput = double(\OCP\Migration\IOutput::class, [
+		'info' => function (string $message) use (&$upgradeInfos) {
+			$upgradeInfos[] = $message;
+		},
+		'warning' => function (string $message) use (&$upgradeWarnings) {
+			$upgradeWarnings[] = $message;
+		},
+	]);
+	(new CreateIndexTable($schema, $vocabulary, $config))->run($upgradeOutput);
+	same(true, $schema->isCurrent(), 'CreateIndexTable upgrades the 1.1.x table');
+	$upgradeNotice = implode("\n", array_merge($upgradeInfos, $upgradeWarnings));
+	check(str_contains($upgradeNotice, (string)$expectedRowCount), 'repair step prints document row count when upgrading outdated table');
+	check(stripos($upgradeNotice, 'lock') !== false, 'repair step prints index-table lock notice when upgrading outdated table');
 	same(['N1'], $ids('final'), 'after upgrade: existing rows recomputed, file name parts searchable');
 	same(['N2', 'U1'], $ids('butce'), 'after upgrade: substring matching works');
 	$indexes = $conn->executeQuery('SELECT indexname FROM pg_indexes WHERE tablename = ?', [$t])->fetchAll(PDO::FETCH_COLUMN);
@@ -2512,6 +2570,403 @@ try {
 		@rmdir($b5HangDir);
 		@rmdir($b5StderrDir);
 		@rmdir($b5ToolDir);
+	}
+
+	section('atomic, serialized schema rebuild (S1)');
+	$s1DropTables = static function () use ($conn): void {
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s1fresh_index, ftspg_s1fresh_words, ftspg_s1conc_index, ftspg_s1conc_words, ftspg_s1race_index, ftspg_s1race_words, ftspg_s1test_index, ftspg_s1test_words, ftspg_s1notrgm_index, ftspg_s1notrgm_words');
+	};
+	$s1DropTables();
+
+	try {
+		// 0. CreateIndexTable on missing table omits rebuild/lock notice
+		$freshSysConfig = new ArrayConfig(['dbtableprefix' => 's1fresh_']);
+		$freshSchema = new SchemaService($conn, $freshSysConfig, $logger);
+		$freshConfig = new ConfigService(new ArrayAppConfig(), $freshSchema);
+		$freshVocab = new VocabularyService($conn, $freshSchema);
+		$freshInfos = [];
+		$freshWarnings = [];
+		$freshOutput = double(\OCP\Migration\IOutput::class, [
+			'info' => function (string $message) use (&$freshInfos) {
+				$freshInfos[] = $message;
+			},
+			'warning' => function (string $message) use (&$freshWarnings) {
+				$freshWarnings[] = $message;
+			},
+		]);
+		(new CreateIndexTable($freshSchema, $freshVocab, $freshConfig))->run($freshOutput);
+		same(true, $freshSchema->isCurrent(), 'S1 fresh install: CreateIndexTable creates current schema');
+		same(false, stripos(implode("\n", array_merge($freshInfos, $freshWarnings)), 'lock') !== false, 'S1 fresh install: repair step omits rebuild/lock notice');
+
+		// Helper for concurrent ensureSchema() via proc_open + commit() proxy + pg_locks polling
+		$runConcurrentEnsure = static function (string $prefix) use ($conn, $dsn, $logger): array {
+			$childScript = '<?php' . "\n"
+				. 'declare(strict_types=1);' . "\n"
+				. 'require ' . var_export(__DIR__ . '/bootstrap.php', true) . ';' . "\n"
+				. '$c = new \OCA\FullTextSearch_PgSql\Tests\PdoConnection(new \PDO(' . var_export($dsn, true) . '), ' . var_export($prefix, true) . ');' . "\n"
+				. '$s = new \OCA\FullTextSearch_PgSql\Service\SchemaService($c, new \OCA\FullTextSearch_PgSql\Tests\ArrayConfig([\'dbtableprefix\' => ' . var_export($prefix, true) . ']), new \OCA\FullTextSearch_PgSql\Tests\MemoryLogger());' . "\n"
+				. '$c->statements = [];' . "\n"
+				. '$s->ensureSchema();' . "\n"
+				. 'echo json_encode([\'statements\' => $c->statements, \'current\' => $s->isCurrent()]);' . "\n";
+
+			$state = new class {
+				public bool $committed = false;
+				public bool $sawAdvisoryWait = false;
+				/** @var list<string> */
+				public array $parentSqls = [];
+				public string $dsn = '';
+				public string $childScript = '';
+				/** @var resource|null */
+				public $proc = null;
+				/** @var array<int, resource> */
+				public array $pipes = [];
+			};
+			$state->dsn = $dsn;
+			$state->childScript = $childScript;
+
+			$proxy = new class($conn, $state) implements \OCP\IDBConnection {
+				public function __construct(
+					private \OCP\IDBConnection $inner,
+					private object $state,
+				) {
+				}
+				public function executeStatement($sql, array $params = [], array $types = []): int {
+					$this->state->parentSqls[] = (string)$sql;
+					return $this->inner->executeStatement($sql, $params, $types);
+				}
+				public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+					$this->state->parentSqls[] = $sql;
+					return $this->inner->executeQuery($sql, $params, $types);
+				}
+				public function inTransaction(): bool {
+					return $this->inner->inTransaction();
+				}
+				public function beginTransaction(): void {
+					$this->inner->beginTransaction();
+				}
+				public function commit(): void {
+					if (!$this->state->committed) {
+						$this->state->committed = true;
+						$pipes = [];
+						$proc = proc_open(
+							[PHP_BINARY],
+							[0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+							$pipes
+						);
+						if (!is_resource($proc)) {
+							$this->inner->commit();
+							throw new \RuntimeException('Failed to spawn child PHP process');
+						}
+						fwrite($pipes[0], $this->state->childScript);
+						fclose($pipes[0]);
+						$this->state->proc = $proc;
+						$this->state->pipes = $pipes;
+						try {
+							$monitorPdo = new PDO($this->state->dsn);
+							$deadline = microtime(true) + 5.0;
+							while (microtime(true) < $deadline) {
+								$waitCount = (int)$monitorPdo->query(
+									"SELECT count(*) FROM pg_locks WHERE pid <> pg_backend_pid() AND locktype = 'advisory' AND NOT granted"
+								)->fetchColumn();
+								if ($waitCount > 0) {
+									$this->state->sawAdvisoryWait = true;
+									break;
+								}
+								$status = proc_get_status($proc);
+								if (!$status['running']) {
+									break;
+								}
+								usleep(10000);
+							}
+						} finally {
+							$this->inner->commit();
+						}
+						return;
+					}
+					$this->inner->commit();
+				}
+				public function rollBack(): void {
+					$this->inner->rollBack();
+				}
+				public function getDatabaseProvider(): string {
+					return $this->inner->getDatabaseProvider();
+				}
+			};
+
+			$parentSchema = new SchemaService($proxy, new ArrayConfig(['dbtableprefix' => $prefix]), $logger);
+			try {
+				$parentSchema->ensureSchema();
+			} finally {
+				$childStdout = '';
+				$childStderr = '';
+				$childExit = -1;
+				if (is_resource($state->proc)) {
+					stream_set_blocking($state->pipes[1], false);
+					stream_set_blocking($state->pipes[2], false);
+					$readDeadline = microtime(true) + 5.0;
+					while (microtime(true) < $readDeadline) {
+						$childStdout .= stream_get_contents($state->pipes[1]) ?: '';
+						$childStderr .= stream_get_contents($state->pipes[2]) ?: '';
+						$status = proc_get_status($state->proc);
+						if (!$status['running'] && feof($state->pipes[1]) && feof($state->pipes[2])) {
+							break;
+						}
+						usleep(10000);
+					}
+					$status = proc_get_status($state->proc);
+					if ($status['running']) {
+						proc_terminate($state->proc);
+					}
+					$childStdout .= stream_get_contents($state->pipes[1]) ?: '';
+					$childStderr .= stream_get_contents($state->pipes[2]) ?: '';
+					fclose($state->pipes[1]);
+					fclose($state->pipes[2]);
+					$childExit = proc_close($state->proc);
+				}
+			}
+
+			return [
+				'sawAdvisoryWait' => $state->sawAdvisoryWait,
+				'parentSqls' => $state->parentSqls,
+				'childExit' => $childExit,
+				'childJson' => json_decode($childStdout, true) ?: [],
+				'childStderr' => $childStderr,
+			];
+		};
+
+		// 1. Concurrent ensureSchema() on outdated Schema v2 table executes rebuild once
+		$concSchema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 's1conc_']), $logger);
+		$concSchema->ensureSchema();
+		$conn->executeStatement(
+			"INSERT INTO ftspg_s1conc_index (provider_id, document_id, config, title, content) VALUES ('files', 'S1C1', 'simple', 'S1 Conc', 'concurrent test')"
+		);
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s1conc_index.tsv IS 'ftspg schema 1'");
+		same(false, $concSchema->isCurrent(), 'S1 concurrency: downgraded schema detected as outdated');
+
+		$concRun = $runConcurrentEnsure('s1conc_');
+		same(true, $concRun['sawAdvisoryWait'], 'S1 concurrency (outdated): second caller blocks on pg_advisory_xact_lock');
+		same(0, $concRun['childExit'], 'S1 concurrency (outdated): second caller exits cleanly' . ($concRun['childStderr'] !== '' ? ' (' . trim($concRun['childStderr']) . ')' : ''));
+		same(true, $concRun['childJson']['current'] ?? false, 'S1 concurrency (outdated): second caller observes current schema');
+		$parentRebuilt = count(array_filter(
+			$concRun['parentSqls'],
+			static fn (string $sql): bool => str_contains($sql, 'ALTER TABLE') || str_contains($sql, 'COMMENT ON COLUMN')
+		)) > 0;
+		$childDdl = array_values(array_filter(
+			$concRun['childJson']['statements'] ?? [],
+			static fn (string $sql): bool => preg_match('/\b(ALTER TABLE|DROP INDEX|COMMENT ON COLUMN|CREATE INDEX)\b/i', $sql) === 1
+		));
+		same(true, $parentRebuilt, 'S1 concurrency (outdated): parent performed rebuild');
+		same([], $childDdl, 'S1 concurrency (outdated): second caller executed zero rebuild DDL');
+		same(true, $concSchema->isCurrent(), 'S1 concurrency (outdated): schema is current');
+		same(1, $concSchema->countDocuments(), 'S1 concurrency (outdated): existing row preserved');
+
+		// 2. Concurrent ensureSchema() on missing table serializes CREATE TABLE IF NOT EXISTS
+		$raceSchema = new SchemaService($conn, new ArrayConfig(['dbtableprefix' => 's1race_']), $logger);
+		$raceRun = $runConcurrentEnsure('s1race_');
+		same(true, $raceRun['sawAdvisoryWait'], 'S1 concurrency (missing): second caller blocks on pg_advisory_xact_lock');
+		same(0, $raceRun['childExit'], 'S1 concurrency (missing): second caller exits cleanly' . ($raceRun['childStderr'] !== '' ? ' (' . trim($raceRun['childStderr']) . ')' : ''));
+		same(true, $raceRun['childJson']['current'] ?? false, 'S1 concurrency (missing): second caller observes current schema');
+		$raceChildDdl = array_values(array_filter(
+			$raceRun['childJson']['statements'] ?? [],
+			static fn (string $sql): bool => preg_match('/\b(CREATE TABLE|ALTER TABLE|DROP INDEX|COMMENT ON COLUMN|CREATE INDEX)\b/i', $sql) === 1
+		));
+		same([], $raceChildDdl, 'S1 concurrency (missing): second caller skipped CREATE TABLE/DDL');
+		same(true, $raceSchema->tableExists() && $raceSchema->isCurrent(), 'S1 concurrency (missing): table created and current');
+
+		// 3. Forced mid-rebuild failure leaves Schema v2 columns, indexes, marker, and rows intact
+		$s1SysConfig = new ArrayConfig(['dbtableprefix' => 's1test_']);
+		$s1Schema = new SchemaService($conn, $s1SysConfig, $logger);
+		$s1Config = new ConfigService(new ArrayAppConfig(), $s1Schema);
+		$s1Extractor = new ContentExtractor($s1Config);
+		$s1Vocab = new VocabularyService($conn, $s1Schema);
+		$s1Detector = new LanguageDetector($conn, $s1Config, $logger);
+		$s1Index = new IndexService($conn, $s1Schema, $s1Config, $s1Extractor, $s1Vocab, $logger, $s1Detector);
+		$s1Search = new SearchService($conn, $s1Schema, $s1Config, new TsQueryBuilder(), $s1Vocab);
+		$s1Platform = new PostgreSQLPlatform($s1Config, $s1Schema, $s1Index, $s1Search, $logger, $s1Extractor);
+		$s1Platform->initializeIndex();
+		$s1Platform->indexDocument(doc('S1_KEEP', 'alice', 'S1 Atomic Keep', 'atomic rollback verification'));
+
+		$makeFailProxy = static function (string $failTrigger) use ($conn): \OCP\IDBConnection {
+			return new class($conn, $failTrigger) implements \OCP\IDBConnection {
+				public function __construct(
+					private \OCP\IDBConnection $inner,
+					private string $failTrigger,
+				) {
+				}
+				public function executeStatement($sql, array $params = [], array $types = []): int {
+					if (str_contains((string)$sql, $this->failTrigger)) {
+						throw new \RuntimeException('injected failure at ' . $this->failTrigger);
+					}
+					return $this->inner->executeStatement($sql, $params, $types);
+				}
+				public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+					return $this->inner->executeQuery($sql, $params, $types);
+				}
+				public function inTransaction(): bool {
+					return $this->inner->inTransaction();
+				}
+				public function beginTransaction(): void {
+					$this->inner->beginTransaction();
+				}
+				public function commit(): void {
+					$this->inner->commit();
+				}
+				public function rollBack(): void {
+					$this->inner->rollBack();
+				}
+				public function getDatabaseProvider(): string {
+					return $this->inner->getDatabaseProvider();
+				}
+			};
+		};
+
+		foreach (['ADD COLUMN tsv', 'COMMENT ON COLUMN'] as $failTrigger) {
+			$conn->executeStatement("COMMENT ON COLUMN ftspg_s1test_index.tsv IS 'ftspg schema 1'");
+			$failSchema = new SchemaService($makeFailProxy($failTrigger), $s1SysConfig, $logger);
+			$threw = false;
+			try {
+				$failSchema->ensureSchema();
+			} catch (\RuntimeException) {
+				$threw = true;
+			}
+			same(true, $threw, "S1 rollback ($failTrigger): exception propagates");
+			same(false, $conn->inTransaction(), "S1 rollback ($failTrigger): no leaked open transaction");
+			same(1, (int)$conn->executeQuery('SELECT 1')->fetchOne(), "S1 rollback ($failTrigger): connection remains usable");
+			$cols = $conn->executeQuery(
+				"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ftspg_s1test_index'"
+			)->fetchAll(PDO::FETCH_COLUMN);
+			check(in_array('tsv', $cols, true) && in_array('title_search', $cols, true), "S1 rollback ($failTrigger): Schema v2 columns remain intact");
+			$idxs = $conn->executeQuery("SELECT indexname FROM pg_indexes WHERE tablename = 'ftspg_s1test_index'")->fetchAll(PDO::FETCH_COLUMN);
+			check(in_array('ftspg_s1test_index_tsv_idx', $idxs, true), "S1 rollback ($failTrigger): tsv index remains intact");
+			if ($s1Schema->hasTrigram()) {
+				check(in_array('ftspg_s1test_index_title_search_trgm_idx', $idxs, true), "S1 rollback ($failTrigger): trigram index remains intact");
+			}
+			$marker = $conn->executeQuery(
+				"SELECT col_description(to_regclass('ftspg_s1test_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s1test_index') AND attname = 'tsv' AND NOT attisdropped"
+			)->fetchOne();
+			same('ftspg schema 1', $marker, "S1 rollback ($failTrigger): marker preserved");
+			same(['S1_KEEP'], search($s1Platform, 'alice', 'atomic')['ids'], "S1 rollback ($failTrigger): existing row intact and searchable");
+		}
+
+		$s1Schema->ensureSchema();
+		same(true, $s1Schema->isCurrent(), 'S1: subsequent normal ensureSchema succeeds after prior rollback');
+		same(['S1_KEEP'], search($s1Platform, 'alice', 'atomic')['ids'], 'S1: existing row remains searchable after recovery');
+
+		// 4. ensureSchema() inside an already-open caller transaction (success + savepoint rollback)
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s1test_index.tsv IS 'ftspg schema 1'");
+		$conn->beginTransaction();
+		$conn->executeStatement("UPDATE ftspg_s1test_index SET title = 'Outer Tx Title' WHERE document_id = 'S1_KEEP'");
+		$s1Schema->ensureSchema();
+		same(true, $conn->inTransaction(), 'S1 caller tx: ensureSchema leaves outer transaction open on success');
+		same(true, $s1Schema->isCurrent(), 'S1 caller tx: schema upgraded inside caller transaction');
+		$conn->commit();
+		same('Outer Tx Title', (string)$conn->executeQuery("SELECT title FROM ftspg_s1test_index WHERE document_id = 'S1_KEEP'")->fetchOne(), 'S1 caller tx: outer DML committed');
+
+		$conn->executeStatement("COMMENT ON COLUMN ftspg_s1test_index.tsv IS 'ftspg schema 1'");
+		$conn->beginTransaction();
+		$conn->executeStatement("UPDATE ftspg_s1test_index SET title = 'Outer Tx Pending' WHERE document_id = 'S1_KEEP'");
+		$txFailSchema = new SchemaService($makeFailProxy('ADD COLUMN tsv'), $s1SysConfig, $logger);
+		$txThrew = false;
+		try {
+			$txFailSchema->ensureSchema();
+		} catch (\RuntimeException) {
+			$txThrew = true;
+		}
+		same(true, $txThrew, 'S1 caller tx rollback: exception propagates');
+		same(true, $conn->inTransaction(), 'S1 caller tx rollback: outer transaction remains open');
+		same(
+			'Outer Tx Pending',
+			(string)$conn->executeQuery("SELECT title FROM ftspg_s1test_index WHERE document_id = 'S1_KEEP'")->fetchOne(),
+			'S1 caller tx rollback: outer transaction is un-aborted (no 25P02) and DML is intact'
+		);
+		$txCols = $conn->executeQuery(
+			"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ftspg_s1test_index'"
+		)->fetchAll(PDO::FETCH_COLUMN);
+		check(in_array('tsv', $txCols, true) && in_array('title_search', $txCols, true), 'S1 caller tx rollback: Schema v2 columns remain intact');
+		$txMarker = $conn->executeQuery(
+			"SELECT col_description(to_regclass('ftspg_s1test_index'), attnum) FROM pg_attribute WHERE attrelid = to_regclass('ftspg_s1test_index') AND attname = 'tsv' AND NOT attisdropped"
+		)->fetchOne();
+		same('ftspg schema 1', $txMarker, 'S1 caller tx rollback: marker preserved');
+		$conn->rollBack();
+		same('Outer Tx Title', (string)$conn->executeQuery("SELECT title FROM ftspg_s1test_index WHERE document_id = 'S1_KEEP'")->fetchOne(), 'S1 caller tx rollback: outer rollback succeeds cleanly');
+
+		// 5. CREATE EXTENSION pg_trgm failure (42501) stays outside the rebuild transaction
+		$noTrgmState = new class {
+			public ?bool $createExtInTx = null;
+		};
+		$noTrgmProxy = new class($conn, $noTrgmState) implements \OCP\IDBConnection {
+			public function __construct(
+				private \OCP\IDBConnection $inner,
+				private object $state,
+			) {
+			}
+			public function executeStatement($sql, array $params = [], array $types = []): int {
+				if (str_contains((string)$sql, 'CREATE EXTENSION')) {
+					$this->state->createExtInTx = $this->inner->inTransaction();
+					$e = new \PDOException('SQLSTATE[42501]: Insufficient privilege: permission denied to create extension "pg_trgm"', 42501);
+					$e->errorInfo = ['42501', 7, 'permission denied to create extension "pg_trgm"'];
+					throw $e;
+				}
+				return $this->inner->executeStatement($sql, $params, $types);
+			}
+			public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+				if (str_contains($sql, 'pg_extension')) {
+					return new class implements \OCP\DB\IResult {
+						public function closeCursor(): bool {
+							return true;
+						}
+						public function fetch(int $fetchMode = \PDO::FETCH_ASSOC) {
+							return false;
+						}
+						public function fetchAll(int $fetchMode = \PDO::FETCH_ASSOC): array {
+							return [];
+						}
+						public function fetchOne() {
+							return false;
+						}
+					};
+				}
+				return $this->inner->executeQuery($sql, $params, $types);
+			}
+			public function inTransaction(): bool {
+				return $this->inner->inTransaction();
+			}
+			public function beginTransaction(): void {
+				$this->inner->beginTransaction();
+			}
+			public function commit(): void {
+				$this->inner->commit();
+			}
+			public function rollBack(): void {
+				$this->inner->rollBack();
+			}
+			public function getDatabaseProvider(): string {
+				return $this->inner->getDatabaseProvider();
+			}
+		};
+		$noTrgmSchema = new SchemaService($noTrgmProxy, new ArrayConfig(['dbtableprefix' => 's1notrgm_']), $logger);
+		$noTrgmSchema->ensureSchema();
+		same(false, $noTrgmState->createExtInTx, 'S1 pg_trgm isolation: CREATE EXTENSION attempted outside transaction');
+		same(false, $conn->inTransaction(), 'S1 pg_trgm isolation: no open transaction leaked');
+		same(true, $noTrgmSchema->tableExists() && $noTrgmSchema->isCurrent(), 'S1 pg_trgm isolation: schema rebuild committed despite 42501');
+
+		// 6. Recovery of missing words table/index when marker is already current does not rewrite tsv
+		$s1Schema->ensureSchema();
+		same(true, $s1Schema->isCurrent(), 'S1 recovery: schema marker is current before dropping words table');
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_s1test_words');
+		$conn->statements = [];
+		$s1Schema->ensureSchema();
+		same(true, (bool)$conn->executeQuery("SELECT to_regclass('ftspg_s1test_words') IS NOT NULL")->fetchOne(), 'S1 recovery: missing words table recreated when schema marker is current');
+		$rewriteDdl = array_values(array_filter(
+			$conn->statements,
+			static fn (string $sql): bool => preg_match('/\b(ALTER TABLE|COMMENT ON)\b/i', $sql) === 1
+		));
+		same([], $rewriteDdl, 'S1 recovery: words table/index recovery does not drop or rebuild tsv');
+	} finally {
+		$s1DropTables();
 	}
 } catch (Throwable $e) {
 	$failures++;
