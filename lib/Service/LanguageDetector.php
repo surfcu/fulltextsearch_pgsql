@@ -69,7 +69,7 @@ class LanguageDetector {
 		$bestScore = $scores[$best] ?? 0;
 		$second = isset($ranked[1]) ? $scores[$ranked[1]] : 0;
 
-		if ($bestScore >= self::MIN_STOPWORDS && $bestScore >= $second * self::MARGIN) {
+		if ($bestScore >= self::MIN_STOPWORDS && (float)$bestScore >= (float)$second * self::MARGIN) {
 			return (string)$best;
 		}
 		return $languages[0];
