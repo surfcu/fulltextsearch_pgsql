@@ -35,6 +35,13 @@ class CreateIndexTable implements IRepairStep {
 			$output->warning('Nextcloud is not running on PostgreSQL; the PostgreSQL full text search platform cannot be used.');
 			return;
 		}
+		if ($this->schemaService->tableExists() && !$this->schemaService->isCurrent()) {
+			$documents = $this->schemaService->countDocuments();
+			$output->info(sprintf(
+				'Rebuilding full text search index schema for %d document(s); the index table is locked while this runs.',
+				$documents
+			));
+		}
 		$this->schemaService->ensureSchema();
 		$this->fillVocabulary($output);
 		if (!$this->schemaService->hasTrigram()) {
