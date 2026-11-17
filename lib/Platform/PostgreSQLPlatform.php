@@ -44,6 +44,9 @@ class PostgreSQLPlatform implements IFullTextSearchPlatform {
 		$config = $this->configService->getConfig();
 		$config['table'] = $this->schemaService->getTableName();
 		$config['pg_trgm'] = $this->schemaService->isPostgres() && $this->schemaService->hasTrigram();
+		$localeFolding = $this->schemaService->isPostgres() && $this->schemaService->hasLocaleCaseFolding();
+		$config['locale_folding'] = $localeFolding;
+		$config['database_locale'] = $localeFolding ? 'ok' : 'case folding and non-ASCII accent matching are disabled due to database locale (LC_CTYPE)';
 		// What PDFs go through right now: pdftotext, pdfparser (bundled), or none.
 		$config['pdf_tool'] = $this->contentExtractor->pdfTool() ?? 'none';
 		// catdoc, xls2csv and catppt read Office 97–2003 files when installed.

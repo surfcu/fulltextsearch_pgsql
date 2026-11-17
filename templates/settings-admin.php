@@ -16,7 +16,14 @@ $config = $_['config'];
 	</p>
 
 	<h3><?php p($l->t('Status')); ?></h3>
-	<ul class="ftspg-status" aria-live="polite"></ul>
+	<ul class="ftspg-status" aria-live="polite">
+		<?php if (isset($_['status']['locale_folding']) && $_['status']['locale_folding'] === false): ?>
+			<li class="ftspg-warn">
+				<span class="ftspg-status-label"><?php p($l->t('Database locale')); ?></span>
+				<span><?php p($l->t('case folding and non-ASCII accent matching are disabled due to database locale (LC_CTYPE)')); ?></span>
+			</li>
+		<?php endif; ?>
+	</ul>
 
 	<form class="ftspg-form">
 		<h3><?php p($l->t('Languages')); ?></h3>
@@ -64,6 +71,11 @@ $config = $_['config'];
 			<input type="number" id="ftspg-max-results" name="max_results" min="1" max="10000" required
 				value="<?php p((string)$config['max_results']); ?>">
 		</p>
+		<p class="ftspg-field">
+			<label for="ftspg-search-timeout"><?php p($l->t('Search timeout (seconds, 0 disables)')); ?></label>
+			<input type="number" id="ftspg-search-timeout" name="search_timeout" min="0" max="300" required
+				value="<?php p((string)$config['search_timeout']); ?>">
+		</p>
 
 		<h3><?php p($l->t('Content extraction')); ?></h3>
 		<p class="ftspg-field">
@@ -82,12 +94,6 @@ foreach ($_['pdfExtractors'] as $extractor): ?>
 		</p>
 		<p class="settings-hint">
 			<?php p($l->t('pdftotext (poppler-utils) is faster and copes with more files. The built-in parser needs nothing installed, but uses more memory and skips files over 64 MB.')); ?>
-		</p>
-		<p class="ftspg-field">
-			<label for="ftspg-pdftotext-path"><?php p($l->t('Path to pdftotext')); ?></label>
-			<input type="text" id="ftspg-pdftotext-path" name="pdftotext_path" spellcheck="false" autocomplete="off"
-				placeholder="<?php p($l->t('Found on PATH')); ?>"
-				value="<?php p((string)$config['pdftotext_path']); ?>">
 		</p>
 		<p class="ftspg-field">
 			<label for="ftspg-max-content-size"><?php p($l->t('Text kept per document (bytes)')); ?></label>

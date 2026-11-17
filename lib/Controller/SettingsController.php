@@ -31,6 +31,13 @@ class SettingsController extends Controller {
 	 * @param array<string, mixed> $settings the same keys as `occ fulltextsearch_pgsql:configure`
 	 */
 	public function save(array $settings = []): JSONResponse {
+		if (array_key_exists(ConfigService::PDFTOTEXT_PATH, $settings)) {
+			return new JSONResponse(
+				['message' => 'pdftotext_path cannot be configured from the web interface'],
+				Http::STATUS_BAD_REQUEST
+			);
+		}
+
 		try {
 			$languageChanged = $this->configService->setConfig($settings);
 		} catch (InvalidArgumentException $e) {

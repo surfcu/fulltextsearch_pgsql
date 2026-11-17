@@ -21,8 +21,8 @@ class StatusService {
 
 	/**
 	 * @return array{postgres: bool, table: string, documents: ?int, by_language: ?array<string, int>,
-	 *               words: ?int, pg_trgm: bool, pdftotext: ?string, pdfparser: bool, pdf_tool: ?string,
-	 *               catdoc: ?string}
+	 *               words: ?int, pg_trgm: bool, locale_folding: bool, pdftotext: ?string, pdfparser: bool,
+	 *               pdf_tool: ?string, catdoc: ?string}
 	 */
 	public function getStatus(): array {
 		$postgres = $this->schemaService->isPostgres();
@@ -33,6 +33,7 @@ class StatusService {
 			'by_language' => $postgres ? $this->attempt(fn () => $this->schemaService->countDocumentsByLanguage()) : null,
 			'words' => $postgres ? $this->attempt(fn () => $this->vocabularyService->count()) : null,
 			'pg_trgm' => $postgres && (bool)$this->attempt(fn () => $this->schemaService->hasTrigram()),
+			'locale_folding' => $postgres && (bool)$this->attempt(fn () => $this->schemaService->hasLocaleCaseFolding()),
 			'pdftotext' => $this->contentExtractor->findPdfToTextPath(),
 			'pdfparser' => $this->contentExtractor->pdfParserAvailable(),
 			'pdf_tool' => $this->contentExtractor->pdfTool(),

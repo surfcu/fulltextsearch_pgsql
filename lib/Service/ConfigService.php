@@ -7,6 +7,7 @@ namespace OCA\FullTextSearch_PgSql\Service;
 use InvalidArgumentException;
 use OCA\FullTextSearch_PgSql\AppInfo\Application;
 use OCP\IAppConfig;
+use Psr\Log\LoggerInterface;
 
 /**
  * Typed access to the app's settings.
@@ -21,6 +22,7 @@ class ConfigService {
 	public const TYPO_CORRECTION = 'typo_correction';
 	public const MAX_RESULTS = 'max_results';
 	public const MAX_CONTENT_SIZE = 'max_content_size';
+	public const SEARCH_TIMEOUT = 'search_timeout';
 	public const PDFTOTEXT_PATH = 'pdftotext_path';
 	public const PDF_EXTRACTOR = 'pdf_extractor';
 
@@ -40,14 +42,20 @@ class ConfigService {
 		self::MAX_RESULTS => 100,
 		// Bytes of extracted text kept per document. PostgreSQL refuses tsvectors over 1 MB.
 		self::MAX_CONTENT_SIZE => 512000,
+		self::SEARCH_TIMEOUT => 10,
 		// Empty means "look for pdftotext on PATH".
 		self::PDFTOTEXT_PATH => '',
 		self::PDF_EXTRACTOR => 'auto',
 	];
 
+	/** @var non-empty-list<string>|null */
+	private ?array $cachedLanguages = null;
+	private ?string $lastRawLanguage = null;
+
 	public function __construct(
 		private IAppConfig $appConfig,
 		private SchemaService $schemaService,
+		private ?LoggerInterface $logger = null,
 	) {
 	}
 
@@ -58,6 +66,7 @@ class ConfigService {
 			self::TYPO_CORRECTION => $this->useTypoCorrection(),
 			self::MAX_RESULTS => $this->getMaxResults(),
 			self::MAX_CONTENT_SIZE => $this->getMaxContentSize(),
+			self::SEARCH_TIMEOUT => $this->getSearchTimeout(),
 			self::PDFTOTEXT_PATH => $this->getPdfToTextPath(),
 			self::PDF_EXTRACTOR => $this->getPdfExtractor(),
 		];
@@ -97,7 +106,17 @@ class ConfigService {
 				);
 			}
 			$value = implode(',', $languages);
-			$languageChanged = $languages !== $this->getLanguages();
+
+			$current = $this->getLanguages();
+			$currentPrimary = $current[0];
+			$currentExtras = array_slice($current, 1);
+			sort($currentExtras);
+
+			$newPrimary = $languages[0];
+			$newExtras = array_slice($languages, 1);
+			sort($newExtras);
+
+			$languageChanged = ($newPrimary !== $currentPrimary) || ($newExtras !== $currentExtras);
 			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::LANGUAGE, $value);
 		}
 
@@ -112,7 +131,7 @@ class ConfigService {
 			$writes[] = fn () => $this->appConfig->setValueBool(Application::APP_ID, $key, $value);
 		}
 
-		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, 1000000]] as $key => [$min, $max]) {
+		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, 1000000], self::SEARCH_TIMEOUT => [0, 300]] as $key => [$min, $max]) {
 			if (!array_key_exists($key, $config)) {
 				continue;
 			}
@@ -125,8 +144,16 @@ class ConfigService {
 
 		if (array_key_exists(self::PDFTOTEXT_PATH, $config)) {
 			$path = trim((string)$config[self::PDFTOTEXT_PATH]);
-			if ($path !== '' && !is_executable($path)) {
-				throw new InvalidArgumentException('pdftotext_path is not an executable file: ' . $path);
+			if ($path !== '') {
+				if (basename($path) !== 'pdftotext') {
+					throw new InvalidArgumentException('pdftotext_path binary must be named pdftotext: ' . $path);
+				}
+				if (!is_file($path) || !is_executable($path)) {
+					throw new InvalidArgumentException('pdftotext_path is not an executable file: ' . $path);
+				}
+				if (!$this->validatePdfToTextVersion($path)) {
+					throw new InvalidArgumentException('pdftotext_path does not output pdftotext version information: ' . $path);
+				}
 			}
 			$writes[] = fn () => $this->appConfig->setValueString(Application::APP_ID, self::PDFTOTEXT_PATH, $path);
 		}
@@ -142,6 +169,8 @@ class ConfigService {
 		foreach ($writes as $write) {
 			$write();
 		}
+		$this->cachedLanguages = null;
+		$this->lastRawLanguage = null;
 		return $languageChanged;
 	}
 
@@ -155,12 +184,42 @@ class ConfigService {
 
 	/**
 	 * Every configured language, fallback first. Search tries each of them.
+	 * Invalid or uninstalled languages are dropped with a warning; falls back to ['simple']
+	 * if all configured languages are invalid.
 	 *
 	 * @return non-empty-list<string>
 	 */
 	public function getLanguages(): array {
-		$languages = $this->parseLanguages($this->appConfig->getValueString(Application::APP_ID, self::LANGUAGE, self::DEFAULTS[self::LANGUAGE]));
-		return $languages === [] ? [self::DEFAULTS[self::LANGUAGE]] : $languages;
+		$raw = $this->appConfig->getValueString(Application::APP_ID, self::LANGUAGE, self::DEFAULTS[self::LANGUAGE]);
+		if ($raw === $this->lastRawLanguage && $this->cachedLanguages !== null) {
+			return $this->cachedLanguages;
+		}
+
+		$languages = $this->parseLanguages($raw);
+		if ($languages === []) {
+			$languages = [self::DEFAULTS[self::LANGUAGE]];
+		}
+
+		$installed = $this->schemaService->getTextSearchConfigs();
+		if ($installed !== []) {
+			$valid = [];
+			$dropped = [];
+			foreach ($languages as $lang) {
+				if (in_array($lang, $installed, true)) {
+					$valid[] = $lang;
+				} else {
+					$dropped[] = $lang;
+				}
+			}
+			if ($dropped !== []) {
+				$this->logger?->warning('Configured language(s) not installed in PostgreSQL, dropping: ' . implode(', ', $dropped));
+			}
+			$languages = $valid !== [] ? $valid : ['simple'];
+		}
+
+		$this->lastRawLanguage = $raw;
+		$this->cachedLanguages = $languages;
+		return $this->cachedLanguages;
 	}
 
 	/**
@@ -190,11 +249,17 @@ class ConfigService {
 	}
 
 	public function getMaxResults(): int {
-		return max(1, $this->appConfig->getValueInt(Application::APP_ID, self::MAX_RESULTS, self::DEFAULTS[self::MAX_RESULTS]));
+		$value = $this->appConfig->getValueInt(Application::APP_ID, self::MAX_RESULTS, self::DEFAULTS[self::MAX_RESULTS]);
+		return max(1, min(10000, $value));
 	}
 
 	public function getMaxContentSize(): int {
 		return max(0, $this->appConfig->getValueInt(Application::APP_ID, self::MAX_CONTENT_SIZE, self::DEFAULTS[self::MAX_CONTENT_SIZE]));
+	}
+
+	public function getSearchTimeout(): int {
+		$value = $this->appConfig->getValueInt(Application::APP_ID, self::SEARCH_TIMEOUT, self::DEFAULTS[self::SEARCH_TIMEOUT]);
+		return max(0, min(300, $value));
 	}
 
 	public function getPdfToTextPath(): string {
@@ -204,5 +269,52 @@ class ConfigService {
 	public function getPdfExtractor(): string {
 		$value = $this->appConfig->getValueString(Application::APP_ID, self::PDF_EXTRACTOR, self::DEFAULTS[self::PDF_EXTRACTOR]);
 		return in_array($value, self::PDF_EXTRACTORS, true) ? $value : self::DEFAULTS[self::PDF_EXTRACTOR];
+	}
+
+	/**
+	 * Run `<path> -v` and check that the output contains "pdftotext" (case-insensitive).
+	 */
+	private function validatePdfToTextVersion(string $path): bool {
+		$pipes = [];
+		$process = @proc_open(
+			[$path, '-v'],
+			[1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+			$pipes
+		);
+		if (!is_resource($process)) {
+			$output = [];
+			@exec(escapeshellarg($path) . ' -v 2>&1', $output);
+			$combined = implode("\n", $output);
+			return stripos($combined, 'pdftotext') !== false;
+		}
+
+		stream_set_blocking($pipes[1], false);
+		stream_set_blocking($pipes[2], false);
+		$stdout = '';
+		$stderr = '';
+		$deadline = time() + 2;
+		while ((!feof($pipes[1]) || !feof($pipes[2])) && time() < $deadline) {
+			$chunk1 = fread($pipes[1], 4096);
+			if ($chunk1 !== false && $chunk1 !== '') {
+				$stdout .= $chunk1;
+			}
+			$chunk2 = fread($pipes[2], 4096);
+			if ($chunk2 !== false && $chunk2 !== '') {
+				$stderr .= $chunk2;
+			}
+			if (feof($pipes[1]) && feof($pipes[2])) {
+				break;
+			}
+			usleep(10000);
+		}
+		if (time() >= $deadline) {
+			@proc_terminate($process);
+		}
+		@fclose($pipes[1]);
+		@fclose($pipes[2]);
+		@proc_close($process);
+
+		$combined = $stdout . "\n" . $stderr;
+		return stripos($combined, 'pdftotext') !== false;
 	}
 }

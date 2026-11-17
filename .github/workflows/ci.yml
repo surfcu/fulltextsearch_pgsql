@@ -21,9 +21,10 @@ jobs:
           - { nextcloud: '30', php: '8.1', postgres: '13', psalm: true }
           - { nextcloud: '34', php: '8.3', postgres: '16', psalm: true }
           - { nextcloud: '35', php: '8.3', postgres: '17', psalm: true }
+          - { nextcloud: '35', php: '8.3', postgres: '18', psalm: true }
           # Psalm 5 does not install on PHP 8.4+; these jobs check runtime behaviour and deprecations.
           - { nextcloud: '35', php: '8.4', postgres: '17', psalm: false }
-          - { nextcloud: '35', php: '8.5', postgres: '17', psalm: false }
+          - { nextcloud: '35', php: '8.5', postgres: '18', psalm: false }
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -56,9 +57,33 @@ jobs:
         run: composer psalm
       - name: Coding standard (nextcloud/coding-standard)
         # Same result on every matrix entry, so checked once.
-        if: matrix.nextcloud == '35' && matrix.php == '8.3'
+        if: matrix.nextcloud == '35' && matrix.php == '8.3' && matrix.postgres == '17'
         run: composer cs:check
       - name: Integration tests
         env:
           FTSPG_TEST_DSN: 'pgsql:host=127.0.0.1;port=5432;dbname=fts_test;user=postgres;password=postgres'
         run: composer test
+
+  package:
+    name: AppStore packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+      - name: Build AppStore package
+        run: make appstore
+      - name: Validate package contents
+        run: |
+          archive="build/artifacts/appstore/fulltextsearch_pgsql.tar.gz"
+          test -f "$archive" || { echo "FAIL: Archive $archive not found"; exit 1; }
+          contents=$(tar -tzf "$archive")
+          echo "$contents" | grep -q '^fulltextsearch_pgsql/appinfo/info\.xml$' || { echo "FAIL: Missing appinfo/info.xml in archive"; exit 1; }
+          echo "$contents" | grep -q '^fulltextsearch_pgsql/lib/Vendor/Smalot/PdfParser/Parser\.php$' || { echo "FAIL: Missing lib/Vendor/Smalot/PdfParser/Parser.php in archive"; exit 1; }
+          if echo "$contents" | grep -E '^fulltextsearch_pgsql/(tests/|vendor/|\.github/)'; then
+            echo "FAIL: Archive contains forbidden test/dev directories (tests/, vendor/, or .github/)"
+            exit 1
+          fi
+          echo "ok: AppStore package archive validation passed"

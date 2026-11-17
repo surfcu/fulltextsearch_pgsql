@@ -203,7 +203,7 @@ class TsQueryBuilder {
 
 	/** @return list<array<int, string>> regex matches: [1] phrase operator, [2] phrase, [3] word operator, [4] word */
 	private function tokenize(string $search, string $language): array {
-		$search = mb_scrub($search, 'UTF-8');
+		$search = str_replace("\0", '', mb_scrub($search, 'UTF-8'));
 		if ($language === 'turkish') {
 			// Same dotted/dotless I mapping as the indexed text (see SchemaService::normalized()).
 			$search = strtr($search, ['I' => 'ı', 'İ' => 'i']);

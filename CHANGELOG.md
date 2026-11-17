@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Search timeout setting (`search_timeout`, default 10 seconds, 0 to 300) in administration settings and CLI, cancelling long-running search statements transaction-locally and flagging the result as timed out.
+- Synthetic benchmark harness (`tests/bench/run.php`) measuring search throughput and planning costs against a 100,000-document corpus.
+- Query fuzzing suite in `tests/run.php` verifying robust query compilation across >= 2,500 random operator and Unicode permutations without SQL errors.
+- PostgreSQL 18 added to CI integration and live Nextcloud test matrices.
+- CI App Store packaging job verifying archive structure, namespace bundling, and exclusion of test/dev directories.
+- Live test coverage for file sharing access lifecycle (admin shares with user, re-index, user finds file, unshare, re-index, user no longer finds file).
+- Dependabot configuration for automated Composer and GitHub Actions updates.
+- Gitattributes marking Office fixtures (`*.doc`, `*.xls`, `*.ppt`) and images (`*.png`) as binary.
+
+### Changed
+- Minimum supported Nextcloud version set to 30 (was 29) and PostgreSQL to 13 (was 12) in `appinfo/info.xml`.
+- Live test log inspection catches Nextcloud log warnings (levels 2–4).
+- Committed `composer.lock` for reproducible App Store builds.
+
+### Fixed
+- Regular expression filter hardening: reject backreferences, quantifiers exceeding PostgreSQL repetition bounds, NUL bytes, and invalid UTF-8 byte sequences without search errors.
+- Atomic transaction-local trigram similarity threshold in search planning without post-execution resets interfering with aborted transactions.
+- Preserve angle brackets in plain text and prevent word fusion across HTML block tags. Re-indexing of text files is needed to benefit.
+- Safe upsert retry and size caps: restrict degradation strictly to tsvector limits (SQLSTATE 54000) with savepoint isolation in transactions, gracefully degrade oversized documents in five bounded steps, enforce pre-flight size limits on parts and tags, and sanitize NUL bytes from metadata.
+- Preserve stored content and parts when an already-indexed document is refreshed with `INDEX_OK` only (such as after `occ files:scan` when `files_fulltextsearch` omits unchanged file bytes).
+- Restrict pdftotext_path configuration to CLI/occ with strict binary name, executable, and version validation, removing editable path from admin web settings and rejecting web updates with HTTP 400.
+- Validate language and max_results settings when read: drop uninstalled text search configurations with a warning, fall back to simple if none remain, clamp max_results to 1..10000, eliminate spurious language change notices on extra language order differences, and expose database locale case-folding diagnostics.
+
 ## [1.4.2] - 2026-11-03
 
 First release on the Nextcloud App Store. The app itself is unchanged from 1.4.1.

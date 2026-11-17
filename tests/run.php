@@ -14,6 +14,7 @@ namespace OCA\FullTextSearch_PgSql\Tests;
 
 use OC\FullTextSearch\Model\DocumentAccess;
 use OC\FullTextSearch\Model\IndexDocument;
+use OCA\FullTextSearch_PgSql\Controller\SettingsController;
 use OCA\FullTextSearch_PgSql\Migration\CreateIndexTable;
 use OCA\FullTextSearch_PgSql\Platform\PostgreSQLPlatform;
 use OCA\FullTextSearch_PgSql\Service\ConfigService;
@@ -22,19 +23,24 @@ use OCA\FullTextSearch_PgSql\Service\IndexService;
 use OCA\FullTextSearch_PgSql\Service\LanguageDetector;
 use OCA\FullTextSearch_PgSql\Service\SchemaService;
 use OCA\FullTextSearch_PgSql\Service\SearchService;
+use OCA\FullTextSearch_PgSql\Service\StatusService;
 use OCA\FullTextSearch_PgSql\Service\TsQueryBuilder;
 use OCA\FullTextSearch_PgSql\Service\VocabularyService;
+use OCP\AppFramework\Http;
 use OCP\FullTextSearch\IFullTextSearchProvider;
 use OCP\FullTextSearch\Model\IIndex;
 use OCP\FullTextSearch\Model\IIndexDocument;
 use OCP\FullTextSearch\Model\IRunner;
 use OCP\FullTextSearch\Model\ISearchRequest;
 use OCP\FullTextSearch\Model\ISearchResult;
+use OCP\IRequest;
 use PDO;
 use Throwable;
 use ZipArchive;
 
 require __DIR__ . '/bootstrap.php';
+
+ini_set('memory_limit', '512M');
 
 // Any warning, notice or deprecation raised from the app's own code fails the run. This is
 // what makes the PHP 8.4/8.5 CI jobs meaningful. Errors silenced with @ are ignored.
@@ -117,6 +123,7 @@ function doc(string $id, string $owner, string $title, string $content, array $s
 function search(PostgreSQLPlatform $platform, string $viewer, string $q, array $opts = []): array {
 	$docs = [];
 	$total = -1;
+	$timedOut = false;
 	$request = double(ISearchRequest::class, [
 		'getSearch' => $q,
 		'getSize' => $opts['size'] ?? 20,
@@ -138,13 +145,20 @@ function search(PostgreSQLPlatform $platform, string $viewer, string $q, array $
 		'setTotal' => function (int $t) use (&$total) {
 			$total = $t;
 		},
+		'setTimedOut' => function (bool $t) use (&$timedOut) {
+			$timedOut = $t;
+		},
+		'setTime' => function (int $t) {
+		},
+		'setMaxScore' => function (float $s) {
+		},
 	]);
 	$access = new DocumentAccess();
 	$access->setViewerId($viewer);
 	$access->setGroups($opts['groups'] ?? []);
 	$access->setCircles($opts['circles'] ?? []);
 	$platform->searchRequest($result, $access);
-	return ['ids' => array_map(fn ($d) => $d->getId(), $docs), 'total' => $total, 'docs' => $docs];
+	return ['ids' => array_map(fn ($d) => $d->getId(), $docs), 'total' => $total, 'docs' => $docs, 'timedOut' => $timedOut];
 }
 
 function sorted(array $a): array {
@@ -232,11 +246,205 @@ try {
 		search($platform, 'alice', $nasty);
 	}
 	check($schema->tableExists(), 'hostile queries do not error or inject');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "bud\0get")['ids']), 'NUL byte inside search word is stripped');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "+bud\0get")['ids']), 'NUL byte inside required search word is stripped');
+	same([], search($platform, 'alice', "foo\0bar")['ids'], 'NUL byte inside unmatched search word does not throw 42601');
+	same([], search($platform, 'alice', "+foo\0bar")['ids'], 'NUL byte inside required unmatched word does not throw 42601');
+	same(['Q1', 'Q3'], sorted(search($platform, 'alice', "budget -foo\0bar")['ids']), 'NUL byte inside excluded word does not throw 42601');
+	same(['Q1'], search($platform, 'alice', "\"bud\0get review\"")['ids'], 'NUL byte inside phrase is stripped');
 	same(['Q1', 'Q3'], search($platform, 'alice', '(budget), review!')['ids'], 'edge punctuation ignored; doc with both words first');
 	same(['Q1'], search($platform, 'alice', '+budget +review')['ids'], '+ makes words required');
 	same(['Q1'], search($platform, 'alice', '+budg +revi')['ids'], 'required words still match as prefixes');
 	same(['Q3'], search($platform, 'alice', '+budget -review')['ids'], 'required plus exclusion');
 	same(['Q1', 'Q3'], sorted(search($platform, 'alice', 'budget -revi')['ids']), 'exclusions are exact words, not prefixes');
+
+	section('query syntax fuzzer (2,500 queries)');
+	// Deterministic seedable LCG: 100% reproducible across all PHP 8.1-8.5 environments.
+	$fuzzSeed = 1337;
+	$fuzzRand = static function (int $min = 0, int $max = 1) use (&$fuzzSeed): int {
+		$fuzzSeed = ($fuzzSeed * 1103515245 + 12345) & 0x7FFFFFFF;
+		return $min + ($fuzzSeed % ($max - $min + 1));
+	};
+	$fuzzChoice = static function (array $items) use (&$fuzzRand): mixed {
+		return $items[$fuzzRand(0, count($items) - 1)];
+	};
+
+	// Atom dictionaries covering English, Turkish diacritics, numbers, punctuation, and Unicode
+	$fuzzWords = [
+		'budget', 'review', 'marketing', 'plan', 'notes', 'meeting', 'report', 'annual', 'spring', 'spend',
+		'the', 'of', 'and', 'to', 'a', 'in', 'that', 'is', 'for', 'with',
+		'çalışma', 'İpek', 'ISPARTA', 'ışık', 'Isparta', 'İstanbul', 'bütçe', 'öğrenci', 'sözleşmesi', 'GÜLLERİ', 'şeker',
+		'café', 'naïve', 'über', 'résumé', 'тест', 'δοκιμή', '日本語', 'العربية', '🚀',
+		'2025', '4711', 'v2', 'IMG2025', 'doc123', '0x1a', 'Q1', 'N1',
+		"o'brien", 'e-mail', 'final.pdf', 'rapor_2025', 'user@example.com', 'example.com',
+		'a', 'x', 'z', str_repeat('a', 120), str_repeat('w', 250),
+	];
+	$fuzzPrefixes = ['', '', '+', '-', '!', '~', '&', '|'];
+	$fuzzSuffixes = ['', '', '*', ':*', ':*A', ':*D', '?', '%', '_', ':', '!', '?'];
+	$fuzzInfixes = [' ', '  ', "\t", ' OR ', ' AND ', ' NOT ', ' | ', ' & ', ' <-> ', ' <1> ', ' <2> ', ', ', '; ', ' / ', ' \\ '];
+	$fuzzProbes = [
+		"'); DROP TABLE ftspg_oc_index; --",
+		"'; DROP TABLE ftspg_oc_words; --",
+		"' OR '1'='1",
+		"' OR 1=1 --",
+		"admin'--",
+		'" OR ""="',
+		"' UNION SELECT null, null, null--",
+		'/* comment */',
+		'/* unclosed comment',
+		'-- single line comment',
+		'<!-- xml comment -->',
+		'CAST(? AS regconfig)',
+		"to_tsquery('simple', 'x')",
+		'$$quoted$$',
+		"\0",
+		'nul-byte',
+		"\xff\xfe broken utf8",
+		"\xC3\x28",
+		'\\\\',
+		"'",
+		"''",
+		"'''",
+		"''''",
+		'a & | ! :* <-> (',
+		'::::',
+		'* * *',
+		'+ + +',
+		'- - -',
+		'OR OR OR',
+		'AND AND AND',
+		'NOT NOT NOT',
+	];
+
+	// Generator building 2,500 queries across 5 distinct structural categories
+	$generateFuzzQuery = static function (int $idx) use (&$fuzzRand, &$fuzzChoice, $fuzzWords, $fuzzPrefixes, $fuzzSuffixes, $fuzzInfixes, $fuzzProbes): string {
+		// Category 1: Baseline Hand-crafted & Edge-case Torture Corpus (0..99)
+		if ($idx < count($fuzzProbes)) {
+			return $fuzzProbes[$idx];
+		}
+		if ($idx < 100) {
+			$edgePatterns = [
+				'""', '"', '"""', "''''", '()', '(()', '())', '((()))', '[,]', '{;}',
+				'+ + - -', 'OR AND NOT', ':::*:::*', '***', '???', '%%%',
+				'"unclosed phrase with budget', 'unclosed" phrase with review',
+				'+budget -budget', '"budget review" -budget', '+(budget review)',
+				'çalışma OR "İstanbul ofisi" -bütçe', 'İSTANBUL & ışık | ISPARTA',
+				str_repeat('word ', 40),
+				str_repeat('a', 120) . ' ' . str_repeat('b', 120),
+			];
+			return $edgePatterns[$idx % count($edgePatterns)];
+		}
+
+		// Category 2: Single-Clause Mutational Fuzzing (100..599)
+		if ($idx < 600) {
+			$word = $fuzzChoice($fuzzWords);
+			$prefix = $fuzzChoice($fuzzPrefixes);
+			$suffix = $fuzzChoice($fuzzSuffixes);
+			$clause = $prefix . $word . $suffix;
+			$wrapMode = $fuzzRand(0, 5);
+			return match ($wrapMode) {
+				1 => '(' . $clause . ')',
+				2 => '(' . $clause,
+				3 => '"' . $clause . '"',
+				4 => '"' . $clause,
+				default => $clause,
+			};
+		}
+
+		// Category 3: Multi-Clause Boolean & Phrase Fuzzing (600..1599)
+		if ($idx < 1600) {
+			$clauseCount = $fuzzRand(2, 6);
+			$parts = [];
+			for ($c = 0; $c < $clauseCount; $c++) {
+				$isPhrase = ($fuzzRand(0, 4) === 0);
+				if ($isPhrase) {
+					$w1 = $fuzzChoice($fuzzWords);
+					$w2 = $fuzzChoice($fuzzWords);
+					$pPrefix = $fuzzChoice(['', '+', '-']);
+					$closed = ($fuzzRand(0, 5) !== 0);
+					$parts[] = $pPrefix . '"' . $w1 . ' ' . $w2 . ($closed ? '"' : '');
+				} else {
+					$parts[] = $fuzzChoice($fuzzPrefixes) . $fuzzChoice($fuzzWords) . $fuzzChoice($fuzzSuffixes);
+				}
+			}
+			$res = '';
+			foreach ($parts as $pIdx => $part) {
+				$res .= ($pIdx === 0 ? '' : $fuzzChoice($fuzzInfixes)) . $part;
+			}
+			return $res;
+		}
+
+		// Category 4: Hostile SQL Injection & Operator Bombardment (1600..2099)
+		if ($idx < 2100) {
+			$probe = $fuzzChoice($fuzzProbes);
+			$word = $fuzzChoice($fuzzWords);
+			$layout = $fuzzRand(0, 4);
+			return match ($layout) {
+				0 => $probe . ' ' . $word,
+				1 => $word . ' ' . $probe,
+				2 => '"' . $word . ' ' . $probe . '"',
+				3 => '(' . $probe . ') OR ' . $word,
+				default => $probe . ' ' . $probe . ' ' . $word,
+			};
+		}
+
+		// Category 5: Turkish, Diacritic & Mixed Unicode Permutations (2100..2499)
+		$turkishPool = ['çalışma', 'İpek', 'ISPARTA', 'ışık', 'Isparta', 'İstanbul', 'bütçe', 'öğrenci', 'sözleşmesi', 'GÜLLERİ', 'şeker'];
+		$intlPool = ['café', 'naïve', 'über', 'тест', 'δοκιμή', '日本語', 'العربية', '🚀'];
+		$tWord1 = $fuzzChoice($turkishPool);
+		$tWord2 = $fuzzChoice($turkishPool);
+		$iWord = $fuzzChoice($intlPool);
+		$op = $fuzzChoice([' OR ', ' AND ', ' ', ' +', ' -']);
+		return $tWord1 . $op . $tWord2 . ($fuzzRand(0, 1) ? ' ' . $iWord : '');
+	};
+
+	$fuzzErrors = [];
+	$fuzzTotal = 2500;
+	$fuzzStart = microtime(true);
+
+	// Execute across English (1,500 queries) and Turkish (1,000 queries) configurations
+	$fuzzLangs = [
+		['lang' => 'english', 'count' => 1500],
+		['lang' => 'turkish', 'count' => 1000],
+	];
+
+	$fuzzIndex = 0;
+	foreach ($fuzzLangs as $fl) {
+		$config->setConfig(['language' => $fl['lang']]);
+		for ($i = 0; $i < $fl['count']; $i++) {
+			$q = $generateFuzzQuery($fuzzIndex++);
+			try {
+				$res = search($platform, 'alice', $q);
+				if (!is_array($res) || !isset($res['total']) || !is_int($res['total']) || $res['total'] < 0) {
+					$fuzzErrors[] = [
+						'index' => $fuzzIndex - 1,
+						'query' => $q,
+						'lang' => $fl['lang'],
+						'error' => 'Malformed result array',
+					];
+				}
+			} catch (Throwable $e) {
+				$fuzzErrors[] = [
+					'index' => $fuzzIndex - 1,
+					'query' => $q,
+					'lang' => $fl['lang'],
+					'error' => get_class($e) . ': ' . $e->getMessage(),
+				];
+				if (count($fuzzErrors) >= 20) {
+					break 2; // Safeguard against cascading connection collapse
+				}
+			}
+		}
+	}
+
+	// Restore test state & release memory accumulated in PDO mock
+	$config->setConfig(['language' => 'english']);
+	$conn->log = [];
+	$conn->statements = [];
+	$fuzzDuration = microtime(true) - $fuzzStart;
+
+	check($schema->tableExists(), 'table still exists after fuzzer (no injection succeeded)');
+	same([], $fuzzErrors, sprintf('fuzzer: %d varied queries executed with zero unhandled SQL exceptions (took %.2fs)', $fuzzIndex, $fuzzDuration));
 
 	section('typo tolerance');
 	same(['Q2', 'Q1'], search($platform, 'alice', 'markting plann')['ids'], 'typos corrected; the document with both words first');
@@ -279,6 +487,90 @@ try {
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '.*\.p(df']]]])['ids'], 'an invalid regex matches nothing instead of failing the search');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '.*\.pdf++']]]])['ids'], 'constructs PostgreSQL reads differently match nothing');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '\bplan.*']]]])['ids'], '\\b (a word boundary in PCRE, a backspace in PostgreSQL) matches nothing');
+	$startT = microtime(true);
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '(a)\1.*']]]])['ids'], 'backreference regex filter returns nothing');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '(?<g>a)\k<g>.*']]]])['ids'], 'named backreference \\k regex filter returns nothing');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '(a)\g1.*']]]])['ids'], 'backreference \\g regex filter returns nothing');
+	check(microtime(true) - $startT < 1.0, 'backreference regex filter returns in under a second');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => 'a{300}.*']]]])['ids'], 'repetition quantifier exceeding 255 returns nothing without SQL error');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => 'a{1,300}.*']]]])['ids'], 'repetition range quantifier exceeding 255 returns nothing without SQL error');
+	foreach ([
+		'quantified lookahead *' => '(?=a)*.*',
+		'quantified lookahead +' => '(?=a)+.*',
+		'quantified lookahead ?' => '(?=a)?.*',
+		'quantified lookahead {1,2}' => '(?=a){1,2}.*',
+		'quantified negative lookahead *' => '(?!b)*.*',
+		'quantified negative lookahead +' => '(?!b)+.*',
+		'quantified negative lookahead ?' => '(?!b)?.*',
+		'quantified negative lookahead {1,2}' => '(?!b){1,2}.*',
+		'quantified nested lookahead' => '(?=(a|b))+.*',
+		'PCRE control verb UTF8' => '(*UTF8).*',
+		'PCRE control verb ANYCRLF' => '(*ANYCRLF).*',
+		'PCRE control verb FAIL' => '(*FAIL).*',
+		'stacked repetitions (a{255}){255}' => '(a{255}){255}',
+		'stacked repetitions (?:a{255}){255}' => '(?:a{255}){255}',
+		'stacked repetitions (a{200}){200}' => '(a{200}){200}',
+		'PCRE \\p{L}' => '\p{L}.*',
+		'PCRE \\P{N}' => '\P{N}.*',
+		'PCRE \\x{0}' => '\x{0}.*',
+		'PCRE \\x{41}' => '\x{41}.*',
+		'PCRE \\o{101}' => '\o{101}.*',
+		'PCRE \\C' => '\C.*',
+		'PCRE \\N{U+0041}' => '\N{U+0041}.*',
+		'PCRE \\p{L} in class' => '[\p{L}].*',
+		'PCRE \\P{N} in class' => '[\P{N}].*',
+		'PCRE \\x{0} in class' => '[\x{0}].*',
+		'PCRE \\x{41} in class' => '[\x{41}].*',
+		'PCRE \\o{101} in class' => '[\o{101}].*',
+		'PCRE \\C in class' => '[\C].*',
+		'PCRE \\N{U+0041} in class' => '[\N{U+0041}].*',
+	] as $label => $badRegex) {
+		same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => $badRegex]]]])['ids'], "unportable regex rejected without SQL error ($label)");
+	}
+	same(['E1', 'E2'], sorted(search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '(?=.*plan).*\.pdf']]]])['ids']), 'unquantified lookahead regex remains portable');
+	same(['E1', 'E2'], sorted(search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => '[[:alpha:]]+\s+\d+\x2e(?:pdf|PDF)']]]])['ids']), 'POSIX class and \\xHH escape remain portable');
+	// Fallback catch for SQLSTATE 2201B in SearchService::searchRequest()
+	$regexErrProxy = new class($conn) implements \OCP\IDBConnection {
+		public function __construct(
+			private \OCP\IDBConnection $inner,
+		) {
+		}
+		public function executeStatement($sql, array $params = [], array $types = []): int {
+			return $this->inner->executeStatement($sql, $params, $types);
+		}
+		public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+			if (str_contains($sql, 'WITH q AS') || str_contains($sql, 'EXPLAIN (FORMAT JSON)')) {
+				$e = new \PDOException('SQLSTATE[2201B]: Invalid regular expression: regular expression is too complex', 2201);
+				$e->errorInfo = ['2201B', 7, 'invalid regular expression: regular expression is too complex'];
+				throw $e;
+			}
+			return $this->inner->executeQuery($sql, $params, $types);
+		}
+		public function inTransaction(): bool {
+			return $this->inner->inTransaction();
+		}
+		public function beginTransaction(): void {
+			$this->inner->beginTransaction();
+		}
+		public function commit(): void {
+			$this->inner->commit();
+		}
+		public function rollBack(): void {
+			$this->inner->rollBack();
+		}
+		public function getDatabaseProvider(): string {
+			return $this->inner->getDatabaseProvider();
+		}
+	};
+	$regexErrSearch = new SearchService($regexErrProxy, $schema, $config, new TsQueryBuilder(), $vocabulary);
+	$regexErrPlatform = new PostgreSQLPlatform($config, $schema, $indexService, $regexErrSearch, $logger, $extractor);
+	$regexErrRes = search($regexErrPlatform, 'alice', 'harbour', $f);
+	same(0, $regexErrRes['total'], 'SQLSTATE 2201B in searchRequest returns total 0 instead of throwing');
+	same(false, $regexErrRes['timedOut'], 'SQLSTATE 2201B does not set timedOut');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => "plan\0pdf.*"]]]])['ids'], 'pattern with NUL byte is safely skipped');
+	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['title' => "plan\xff\xfepdf.*"]]]])['ids'], 'pattern with invalid UTF-8 is safely skipped');
+	same([], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => "plan\0*"]]]])['ids'], 'wildcard with NUL byte is safely skipped');
+	same([], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => "plan\xff\xfe*"]]]])['ids'], 'wildcard with invalid UTF-8 is safely skipped');
 	same([], search($platform, 'alice', 'harbour', $f + ['regex' => [[['owner' => '.*']]]])['ids'], 'a field without a column matches nothing');
 	same(['E3'], search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => '*.odt']]]])['ids'], 'wildcard filter');
 	same(['E1', 'E2', 'E3'], sorted(search($platform, 'alice', 'harbour', $f + ['wildcard' => [[['title' => 'plan 202?.*']]]])['ids']), '? matches one character, case ignored');
@@ -366,6 +658,131 @@ try {
 	$pptx = $makeZip(['ppt/slides/slide1.xml' => '<p:sld><a:t>Armadillo</a:t></p:sld>', 'ppt/slides/slide2.xml' => '<p:sld><a:t>Pangolin</a:t></p:sld>']);
 	$platform->indexDocument(doc('T5', 'alice', 'deck.pptx', $b64($pptx), ['encoded' => IIndexDocument::ENCODED_BASE64]));
 	same(['T5'], search($platform, 'alice', 'pangolin')['ids'], 'pptx slides extracted');
+
+	section('smart markup stripping and tag spacing (B2)');
+
+	// 1. Direct unit verification of looksLikeMarkup()
+	same(false, $extractor->looksLikeMarkup('Plain text without markup'), 'plain text without markup is false');
+	same(false, $extractor->looksLikeMarkup('Contact <john.doe@example.com> for info', 'notes.txt'), 'email in txt file is not markup');
+	same(false, $extractor->looksLikeMarkup('Map<String, Integer> mapping;', 'App.java'), 'generics in code file is not markup');
+	same(false, $extractor->looksLikeMarkup('Condition a < b and c > d holds', 'test.py'), 'inequalities in code file is not markup');
+	same(true, $extractor->looksLikeMarkup("<!DOCTYPE html>\n<html><body>Hi</body></html>"), 'starts with <!DOCTYPE html>');
+	same(true, $extractor->looksLikeMarkup("   \t\r\n<!doctype html>"), 'starts with <!doctype (case-insensitive + leading whitespace)');
+	same(true, $extractor->looksLikeMarkup("\xEF\xBB\xBF<!DOCTYPE html>"), 'starts with <!DOCTYPE after UTF-8 BOM');
+	same(true, $extractor->looksLikeMarkup('<html lang="en"><body>Hello</body></html>'), 'starts with <html');
+	same(true, $extractor->looksLikeMarkup('<?xml version="1.0" encoding="UTF-8"?><root/>'), 'starts with <?xml');
+	same(true, $extractor->looksLikeMarkup('<svg xmlns="http://www.w3.org/2000/svg"><text>Hi</text></svg>'), 'starts with <svg');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'index.html'), 'title ends in .html');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'PAGE.HTM'), 'title ends in .HTM (case-insensitive)');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'doc.xhtml'), 'title ends in .xhtml');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'data.xml'), 'title ends in .xml');
+	same(true, $extractor->looksLikeMarkup('Just a fragment', 'icon.svg'), 'title ends in .svg');
+	same(false, $extractor->looksLikeMarkup('<p>paragraph</p>', 'notes.txt', false), 'internal tags with unencoded=false and .txt title is false');
+	same(true, $extractor->looksLikeMarkup('<p>paragraph</p>', 'snippet', true), 'unencoded=true detects </p>');
+	same(true, $extractor->looksLikeMarkup('<div>division</div>', 'snippet', true), 'unencoded=true detects </div>');
+	same(true, $extractor->looksLikeMarkup('<span>text</span>', 'snippet', true), 'unencoded=true detects </span>');
+	same(true, $extractor->looksLikeMarkup('<a href="#">link</a>', 'snippet', true), 'unencoded=true detects </a>');
+	same(true, $extractor->looksLikeMarkup('<li>item</li>', 'snippet', true), 'unencoded=true detects </li>');
+	same(true, $extractor->looksLikeMarkup('<td>cell</td>', 'snippet', true), 'unencoded=true detects </td>');
+	same(true, $extractor->looksLikeMarkup('Line1<br>Line2', 'snippet', true), 'unencoded=true detects <br>');
+	same(true, $extractor->looksLikeMarkup('Line1<br/>Line2', 'snippet', true), 'unencoded=true detects <br/>');
+	same(true, $extractor->looksLikeMarkup('Line1<br />Line2', 'snippet', true), 'unencoded=true detects <br />');
+	same(false, $extractor->looksLikeMarkup('Reach <user@example.com>', 'comment', true), 'unencoded=true ignores angle brackets without closing tags');
+
+	// 2. Direct unit verification of clean()
+	same('hello world', $extractor->clean('hello world'), 'clean() preserves text');
+	same('Contact <john.doe@example.com>', $extractor->clean('Contact <john.doe@example.com>'), 'clean() preserves email by default');
+	same('Map<String, Integer>', $extractor->clean('Map<String, Integer>'), 'clean() preserves generic types by default');
+	same('a < b and c > d', $extractor->clean('a < b and c > d'), 'clean() preserves inequalities by default');
+	same('First Second', $extractor->clean('<p>First</p><p>Second</p>', true), 'clean() with stripMarkup=true separates block tags with space');
+	same('Heading Content', $extractor->clean('<h2>Heading</h2><p>Content</p>', true), 'clean() separates heading and paragraph');
+	same('Item 1 Item 2', $extractor->clean('<li>Item 1</li><li>Item 2</li>', true), 'clean() separates list items');
+	same('Cell A Cell B', $extractor->clean('<td>Cell A</td><td>Cell B</td>', true), 'clean() separates table cells');
+	same('Line 1 Line 2', $extractor->clean('Line 1<br>Line 2', true), 'clean() separates br tags');
+	same('Line 1 Line 2', $extractor->clean('Line 1<br/>Line 2', true), 'clean() separates br/ tags');
+	same('unbelievable', $extractor->clean('un<b>believable</b>', true), 'clean() strips inline tags without spaces: unbelievable');
+	same('supercalifragilistic', $extractor->clean('super<i>cali</i>fragilistic', true), 'clean() strips inline tags without spaces: italic');
+	same('refactoring', $extractor->clean('re<span>factor</span>ing', true), 'clean() strips inline tags without spaces: span');
+	same('stronghold', $extractor->clean('strong<strong>hold</strong>', true), 'clean() strips inline tags without spaces: strong');
+	same('R&D <draft>', $extractor->clean('R&amp;D &lt;draft&gt;', true), 'clean() decodes entities after tag stripping');
+
+	// 3. E2E: Plain text file preserves angle brackets in indexing and search
+	$plainContent = "Contact <john.doe@example.com> or visit <https://nextcloud.com/docs>.\nIn Java use Map<String, Integer> when a < b and c > d.";
+	$platform->indexDocument(doc('B2_PLAIN', 'alice', 'developer-guide.txt', $b64($plainContent), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_PLAIN'], search($platform, 'alice', 'john.doe@example.com')['ids'], 'plain text search finds email inside angle brackets');
+	same(['B2_PLAIN'], search($platform, 'alice', 'nextcloud.com')['ids'], 'plain text search finds url inside angle brackets');
+	same(['B2_PLAIN'], search($platform, 'alice', 'Integer')['ids'], 'plain text search finds generic parameter Integer');
+	same(['B2_PLAIN'], search($platform, 'alice', 'String')['ids'], 'plain text search finds generic parameter String');
+	$storedPlain = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B2_PLAIN'")->fetchOne();
+	check(str_contains($storedPlain, '<john.doe@example.com>'), 'stored content preserves <john.doe@example.com>');
+	check(str_contains($storedPlain, '<https://nextcloud.com/docs>'), 'stored content preserves <https://...>');
+	check(str_contains($storedPlain, 'Map<String, Integer>'), 'stored content preserves Map<String, Integer>');
+	check(str_contains($storedPlain, 'a < b and c > d'), 'stored content preserves a < b and c > d');
+
+	// 4. E2E: Genuine HTML/XML/SVG files have markup cleanly stripped
+	$htmlDoc = "<!DOCTYPE html>\n<html><head><title>Annual</title></head><body><h1>Quarterly Report</h1><p>Financial results exceeded all expectations.</p></body></html>";
+	$platform->indexDocument(doc('B2_HTML_DOC', 'alice', 'report.txt', $b64($htmlDoc), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_HTML_DOC'], search($platform, 'alice', 'expectations')['ids'], 'html with DOCTYPE indexes body text');
+	same(['B2_HTML_DOC'], search($platform, 'alice', '"Quarterly Report"')['ids'], 'html with DOCTYPE keeps heading words');
+	same([], search($platform, 'alice', 'DOCTYPE')['ids'], 'DOCTYPE tag is stripped and not searchable');
+	same([], search($platform, 'alice', 'body')['ids'], 'body tag is stripped and not searchable');
+
+	$svgDoc = '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><text x="20" y="40">Vector diagram caption</text></svg>';
+	$platform->indexDocument(doc('B2_SVG', 'alice', 'graphic.txt', $b64($svgDoc), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_SVG'], search($platform, 'alice', 'caption')['ids'], 'svg text element is indexed');
+
+	$xmlDoc = '<?xml version="1.0" encoding="UTF-8"?><catalog><item><title>Ceramic</title><description>Handcrafted pottery vase</description></item></catalog>';
+	$platform->indexDocument(doc('B2_XML', 'alice', 'catalog.txt', $b64($xmlDoc), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_XML'], search($platform, 'alice', 'pottery')['ids'], 'xml item description is indexed');
+
+	$extHtml = '<div class="content"><h3>System Diagnostics</h3><p>All background services operational.</p></div>';
+	$platform->indexDocument(doc('B2_EXT_HTML', 'alice', 'status.HTML', $b64($extHtml), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_EXT_HTML'], search($platform, 'alice', 'operational')['ids'], 'file with .HTML extension strips markup');
+
+	// 5. E2E: Unencoded HTML fragment has tags cleanly stripped
+	$unencodedFragment = '<p>First line of unencoded notes.</p><br><p>Second line with important action points.</p>';
+	$platform->indexDocument(doc('B2_UNENC', 'alice', 'notes', $unencodedFragment, ['encoded' => IIndexDocument::NOT_ENCODED]));
+	same(['B2_UNENC'], search($platform, 'alice', '"unencoded notes"')['ids'], 'unencoded fragment indexes text');
+	same(['B2_UNENC'], search($platform, 'alice', '"action points"')['ids'], 'unencoded fragment indexes second paragraph');
+
+	// 6. E2E: Block tags spacing prevents word fusion
+	$blockHtml = '<p>FirstParagraph</p><p>SecondParagraph</p><div>DivisionAlpha</div><div>DivisionBeta</div>';
+	$platform->indexDocument(doc('B2_BLOCK', 'alice', 'blocks.html', $b64($blockHtml), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_BLOCK'], search($platform, 'alice', '"FirstParagraph SecondParagraph"')['ids'], 'block tags separated with whitespace');
+	same(['B2_BLOCK'], search($platform, 'alice', '"DivisionAlpha DivisionBeta"')['ids'], 'div blocks separated with whitespace');
+	same([], search($platform, 'alice', 'FirstParagraphSecondParagraph')['ids'], 'block tags do not fuse words together');
+	$storedBlock = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B2_BLOCK'")->fetchOne();
+	check(!str_contains($storedBlock, 'FirstParagraphSecondParagraph'), 'stored content has no word fusion');
+	check(str_contains($storedBlock, 'FirstParagraph SecondParagraph'), 'stored content has space between paragraphs');
+
+	// 7. E2E: Inline tags do not split words with spaces
+	$inlineHtml = '<p>This is un<b>believable</b> and super<i>cali</i>fragilistic and re<span>factor</span>ing a strong<strong>hold</strong>.</p>';
+	$platform->indexDocument(doc('B2_INLINE', 'alice', 'inline.html', $b64($inlineHtml), ['encoded' => IIndexDocument::ENCODED_BASE64]));
+	same(['B2_INLINE'], search($platform, 'alice', 'unbelievable')['ids'], 'inline tag <b> does not split unbelievable');
+	same(['B2_INLINE'], search($platform, 'alice', 'supercalifragilistic')['ids'], 'inline tag <i> does not split supercalifragilistic');
+	same(['B2_INLINE'], search($platform, 'alice', 'refactoring')['ids'], 'inline tag <span> does not split refactoring');
+	same(['B2_INLINE'], search($platform, 'alice', 'stronghold')['ids'], 'inline tag <strong> does not split stronghold');
+	same([], search($platform, 'alice', '"un believable"')['ids'], 'inline tag does not add spaces inside word');
+
+	// 8. E2E: Parts / comments: plain text preserves angle brackets, HTML strips markup with block spaces
+	$platform->indexDocument(doc('B2_PART_TXT', 'alice', 'task.txt', '', [
+		'parts' => ['comments' => 'Assigned to <ops-team@example.com> for triage on <server-01>.'],
+	]));
+	same(['B2_PART_TXT'], search($platform, 'alice', 'ops-team@example.com')['ids'], 'plain text comment preserves email inside angle brackets');
+	$storedPartTxt = (string)$conn->executeQuery("SELECT parts_text FROM ftspg_oc_index WHERE document_id = 'B2_PART_TXT'")->fetchOne();
+	check(str_contains($storedPartTxt, '<ops-team@example.com>'), 'parts_text preserves angle-bracketed email');
+	check(str_contains($storedPartTxt, '<server-01>'), 'parts_text preserves angle-bracketed hostname');
+
+	$platform->indexDocument(doc('B2_PART_HTML', 'alice', 'review.txt', '', [
+		'parts' => ['comments' => '<p>Please review <b>promptly</b></p><p>Approval needed by EOD</p>'],
+	]));
+	same(['B2_PART_HTML'], search($platform, 'alice', 'promptly')['ids'], 'html comment indexes inline word cleanly');
+	same(['B2_PART_HTML'], search($platform, 'alice', '"promptly Approval"')['ids'], 'html comment separates paragraphs with space');
+	same([], search($platform, 'alice', 'promptlyApproval')['ids'], 'html comment does not fuse words across paragraphs');
+	$storedPartHtml = (string)$conn->executeQuery("SELECT parts_text FROM ftspg_oc_index WHERE document_id = 'B2_PART_HTML'")->fetchOne();
+	check(!str_contains($storedPartHtml, 'promptlyApproval'), 'parts_text has no word fusion in html comment');
+	check(str_contains($storedPartHtml, 'promptly Approval'), 'parts_text has whitespace between html comment paragraphs');
+	check(!str_contains($storedPartHtml, '<p>'), 'parts_text has html tags stripped');
 
 	section('office documents as Word, Excel, PowerPoint and LibreOffice write them');
 	$w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
@@ -493,8 +910,10 @@ try {
 	same('warning', $runnerLog['P2b'][0] ?? null, 'damaged xref: indexed with a warning');
 
 	// A pdftotext that is installed but fails: auto falls back to the parser and says why.
-	$brokenTool = tempnam(sys_get_temp_dir(), 'ftspg-pdftotext');
-	file_put_contents($brokenTool, "#!/bin/sh\nexit 3\n");
+	$testToolDir = sys_get_temp_dir() . '/ftspg_tool_' . mt_rand();
+	mkdir($testToolDir);
+	$brokenTool = $testToolDir . '/pdftotext';
+	file_put_contents($brokenTool, "#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.0\"; exit 0; fi\nexit 3\n");
 	chmod($brokenTool, 0755);
 	$config->setConfig(['pdf_extractor' => 'auto', 'pdftotext_path' => $brokenTool]);
 	$runnerLog = [];
@@ -513,6 +932,7 @@ try {
 	$platform->indexDocument(doc('P5', 'alice', 'missing.pdf', $b64($makePdf('Okapi')), ['encoded' => IIndexDocument::ENCODED_BASE64]));
 	check(str_contains($runnerLog['P5'][1] ?? '', 'pdftotext is selected but not found'), 'pdf_extractor=pdftotext without pdftotext: warning says so');
 	unlink($brokenTool);
+	rmdir($testToolDir);
 
 	$config->setConfig(['pdf_extractor' => 'auto', 'pdftotext_path' => '']);
 	same($hasPdfToText ? 'pdftotext' : 'pdfparser', $extractor->pdfTool(), 'auto: pdftotext preferred when installed');
@@ -576,6 +996,406 @@ try {
 	same(['S2'], search($platform, 'alice', 'vocabulary')['ids'], 'oversized document still findable by title');
 	$config->setConfig(['max_content_size' => 512000]);
 
+	section('safe upsert retry and size caps (B1)');
+
+	// -------------------------------------------------------------------------
+	// 1. Statement timeout / non-54000 exception preserves existing content
+	// -------------------------------------------------------------------------
+	$docTimeout = doc('B1_TIMEOUT', 'alice', 'Original Durable Title', 'Original durable content that must never be wiped');
+	$platform->indexDocument($docTimeout);
+	$storedOriginal = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B1_TIMEOUT'")->fetchOne();
+	same('Original durable content that must never be wiped', $storedOriginal, 'B1: document initialized with durable content');
+
+	// Create an IDBConnection proxy that intercepts upsert and simulates SQLSTATE 57014 (statement timeout)
+	$timeoutProxy = new class($conn) implements \OCP\IDBConnection {
+		public bool $simulateTimeout = false;
+		public function __construct(
+			private \OCP\IDBConnection $inner,
+		) {
+		}
+		public function executeStatement($sql, array $params = [], array $types = []): int {
+			if ($this->simulateTimeout && str_starts_with(trim($sql), 'INSERT INTO')) {
+				$e = new \PDOException('canceling statement due to statement timeout', 57014);
+				$e->errorInfo = ['57014', 57014, 'canceling statement due to statement timeout'];
+				throw $e;
+			}
+			return $this->inner->executeStatement($sql, $params, $types);
+		}
+		public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+			return $this->inner->executeQuery($sql, $params, $types);
+		}
+		public function inTransaction(): bool {
+			return $this->inner->inTransaction();
+		}
+		public function beginTransaction(): void {
+			$this->inner->beginTransaction();
+		}
+		public function commit(): void {
+			$this->inner->commit();
+		}
+		public function rollBack(): void {
+			$this->inner->rollBack();
+		}
+		public function getDatabaseProvider(): string {
+			return $this->inner->getDatabaseProvider();
+		}
+	};
+
+	$timeoutIndexService = new IndexService($timeoutProxy, $schema, $config, $extractor, $vocabulary, $logger, $detector);
+	$timeoutPlatform = new PostgreSQLPlatform($config, $schema, $timeoutIndexService, $searchService, $logger, $extractor);
+	$timeoutPlatform->setRunner(double(IRunner::class, [
+		'newIndexResult' => function (IIndex $index, string $message, string $status, int $type) use (&$runnerLog) {
+			$runnerLog[$index->getDocumentId()] = [$status, $message];
+		},
+		'newIndexError' => function (IIndex $index, string $message) use (&$runnerLog) {
+			$runnerLog[$index->getDocumentId()] = ['error', $message];
+		},
+		'updateAction' => '',
+	]));
+
+	// Re-indexing attempt with active timeout simulation
+	$timeoutProxy->simulateTimeout = true;
+	$reindexDoc = doc('B1_TIMEOUT', 'alice', 'Updated Title', 'Replacement content that aborted');
+	$indexResult = $timeoutPlatform->indexDocument($reindexDoc);
+
+	same(true, $indexResult->isStatus(IIndex::INDEX_FAILED), 'B1: statement timeout marks index status as INDEX_FAILED');
+	same('fail', $runnerLog['B1_TIMEOUT'][0] ?? '', 'B1: runner log reports fail status on statement timeout');
+	$storedAfterTimeout = (string)$conn->executeQuery("SELECT content FROM ftspg_oc_index WHERE document_id = 'B1_TIMEOUT'")->fetchOne();
+	same('Original durable content that must never be wiped', $storedAfterTimeout, 'B1: statement timeout leaves original content intact in database');
+
+	// Verify direct rethrow on IndexService::indexDocument
+	try {
+		$timeoutIndexService->indexDocument($reindexDoc);
+		check(false, 'B1: IndexService directly rethrows non-54000 exception');
+	} catch (Throwable $e) {
+		check(str_contains($e->getMessage(), 'statement timeout'), 'B1: non-54000 exception is rethrown');
+	}
+	$timeoutProxy->simulateTimeout = false;
+
+	// -------------------------------------------------------------------------
+	// 2. Stepwise degradation: content cut to half (Step 1)
+	// -------------------------------------------------------------------------
+	$config->setConfig(['max_content_size' => 1000000]);
+	mt_srand(101);
+	$halfWords = [];
+	for ($i = 0; $i < 90000; $i++) {
+		$halfWords[] = 'w' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$firstHalfMarker = $halfWords[0];
+	$secondHalfMarker = $halfWords[89999];
+	$runnerLog = [];
+	$docHalf = doc('B1_HALF', 'alice', 'Half Degradation Title', implode(' ', $halfWords));
+	$platform->indexDocument($docHalf);
+
+	same('warning', $runnerLog['B1_HALF'][0] ?? '', 'B1: oversized content degrades with warning');
+	check(str_contains($runnerLog['B1_HALF'][1] ?? '', 'half'), 'B1: warning indicates content cut to half');
+	$storedHalfLen = (int)$conn->executeQuery("SELECT octet_length(content) FROM ftspg_oc_index WHERE document_id = 'B1_HALF'")->fetchOne();
+	check($storedHalfLen > 350000 && $storedHalfLen < 550000, "B1: content cut to half (length $storedHalfLen)");
+	same(['B1_HALF'], search($platform, 'alice', $firstHalfMarker)['ids'], 'B1: first half content is searchable');
+	same([], search($platform, 'alice', $secondHalfMarker)['ids'], 'B1: second half content was cut');
+
+	// -------------------------------------------------------------------------
+	// 3. Three 500 KB parts (pre-flight cap and Step 4 degradation)
+	// -------------------------------------------------------------------------
+	mt_srand(202);
+	$partWords = [];
+	for ($i = 0; $i < 100000; $i++) {
+		$partWords[] = 'p' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$part1 = 'partonehead ' . implode(' ', array_slice($partWords, 0, 33000));
+	$part2 = 'parttwohead ' . implode(' ', array_slice($partWords, 33000, 33000));
+	$part3 = 'partthreehead ' . implode(' ', array_slice($partWords, 66000, 33000));
+
+	$runnerLog = [];
+	$docParts = doc('B1_PARTS', 'alice', 'ThreeUniqueBigPartsTitle', '', [
+		'parts' => [
+			'section1' => $part1,
+			'section2' => $part2,
+			'section3' => $part3,
+		],
+	]);
+	$platform->indexDocument($docParts);
+
+	same('warning', $runnerLog['B1_PARTS'][0] ?? '', 'B1: document with three 500 KB parts indexes with warning');
+	same(['B1_PARTS'], search($platform, 'alice', 'ThreeUniqueBigPartsTitle')['ids'], 'B1: document with large parts is findable by title');
+	same(['B1_PARTS'], search($platform, 'alice', 'partonehead')['ids'], 'B1: document with large parts is findable by initial part term');
+	$storedPartsLen = (int)$conn->executeQuery("SELECT octet_length(parts_text) FROM ftspg_oc_index WHERE document_id = 'B1_PARTS'")->fetchOne();
+	check($storedPartsLen <= 65536, "B1: parts_text capped to 64 KB (length $storedPartsLen)");
+
+	// -------------------------------------------------------------------------
+	// 4. 700 KB title (Step 5 degradation: title cut to 4,000 characters)
+	// -------------------------------------------------------------------------
+	mt_srand(303);
+	$titleWords = [];
+	for ($i = 0; $i < 70000; $i++) {
+		$titleWords[] = 't' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$hugeTitle = 'ImportantTitlePrefix ' . implode(' ', $titleWords);
+
+	$runnerLog = [];
+	$docTitle = doc('B1_TITLE', 'alice', $hugeTitle, 'uniquepayloadbody text');
+	$platform->indexDocument($docTitle);
+
+	same('warning', $runnerLog['B1_TITLE'][0] ?? '', 'B1: 700 KB title indexes with warning');
+	check(str_contains($runnerLog['B1_TITLE'][1] ?? '', 'title') || str_contains($runnerLog['B1_TITLE'][1] ?? '', '4000'), 'B1: warning notes title cut');
+	same(['B1_TITLE'], search($platform, 'alice', 'ImportantTitlePrefix')['ids'], 'B1: document findable by title prefix');
+	same(['B1_TITLE'], search($platform, 'alice', 'uniquepayloadbody')['ids'], 'B1: content of large title document is findable');
+	$storedTitleLen = (int)$conn->executeQuery("SELECT length(title) FROM ftspg_oc_index WHERE document_id = 'B1_TITLE'")->fetchOne();
+	check($storedTitleLen <= 4000, "B1: stored title capped to at most 4000 characters (length $storedTitleLen)");
+
+	// -------------------------------------------------------------------------
+	// 5. NUL byte in info keys and values (avoid SQLSTATE 22P05)
+	// -------------------------------------------------------------------------
+	$runnerLog = [];
+	$docNul = doc('B1_NUL_INFO', 'alice', 'NUL Info Title', 'body text for nul info test', [
+		'links' => ["token\0one", "token\x00two"],
+		'subtags' => ["src\0one" => "tag\0one"],
+	]);
+	$docNul->setInfo("meta\0key", "value\0with\0null");
+	$docNul->setInfoArray('nested', [
+		"sub\0key" => "deep\0value",
+		'number' => 42,
+		'flag' => true,
+	]);
+	$platform->indexDocument($docNul);
+
+	same('ok', $runnerLog['B1_NUL_INFO'][0] ?? '', 'B1: document with NUL in info indexes with ok status');
+	$row = $conn->executeQuery("SELECT info, links, subtags FROM ftspg_oc_index WHERE document_id = 'B1_NUL_INFO'")->fetch(\PDO::FETCH_ASSOC);
+	$rawInfo = (string)$row['info'];
+	check(!str_contains($rawInfo, '\u0000') && !str_contains($rawInfo, "\0"), 'B1: info jsonb has no NUL bytes');
+	$decodedInfo = json_decode($rawInfo, true);
+	same('valuewithnull', $decodedInfo['metakey'] ?? '', 'B1: info keys and string values stripped of NUL bytes');
+	same('deepvalue', $decodedInfo['nested']['subkey'] ?? '', 'B1: nested info keys and string values stripped of NUL bytes');
+	check(str_contains((string)$row['links'], 'tokenone') && str_contains((string)$row['links'], 'tokentwo') && !str_contains((string)$row['links'], "\0"), 'B1: links sanitized of NUL bytes');
+	check(str_contains((string)$row['subtags'], 'tagone') && !str_contains((string)$row['subtags'], "\0"), 'B1: subtags sanitized of NUL bytes');
+	same(['B1_NUL_INFO'], search($platform, 'alice', '"NUL Info Title"')['ids'], 'B1: document with NUL info is searchable');
+
+	// -------------------------------------------------------------------------
+	// 6. Upsert inside caller transaction with SAVEPOINT
+	// -------------------------------------------------------------------------
+	$conn->beginTransaction();
+	same(true, $conn->inTransaction(), 'B1: caller transaction started');
+
+	mt_srand(404);
+	$txWords = [];
+	for ($i = 0; $i < 90000; $i++) {
+		$txWords[] = 'tx' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$docTx = doc('B1_TX_DOC', 'alice', 'Transaction Safety Doc', implode(' ', $txWords));
+	$platform->indexDocument($docTx);
+
+	// Execute an additional statement in the same transaction to prove transaction is healthy (no 25P02)
+	$conn->executeStatement(
+		"INSERT INTO ftspg_oc_index (provider_id, document_id, owner_id, access, config, title, content)
+		 VALUES ('files', 'B1_TX_SIBLING', 'alice', '{u:alice}', 'english', 'Sibling Doc', 'sibling payload content')"
+	);
+
+	// Commit outer transaction
+	$conn->commit();
+	same(false, $conn->inTransaction(), 'B1: caller transaction committed successfully without 25P02 error');
+	same(['B1_TX_DOC'], search($platform, 'alice', '"Transaction Safety Doc"')['ids'], 'B1: degraded doc in committed transaction is findable');
+	same(['B1_TX_SIBLING'], search($platform, 'alice', '"sibling payload content"')['ids'], 'B1: sibling doc in same transaction is findable');
+
+	// Verify rollback behavior
+	$conn->beginTransaction();
+	$docRollback = doc('B1_TX_ROLLBACK', 'alice', 'Rollback Target Doc', 'content that will be rolled back');
+	$platform->indexDocument($docRollback);
+	$conn->rollBack();
+	same(false, $conn->inTransaction(), 'B1: caller transaction rolled back');
+	same([], search($platform, 'alice', '"Rollback Target Doc"')['ids'], 'B1: rolled back document is absent from index');
+
+	// -------------------------------------------------------------------------
+	// 7. Partial updates (INDEX_META / INDEX_CONTENT) under 54000 preserve parts
+	// -------------------------------------------------------------------------
+	$platform->indexDocument(doc('B1_PARTIAL_PARTS', 'alice', 'Initial Partial Title', 'initial durable content', [
+		'parts' => ['comments' => 'precious comment text'],
+	]));
+	$storedPartsBefore = (string)$conn->executeQuery("SELECT parts_text FROM ftspg_oc_index WHERE document_id = 'B1_PARTIAL_PARTS'")->fetchOne();
+	same('precious comment text', $storedPartsBefore, 'B1: partial update baseline parts_text stored');
+
+	// INDEX_META update with oversized title triggering SQLSTATE 54000 -> Step 5
+	mt_srand(505);
+	$metaTitleWords = [];
+	for ($i = 0; $i < 70000; $i++) {
+		$metaTitleWords[] = 'm' . substr(md5((string)mt_rand()), 0, 8);
+	}
+	$hugeMetaTitle = 'HugeMetaTitle ' . implode(' ', $metaTitleWords);
+	$runnerLog = [];
+	$platform->indexDocument(doc('B1_PARTIAL_PARTS', 'alice', $hugeMetaTitle, '', ['users' => ['bob']], 'files', IIndex::INDEX_META));
+	same('warning', $runnerLog['B1_PARTIAL_PARTS'][0] ?? '', 'B1: INDEX_META under 54000 degrades with warning');
+	$partialMetaRow = $conn->executeQuery("SELECT parts::text AS parts, parts_text, content FROM ftspg_oc_index WHERE document_id = 'B1_PARTIAL_PARTS'")->fetch(\PDO::FETCH_ASSOC);
+	same(['comments' => 'precious comment text'], json_decode((string)$partialMetaRow['parts'], true), 'B1: INDEX_META under 54000 preserves parts jsonb');
+	same('precious comment text', (string)$partialMetaRow['parts_text'], 'B1: INDEX_META under 54000 preserves parts_text');
+	same('initial durable content', (string)$partialMetaRow['content'], 'B1: INDEX_META under 54000 preserves content');
+	same(['B1_PARTIAL_PARTS'], search($platform, 'bob', 'precious')['ids'], 'B1: INDEX_META share grants access and existing parts remain searchable');
+
+	// INDEX_CONTENT update with oversized content + title triggering SQLSTATE 54000 -> Step 5/5b
+	$runnerLog = [];
+	$platform->indexDocument(doc('B1_PARTIAL_PARTS', 'alice', $hugeMetaTitle, 'fresh content payload', [], 'files', IIndex::INDEX_CONTENT));
+	same('warning', $runnerLog['B1_PARTIAL_PARTS'][0] ?? '', 'B1: INDEX_CONTENT under 54000 degrades with warning');
+	$partialContentRow = $conn->executeQuery("SELECT parts::text AS parts, parts_text, content FROM ftspg_oc_index WHERE document_id = 'B1_PARTIAL_PARTS'")->fetch(\PDO::FETCH_ASSOC);
+	same(['comments' => 'precious comment text'], json_decode((string)$partialContentRow['parts'], true), 'B1: INDEX_CONTENT under 54000 preserves parts jsonb');
+	same('precious comment text', (string)$partialContentRow['parts_text'], 'B1: INDEX_CONTENT under 54000 preserves parts_text');
+	same('fresh content payload', (string)$partialContentRow['content'], 'B1: INDEX_CONTENT under 54000 updates content');
+
+	$config->setConfig(['max_content_size' => 512000]);
+
+	section('pdftotext_path lockdown & validation (B3)');
+
+	// 1. Directory and non-pdftotext binaries are rejected by ConfigService::setConfig
+	try {
+		$config->setConfig(['pdftotext_path' => __DIR__]);
+		check(false, 'B3: directory rejected as pdftotext_path');
+	} catch (\InvalidArgumentException $e) {
+		check(str_contains($e->getMessage(), 'pdftotext_path'), 'B3: directory rejected as pdftotext_path');
+	}
+
+	$nonPdfBinary = PHP_BINARY ?: '/bin/sh';
+	try {
+		$config->setConfig(['pdftotext_path' => $nonPdfBinary]);
+		check(false, 'B3: binary not named pdftotext rejected by setConfig');
+	} catch (\InvalidArgumentException $e) {
+		check(str_contains($e->getMessage(), 'pdftotext'), 'B3: binary not named pdftotext rejected by setConfig');
+	}
+
+	// 2. An executable named pdftotext that does not print pdftotext on -v is rejected
+	$invalidToolDir = sys_get_temp_dir() . '/ftspg_badtool_' . mt_rand();
+	mkdir($invalidToolDir);
+	$invalidTool = $invalidToolDir . '/pdftotext';
+	file_put_contents($invalidTool, "#!/bin/sh\necho \"different-tool version 1.0\"\nexit 0\n");
+	chmod($invalidTool, 0755);
+	try {
+		$config->setConfig(['pdftotext_path' => $invalidTool]);
+		check(false, 'B3: tool without pdftotext in -v output rejected by setConfig');
+	} catch (\InvalidArgumentException $e) {
+		check(str_contains($e->getMessage(), 'pdftotext'), 'B3: tool without pdftotext in -v output rejected by setConfig');
+	} finally {
+		@unlink($invalidTool);
+		@rmdir($invalidToolDir);
+	}
+
+	// 3. A valid pdftotext executable that outputs version is accepted via ConfigService::setConfig
+	$validToolDir = sys_get_temp_dir() . '/ftspg_goodtool_' . mt_rand();
+	mkdir($validToolDir);
+	$validTool = $validToolDir . '/pdftotext';
+	file_put_contents($validTool, "#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.02.0\"; exit 0; fi\nexit 0\n");
+	chmod($validTool, 0755);
+	try {
+		$config->setConfig(['pdftotext_path' => $validTool]);
+		same($validTool, $config->getPdfToTextPath(), 'B3: valid pdftotext tool accepted via setConfig');
+	} finally {
+		$config->setConfig(['pdftotext_path' => '']);
+		@unlink($validTool);
+		@rmdir($validToolDir);
+	}
+
+	// 4. SettingsController::save rejects pdftotext_path with HTTP 400
+	$statusService = new StatusService($schema, $vocabulary, $extractor);
+	$settingsController = new SettingsController(
+		'fulltextsearch_pgsql',
+		double(IRequest::class, []),
+		$config,
+		$statusService
+	);
+	$saveResponse = $settingsController->save(['pdftotext_path' => '/usr/bin/pdftotext']);
+	same(Http::STATUS_BAD_REQUEST, $saveResponse->getStatus(), 'B3: SettingsController::save rejects pdftotext_path with HTTP 400');
+	same(
+		'pdftotext_path cannot be configured from the web interface',
+		$saveResponse->getData()['message'] ?? '',
+		'B3: rejection error message is informative'
+	);
+
+	// Also verify that SettingsController::save without pdftotext_path succeeds
+	$okResponse = $settingsController->save(['use_trigram' => true]);
+	same(Http::STATUS_OK, $okResponse->getStatus(), 'B3: SettingsController::save succeeds when pdftotext_path is absent');
+
+	// 5. Bad stored path in appConfig is ignored at use (findPdfToText returns null)
+	// Case 5a: Stored path is a non-pdftotext binary
+	$appConfig->setValueString('fulltextsearch_pgsql', 'pdftotext_path', '/bin/sh');
+	same(null, $extractor->findPdfToTextPath(), 'B3: non-pdftotext stored path ignored at use');
+
+	// Case 5b: Stored path is a directory named pdftotext
+	$dirTool = sys_get_temp_dir() . '/ftspg_dir_' . mt_rand() . '/pdftotext';
+	mkdir($dirTool, 0755, true);
+	$appConfig->setValueString('fulltextsearch_pgsql', 'pdftotext_path', $dirTool);
+	same(null, $extractor->findPdfToTextPath(), 'B3: directory named pdftotext in appConfig ignored at use');
+	rmdir($dirTool);
+	rmdir(dirname($dirTool));
+
+	// Restore clean config
+	$appConfig->setValueString('fulltextsearch_pgsql', 'pdftotext_path', '');
+
+	section('validate settings when read & locale diagnostics (B4)');
+
+	// 1. Stored invalid language with valid fallback: klingon,english -> ['english']
+	$appConfig->setValueString('fulltextsearch_pgsql', 'language', 'klingon,english');
+	same(['english'], $config->getLanguages(), 'B4: stored klingon,english drops klingon and returns [english]');
+	same('english', $config->getLanguage(), 'B4: fallback language is english');
+
+	$docInvalidLang = doc('B4_LANG1', 'alice', 'Invalid Language Doc', 'content indexed with dropped klingon');
+	$platform->indexDocument($docInvalidLang);
+	$storedConfig1 = (string)$conn->executeQuery("SELECT config::text FROM ftspg_oc_index WHERE document_id = 'B4_LANG1'")->fetchOne();
+	same('english', $storedConfig1, 'B4: document indexed under english regconfig');
+	same(['B4_LANG1'], search($platform, 'alice', '"Invalid Language Doc"')['ids'], 'B4: document with dropped language is searchable');
+
+	// 2. Stored all-invalid language: klingon -> fallback to ['simple']
+	$appConfig->setValueString('fulltextsearch_pgsql', 'language', 'klingon');
+	same(['simple'], $config->getLanguages(), 'B4: stored klingon alone falls back to [simple]');
+	same('simple', $config->getLanguage(), 'B4: fallback language is simple when all configured are invalid');
+
+	$docSimpleLang = doc('B4_LANG2', 'alice', 'Simple Fallback Doc', 'content indexed under simple fallback config');
+	$platform->indexDocument($docSimpleLang);
+	$storedConfig2 = (string)$conn->executeQuery("SELECT config::text FROM ftspg_oc_index WHERE document_id = 'B4_LANG2'")->fetchOne();
+	same('simple', $storedConfig2, 'B4: document indexed under simple regconfig');
+	same(['B4_LANG2'], search($platform, 'alice', '"Simple Fallback Doc"')['ids'], 'B4: document with simple fallback is searchable');
+
+	// 3. Stored max_results clamped to [1, 10000]
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', 50000);
+	same(10000, $config->getMaxResults(), 'B4: stored max_results 50000 clamped to 10000');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', 0);
+	same(1, $config->getMaxResults(), 'B4: stored max_results 0 clamped to 1');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', -50);
+	same(1, $config->getMaxResults(), 'B4: stored max_results -50 clamped to 1');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', 500);
+	same(500, $config->getMaxResults(), 'B4: valid max_results 500 preserved');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'max_results', 100);
+
+	// 4. Database locale diagnostics (SELECT lower('Ç') = 'ç')
+	same(true, $schema->hasLocaleCaseFolding(), 'B4: PostgreSQL hasLocaleCaseFolding returns true for UTF-8 test DB');
+	$statusB4 = $statusService->getStatus();
+	same(true, $statusB4['locale_folding'] ?? null, 'B4: StatusService exposes locale_folding');
+	$platformConfig = $platform->getConfiguration();
+	same(true, $platformConfig['locale_folding'] ?? null, 'B4: PostgreSQLPlatform::getConfiguration exposes locale_folding');
+	same('ok', $platformConfig['database_locale'] ?? null, 'B4: PostgreSQLPlatform::getConfiguration exposes database_locale ok');
+
+	// Diagnostic reports disabled message when locale folding is false
+	$mockSchemaNoFolding = new class($conn, new ArrayConfig(['dbtableprefix' => 'oc_']), $logger) extends SchemaService {
+		public function hasLocaleCaseFolding(): bool {
+			return false;
+		}
+	};
+	$mockStatusNoFolding = new StatusService($mockSchemaNoFolding, $vocabulary, $extractor);
+	same(false, $mockStatusNoFolding->getStatus()['locale_folding'], 'B4: StatusService reports false when locale folding disabled');
+
+	$mockPlatformNoFolding = new PostgreSQLPlatform($config, $mockSchemaNoFolding, $indexService, $searchService, $logger, $extractor);
+	$mockPlatformConfig = $mockPlatformNoFolding->getConfiguration();
+	same(false, $mockPlatformConfig['locale_folding'], 'B4: Platform reports false locale_folding');
+	check(str_contains($mockPlatformConfig['database_locale'], 'disabled'), 'B4: Platform reports disabled message in database_locale');
+
+	// 5. Language changed precision (order-independent comparison for extras)
+	$config->setConfig(['language' => 'english,turkish,french']);
+	$changedSameExtrasDiffOrder = $config->setConfig(['language' => 'english,french,turkish']);
+	same(false, $changedSameExtrasDiffOrder, 'B4: reordering extra languages does not falsely mark languageChanged');
+
+	$changedNewExtras = $config->setConfig(['language' => 'english,turkish,german']);
+	same(true, $changedNewExtras, 'B4: changing extra languages set marks languageChanged');
+
+	$changedPrimary = $config->setConfig(['language' => 'turkish,english,german']);
+	same(true, $changedPrimary, 'B4: changing primary language marks languageChanged');
+
+	// Restore clean language config
+	$config->setConfig(['language' => 'english']);
+
 	section('partial updates');
 	$platform->indexDocument(doc('P1', 'alice', 'Shared later', 'secret content about narwhals'));
 	$meta = doc('P1', 'alice', 'Shared later', '', ['users' => ['bob']], 'files', IIndex::INDEX_META);
@@ -584,6 +1404,8 @@ try {
 	$platform->indexDocument(doc('P1', 'alice', 'Shared later', 'new text about dolphins', [], 'files', IIndex::INDEX_CONTENT));
 	same([], search($platform, 'alice', 'narwhals')['ids'], 'content update replaces old content');
 	same(['P1'], search($platform, 'alice', 'dolphins')['ids'], 'content update indexes new content');
+	$platform->indexDocument(doc('P1', 'alice', 'Shared later', '', ['users' => ['carol']], 'files', IIndex::INDEX_OK));
+	same(['P1'], search($platform, 'carol', 'dolphins')['ids'], 'INDEX_OK refresh updates access and keeps stored content');
 
 	section('parts and tags');
 	$platform->indexDocument(doc('G1', 'alice', 'Discussed file', '', ['parts' => ['comments' => 'Please review the flamingo section'], 'tags' => ['urgent']]));
@@ -947,8 +1769,9 @@ try {
 	same(false, $conn->inTransaction(), 'and its transaction is closed');
 	$conn->beginTransaction();
 	$conn->executeStatement('SET LOCAL random_page_cost = 0.9');
+	$conn->executeStatement('SET LOCAL pg_trgm.similarity_threshold = 0.55');
 	search($platform, 'alice', 'lantern', ['provider' => 'plan']);
-	same(['on', '0.9'], array_values($conn->executeQuery("SELECT current_setting('enable_seqscan'), current_setting('random_page_cost')")->fetch(PDO::FETCH_NUM)), 'inside a caller\'s transaction, its settings are put back');
+	same(['on', '0.9', '0.55'], array_values($conn->executeQuery("SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('pg_trgm.similarity_threshold')")->fetch(PDO::FETCH_NUM)), 'inside a caller\'s transaction, its settings including pg_trgm.similarity_threshold are put back');
 	same(true, $conn->inTransaction(), 'and the transaction is left open');
 	$conn->rollBack();
 	// A provider with a few documents, searched for a word hundreds of others contain: testing
@@ -978,6 +1801,64 @@ try {
 	)->fetchAll(), 'QUERY PLAN'));
 	check(str_contains($plan, 'ftspg_oc_index_title_search_trgm_idx'), 'title substring search uses the trigram index');
 	$conn->executeStatement('SET enable_seqscan = on');
+
+	section('search statement timeout and cancellation (A1)');
+	same(10, $config->getSearchTimeout(), 'ConfigService::getSearchTimeout() default is 10');
+	$config->setConfig(['search_timeout' => 5]);
+	same(5, $config->getSearchTimeout(), 'ConfigService::getSearchTimeout() returns configured value');
+	same(5, $config->getConfig()['search_timeout'], 'getConfig() includes search_timeout');
+	try {
+		$config->setConfig(['search_timeout' => -1]);
+		check(false, 'negative search_timeout rejected');
+	} catch (\InvalidArgumentException) {
+		check(true, 'negative search_timeout rejected');
+	}
+	try {
+		$config->setConfig(['search_timeout' => 301]);
+		check(false, 'search_timeout > 300 rejected');
+	} catch (\InvalidArgumentException) {
+		check(true, 'search_timeout > 300 rejected');
+	}
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'search_timeout', -10);
+	same(0, $config->getSearchTimeout(), 'getSearchTimeout() clamps negative value to 0');
+	$appConfig->setValueInt('fulltextsearch_pgsql', 'search_timeout', 999);
+	same(300, $config->getSearchTimeout(), 'getSearchTimeout() clamps excessive value to 300');
+
+	// Fast search within timeout completes and timedOut is false
+	$config->setConfig(['search_timeout' => 10]);
+	$fastResult = search($platform, 'alice', 'budget');
+	same(false, $fastResult['timedOut'], 'fast search within timeout completes and timedOut is false');
+
+	// Search inside active caller transaction does not override caller statement_timeout
+	$conn->beginTransaction();
+	$conn->executeStatement("SET LOCAL statement_timeout = '42s'");
+	$callerSearch = search($platform, 'alice', 'budget');
+	same('42s', (string)$conn->executeQuery('SHOW statement_timeout')->fetchOne(), 'search inside active caller transaction does not override caller statement_timeout');
+	$conn->rollBack();
+
+	// Exclusive table lock with search_timeout = 1 causes query cancellation (SQLSTATE 57014)
+	$conn2 = new PDO($dsn);
+	$conn2->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+	$config->setConfig(['search_timeout' => 1]);
+	$conn2->beginTransaction();
+	$conn2->exec('LOCK TABLE ftspg_oc_index IN ACCESS EXCLUSIVE MODE');
+	$timedSearch = search($platform, 'alice', 'budget');
+	$conn2->rollBack();
+	same(true, $timedSearch['timedOut'], 'exclusive table lock with search_timeout = 1 causes query cancellation (timedOut is true)');
+	same(0, $timedSearch['total'], 'timed out search has total 0');
+	same([], $timedSearch['ids'], 'timed out search returns empty ids');
+
+	// Statement timeout during spelling correction returns timed-out result without transaction-aborted RESET errors
+	$config->setConfig(['search_timeout' => 1, 'typo_correction' => true]);
+	$conn2->beginTransaction();
+	$conn2->exec('LOCK TABLE ftspg_oc_words IN ACCESS EXCLUSIVE MODE');
+	$timedCorrection = search($platform, 'alice', 'budgett');
+	$conn2->rollBack();
+	same(true, $timedCorrection['timedOut'], 'statement timeout during spelling correction returns timed out result');
+	same(0, $timedCorrection['total'], 'spelling correction timeout has total 0');
+
+	// Restore normal timeout
+	$config->setConfig(['search_timeout' => 10]);
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";

@@ -26,6 +26,9 @@ class SchemaService {
 	private const SCHEMA_MARKER = 'ftspg schema 2';
 
 	private ?bool $trigram = null;
+	/** @var string[]|null */
+	private ?array $textSearchConfigs = null;
+	private ?bool $localeFolding = null;
 
 	public function __construct(
 		private IDBConnection $db,
@@ -238,10 +241,32 @@ class SchemaService {
 
 	/** @return string[] text search configurations installed on this server, e.g. english, turkish, simple */
 	public function getTextSearchConfigs(): array {
-		$result = $this->db->executeQuery('SELECT cfgname FROM pg_ts_config ORDER BY cfgname');
-		$configs = array_map('strval', array_column($result->fetchAll(), 'cfgname'));
-		$result->closeCursor();
-		return $configs;
+		if ($this->textSearchConfigs === null) {
+			$result = $this->db->executeQuery('SELECT cfgname FROM pg_ts_config ORDER BY cfgname');
+			$this->textSearchConfigs = array_map('strval', array_column($result->fetchAll(), 'cfgname'));
+			$result->closeCursor();
+		}
+		return $this->textSearchConfigs;
+	}
+
+	/**
+	 * Probe whether the database locale supports non-ASCII case folding.
+	 * When the database runs under LC_CTYPE="C", lower('Ç') remains 'Ç'.
+	 */
+	public function hasLocaleCaseFolding(): bool {
+		if ($this->localeFolding === null) {
+			if (!$this->isPostgres()) {
+				return false;
+			}
+			try {
+				$result = $this->db->executeQuery("SELECT lower('Ç') = 'ç'");
+				$this->localeFolding = (bool)$result->fetchOne();
+				$result->closeCursor();
+			} catch (Throwable) {
+				return false;
+			}
+		}
+		return $this->localeFolding;
 	}
 
 	private function tryCreateTrigramExtension(): void {
