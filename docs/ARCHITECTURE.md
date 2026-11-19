@@ -118,7 +118,7 @@ The search vector is always consistent with the stored text, a single `INSERT â€
 
 ## Access control
 
-Document access becomes an array of tokens: the owner and shared users as `u:<uid>`, groups as `g:<gid>`, circles as `c:<id>`, and `u:__all` for public documents. At search time the framework passes an `IDocumentAccess` with the viewer's id, groups and circles, which becomes the same kind of tokens. A row is visible when the arrays overlap:
+Document access becomes an array of tokens: the owner and shared users as `u:<uid>` (`o:__all` when the owner account itself is literally named `__all`), groups as `g:<gid>`, circles as `c:<id>`, and `u:__all` for public documents. At search time the framework passes an `IDocumentAccess` with the viewer's id, groups and circles, which becomes the same kind of tokens (`o:__all` is granted only when the viewer is `__all`). A row is visible when the arrays overlap:
 
 ```sql
 WHERE d.access && '{u:alice,u:__all,g:sales,c:team1}'::text[]
