@@ -3860,6 +3860,74 @@ try {
 		$platform->resetIndex('h2p');
 		$config->setConfig(['language' => 'turkish']);
 	}
+
+	section('H3: max_content_size = 0 clean skip, getMaxContentSize clamp, high-byte binary rejection');
+	$platform->resetIndex('h3p');
+	$h3ToolDir = sys_get_temp_dir() . '/ftspg_h3_' . getmypid();
+	@mkdir($h3ToolDir, 0755, true);
+	$h3SpyPdfToText = $h3ToolDir . '/pdftotext';
+	$h3MarkerFile = $h3ToolDir . '/invoked';
+
+	try {
+		$config->setConfig(['language' => 'english', 'typo_correction' => true]);
+
+		// 1. getMaxContentSize() clamps excessive unvalidated values to 1,000,000
+		$appConfig->setValueInt('fulltextsearch_pgsql', 'max_content_size', 50000000);
+		same(1000000, $config->getMaxContentSize(), 'H3: getMaxContentSize() clamps excessive stored value to 1000000');
+		$appConfig->setValueInt('fulltextsearch_pgsql', 'max_content_size', -50);
+		same(0, $config->getMaxContentSize(), 'H3: getMaxContentSize() clamps negative stored value to 0');
+
+		// 2. max_content_size = 0 skips body extraction cleanly without spawning pdftotext or wiping tags/parts
+		file_put_contents(
+			$h3SpyPdfToText,
+			"#!/bin/sh\nif [ \"\$1\" = \"-v\" ]; then echo \"pdftotext version 24.0\"; exit 0; fi\ntouch " . escapeshellarg($h3MarkerFile) . "\necho \"spybodyword\"\n"
+		);
+		chmod($h3SpyPdfToText, 0755);
+		$config->setConfig(['max_content_size' => 0, 'pdf_extractor' => 'pdftotext', 'pdftotext_path' => $h3SpyPdfToText]);
+		@unlink($h3MarkerFile);
+
+		$runnerLog = [];
+		$platform->indexDocument(doc('H3_PDF_ZERO', 'alice', 'Quarterly Deck.pdf', base64_encode("%PDF-1.4\nfake pdf bytes"), [
+			'encoded' => IIndexDocument::ENCODED_BASE64,
+			'tags' => ['tagalpha'],
+			'metatags' => ['metaomega'],
+			'parts' => ['comments' => 'partcommentzeta'],
+		], 'h3p'));
+		same(false, file_exists($h3MarkerFile), 'H3: max_content_size = 0 does not spawn pdftotext');
+		same(['ok', 'ok'], $runnerLog['H3_PDF_ZERO'] ?? [], 'H3: max_content_size = 0 indexes PDF with ok status and no false warning');
+		$storedPdfZero = $platform->getDocument('h3p', 'H3_PDF_ZERO');
+		same('', $storedPdfZero->getContent(), 'H3: max_content_size = 0 stores empty body content');
+		same(['comments' => 'partcommentzeta'], $storedPdfZero->getParts(), 'H3: max_content_size = 0 preserves document parts');
+		same(['H3_PDF_ZERO'], search($platform, 'alice', 'Quarterly', ['provider' => 'h3p'])['ids'], 'H3: max_content_size = 0 keeps title searchable');
+		same(['H3_PDF_ZERO'], search($platform, 'alice', 'tagalpha', ['provider' => 'h3p'])['ids'], 'H3: max_content_size = 0 keeps tags_text searchable');
+		same(['H3_PDF_ZERO'], search($platform, 'alice', 'metaomega', ['provider' => 'h3p'])['ids'], 'H3: max_content_size = 0 keeps metatags searchable');
+		same(['H3_PDF_ZERO'], search($platform, 'alice', 'partcommentzeta', ['provider' => 'h3p'])['ids'], 'H3: max_content_size = 0 keeps parts searchable');
+
+		$runnerLog = [];
+		$platform->indexDocument(doc('H3_TXT_ZERO', 'alice', 'Readme.txt', 'ignoredbodytoken', [
+			'parts' => ['comments' => 'kepttxtcomment'],
+		], 'h3p'));
+		same(['ok', 'ok'], $runnerLog['H3_TXT_ZERO'] ?? [], 'H3: max_content_size = 0 indexes plain text with ok status');
+		same([], search($platform, 'alice', 'ignoredbodytoken', ['provider' => 'h3p'])['ids'], 'H3: max_content_size = 0 skips unencoded body content');
+		same(['H3_TXT_ZERO'], search($platform, 'alice', 'kepttxtcomment', ['provider' => 'h3p'])['ids'], 'H3: max_content_size = 0 keeps plain-text doc parts searchable');
+
+		$directBytesZero = $extractor->extractFromBytes('direct raw text', 'raw.txt');
+		same('', $directBytesZero->text, 'H3: extractFromBytes returns empty text when max_content_size = 0');
+		same(null, $directBytesZero->warning, 'H3: extractFromBytes returns null warning when max_content_size = 0');
+
+		// 3. NUL-free high-byte binary blob is rejected instead of indexed as Windows-1254 mojibake
+		$config->setConfig(['max_content_size' => 512000, 'pdf_extractor' => 'auto', 'pdftotext_path' => '']);
+		$highBytes = str_repeat("\x81\x9F\xA7\xC4\xD8\xE6\xF3\xFE", 512);
+		$highRes = $extractor->extractFromBytes($highBytes, 'blob.bin');
+		same('', $highRes->text, 'H3: NUL-free high-byte binary blob yields empty text');
+		same('binary content in an unsupported format, indexed without content', $highRes->warning, 'H3: NUL-free high-byte binary blob reports unsupported binary warning');
+	} finally {
+		$config->setConfig(['max_content_size' => 512000, 'pdf_extractor' => 'auto', 'pdftotext_path' => '', 'language' => 'turkish']);
+		$platform->resetIndex('h3p');
+		@unlink($h3MarkerFile);
+		@unlink($h3SpyPdfToText);
+		@rmdir($h3ToolDir);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";
