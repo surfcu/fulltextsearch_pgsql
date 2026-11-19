@@ -68,6 +68,7 @@ class IndexService {
 		$tags = array_map([$extractor, 'sanitize'], $this->strings($document->getTags()));
 		$metaTags = array_map([$extractor, 'sanitize'], $this->strings($document->getMetaTags()));
 		$subtags = array_map([$extractor, 'sanitize'], $this->strings($document->getSubTags(true)));
+		$subtagsMap = $this->sanitizeSubTagsMap($document->getSubTags(false));
 		$links = array_map([$extractor, 'sanitize'], $this->strings($access->getLinks()));
 
 		$parts = [];
@@ -96,6 +97,7 @@ class IndexService {
 		$cleanInfo = $this->cleanInfoMap($document->getInfoAll());
 		$partsJson = json_encode((object)$parts, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
 		$infoJson = json_encode((object)$cleanInfo, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+		$subtagsMapJson = json_encode((object)$subtagsMap, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
 
 		$savepoint0 = 'ftspg_upsert_0';
 		$this->createSavepoint($savepoint0);
@@ -115,6 +117,7 @@ class IndexService {
 				$tags,
 				$metaTags,
 				$subtags,
+				$subtagsMapJson,
 				$links,
 			);
 			$this->releaseSavepoint($savepoint0);
@@ -218,6 +221,7 @@ class IndexService {
 						$tags,
 						$metaTags,
 						$subtags,
+						$subtagsMapJson,
 						$links,
 					);
 					$this->releaseSavepoint($savepointStep);
@@ -255,6 +259,7 @@ class IndexService {
 								$tags,
 								$metaTags,
 								$subtags,
+								$subtagsMapJson,
 								$links,
 							);
 							$this->releaseSavepoint($savepoint5b);
@@ -341,17 +346,18 @@ class IndexService {
 		array $tags,
 		array $metaTags,
 		array $subtags,
+		string $subtagsMapJson,
 		array $links,
 	): void {
 		$access = $document->getAccess();
 		$t = $this->schemaService->getQualifiedTableName();
 		$this->db->executeStatement(<<<SQL
 			INSERT INTO $t AS d (
-				provider_id, document_id, owner_id, access, links, tags, metatags, subtags,
+				provider_id, document_id, owner_id, access, links, tags, metatags, subtags, subtags_map,
 				source, hash, modified_time, indexed_at, config,
 				title, tags_text, parts, parts_text, content, info
 			) VALUES (
-				?, ?, ?, CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]),
+				?, ?, ?, CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS text[]), CAST(? AS jsonb),
 				?, ?, ?, ?, ?,
 				?, ?, CAST(? AS jsonb), ?, ?, CAST(? AS jsonb)
 			)
@@ -362,6 +368,7 @@ class IndexService {
 				tags = EXCLUDED.tags,
 				metatags = EXCLUDED.metatags,
 				subtags = EXCLUDED.subtags,
+				subtags_map = EXCLUDED.subtags_map,
 				source = EXCLUDED.source,
 				hash = EXCLUDED.hash,
 				modified_time = EXCLUDED.modified_time,
@@ -383,6 +390,7 @@ class IndexService {
 				PgArray::toLiteral($tags),
 				PgArray::toLiteral($metaTags),
 				PgArray::toLiteral($subtags),
+				$subtagsMapJson,
 				$document->getSource(),
 				$document->getHash(),
 				(string)$document->getModifiedTime(),
@@ -491,6 +499,41 @@ class IndexService {
 			$remaining -= strlen($cut);
 		}
 		return json_encode((object)$truncated, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+	}
+
+	/**
+	 * @param array<mixed, mixed> $rawSubTags
+	 * @return array<string, list<string>>
+	 */
+	private function sanitizeSubTagsMap(array $rawSubTags): array {
+		$extractor = $this->extractor;
+		$out = [];
+		foreach ($rawSubTags as $source => $values) {
+			if (is_int($source) && is_scalar($values)) {
+				$entry = (string)$values;
+				[$srcPart, $tagPart] = str_contains($entry, '_') ? explode('_', $entry, 2) : [$entry, ''];
+				$cleanSrc = $extractor->sanitize($srcPart);
+				$cleanTag = $extractor->sanitize($tagPart);
+				if ($cleanSrc !== '' || $cleanTag !== '') {
+					$out[$cleanSrc][] = $cleanTag;
+				}
+				continue;
+			}
+			$cleanSrc = $extractor->sanitize((string)$source);
+			$cleanList = [];
+			foreach (is_array($values) ? $values : [$values] as $val) {
+				if (is_scalar($val) && (string)$val !== '') {
+					$cleanVal = $extractor->sanitize((string)$val);
+					if ($cleanVal !== '') {
+						$cleanList[] = $cleanVal;
+					}
+				}
+			}
+			if ($cleanList !== []) {
+				$out[$cleanSrc] = array_values(array_unique(array_merge($out[$cleanSrc] ?? [], $cleanList)));
+			}
+		}
+		return $out;
 	}
 
 	/** @return list<string> */

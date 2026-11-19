@@ -60,6 +60,7 @@ CREATE TABLE ftspg_oc_index (
   access        text[]       NOT NULL DEFAULT '{}',   -- u:alice, g:sales, c:<circle>, u:__all
   links         text[]       NOT NULL DEFAULT '{}',
   tags, metatags, subtags     text[],
+  subtags_map                 jsonb        NOT NULL DEFAULT '{}',
   source, hash (text), modified_time, indexed_at (bigint),
   config        text         NOT NULL,                -- language name the row was indexed with
   title, tags_text, parts (jsonb), parts_text, content, info (jsonb),

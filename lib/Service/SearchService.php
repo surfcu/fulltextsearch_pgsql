@@ -652,7 +652,7 @@ class SearchService {
 	public function getDocument(string $providerId, string $documentId): IIndexDocument {
 		$result = $this->db->executeQuery(
 			'SELECT owner_id, array_to_json(access) AS access, array_to_json(links) AS links,
-					array_to_json(tags) AS tags, array_to_json(metatags) AS metatags, array_to_json(subtags) AS subtags,
+					array_to_json(tags) AS tags, array_to_json(metatags) AS metatags, array_to_json(subtags) AS subtags, subtags_map,
 					source, hash, modified_time, title, parts, content, info
 			 FROM ' . $this->schemaService->getQualifiedTableName() . ' WHERE provider_id = ? AND document_id = ?',
 			[$providerId, $documentId]
@@ -675,7 +675,7 @@ class SearchService {
 		$document->setAccess($access);
 		$document->setTags($this->decode($row['tags']));
 		$document->setMetaTags($this->decode($row['metatags']));
-		$document->setSubTags($this->decode($row['subtags']));
+		$document->setSubTags($this->rebuildSubTags($this->decode($row['subtags_map'] ?? ''), $this->decode($row['subtags'])));
 		$document->setSource((string)$row['source']);
 		$document->setHash((string)$row['hash']);
 		$document->setModifiedTime((int)$row['modified_time']);
@@ -691,6 +691,37 @@ class SearchService {
 			};
 		}
 		return $document;
+	}
+
+	/**
+	 * @param array<array-key, mixed> $subtagsMap
+	 * @param array<array-key, mixed> $flatSubtags
+	 * @return array<string, list<string>>
+	 */
+	private function rebuildSubTags(array $subtagsMap, array $flatSubtags): array {
+		$out = [];
+		if ($subtagsMap !== []) {
+			foreach ($subtagsMap as $source => $tags) {
+				if (is_array($tags)) {
+					$scalars = array_values(array_map('strval', array_filter($tags, 'is_scalar')));
+					if ($scalars !== []) {
+						$out[(string)$source] = $scalars;
+					}
+				}
+			}
+			if ($out !== []) {
+				return $out;
+			}
+		}
+		foreach ($flatSubtags as $entry) {
+			$str = (string)$entry;
+			if ($str === '') {
+				continue;
+			}
+			[$source, $tag] = str_contains($str, '_') ? explode('_', $str, 2) : [$str, ''];
+			$out[$source][] = $tag;
+		}
+		return $out;
 	}
 
 	/**

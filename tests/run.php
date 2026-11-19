@@ -4594,6 +4594,100 @@ try {
 		$p4DropTables();
 		$config->setConfig(['language' => 'turkish']);
 	}
+
+	section('P5: subtags_map round-trip in getDocument() and legacy first-underscore fallback');
+	$p5Cleanup = static function () use ($conn, $platform): void {
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+		$platform->resetIndex('p5p');
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_p5up_index, ftspg_p5up_words');
+		$conn->executeStatement('DROP FUNCTION IF EXISTS ftspg_p5up_regconfig(text)');
+	};
+	$p5Cleanup();
+	$config->setConfig(['language' => 'english', 'typo_correction' => true]);
+	try {
+		// 1. ['files' => ['local']] round-trips and getSubTags(true) raises no warning
+		$dSingle = doc('P5_SINGLE', 'alice', 'Local File.txt', 'roundtrip body', ['subtags' => ['files' => 'local']], 'p5p');
+		$platform->indexDocument($dSingle);
+		$backSingle = $platform->getDocument('p5p', 'P5_SINGLE');
+		$p5Warnings = [];
+		set_error_handler(static function (int $errno, string $errstr) use (&$p5Warnings): bool {
+			$p5Warnings[] = $errstr;
+			return true;
+		});
+		try {
+			$unflatSingle = $backSingle->getSubTags(false);
+			$flatSingle = $backSingle->getSubTags(true);
+		} finally {
+			restore_error_handler();
+		}
+		same(['files' => ['local']], $unflatSingle, 'P5: getDocument()->getSubTags(false) round-trips [\'files\' => [\'local\']]');
+		same(['files_local'], $flatSingle, 'P5: getDocument()->getSubTags(true) returns [\'files_local\']');
+		same([], $p5Warnings, 'P5: getDocument()->getSubTags(true) raises no PHP warning');
+
+		// 2. Multi-tag and underscore-bearing source names round-trip losslessly via subtags_map (with NUL sanitization)
+		$dMulti = doc('P5_MULTI', 'alice', 'Multi Subtag.txt', 'multi body', [], 'p5p');
+		$dMulti->addSubTag('files', 'local');
+		$dMulti->addSubTag('files', 'external_s3');
+		$dMulti->addSubTag('system_tags', 'urgent_q1');
+		$dMulti->addSubTag("clean\0src", "clean\0tag");
+		$platform->indexDocument($dMulti);
+		$backMulti = $platform->getDocument('p5p', 'P5_MULTI');
+		$actualMultiMap = $backMulti->getSubTags(false);
+		ksort($actualMultiMap);
+		same([
+			'cleansrc' => ['cleantag'],
+			'files' => ['local', 'external_s3'],
+			'system_tags' => ['urgent_q1'],
+		], $actualMultiMap, 'P5: subtags_map preserves multiple tags and underscore-containing source keys');
+		same([
+			'cleansrc_cleantag',
+			'files_external_s3',
+			'files_local',
+			'system_tags_urgent_q1',
+		], sorted($backMulti->getSubTags(true)), 'P5: getSubTags(true) formats multi-source subtags cleanly');
+
+		// 3. Older pre-P5 rows (empty subtags_map, populated subtags[]) fall back to splitting at first underscore
+		$hasSubtagsMapCol = (bool)$conn->executeQuery(
+			"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid = pg_catalog.to_regclass('ftspg_oc_index') AND attname = 'subtags_map' AND NOT attisdropped)"
+		)->fetchOne();
+		same(true, $hasSubtagsMapCol, 'P5: ftspg_oc_index has subtags_map column');
+		if ($hasSubtagsMapCol) {
+			$conn->executeStatement(
+				"UPDATE ftspg_oc_index SET subtags_map = '{}'::jsonb, subtags = '{files_local,files_external_s3}'::text[] WHERE provider_id = 'p5p' AND document_id = 'P5_SINGLE'"
+			);
+			$backLegacy = $platform->getDocument('p5p', 'P5_SINGLE');
+			same(['files' => ['local', 'external_s3']], $backLegacy->getSubTags(false), 'P5: legacy row with empty subtags_map splits subtags at first underscore');
+			same(['files_local', 'files_external_s3'], $backLegacy->getSubTags(true), 'P5: legacy row getSubTags(true) formats cleanly without warning');
+		}
+
+		// 4. Existing 1.6.0/1.6.1 Schema v3 table missing subtags_map adds it instantly without rewriting tsv
+		$p5UpSys = new ArrayConfig(['dbtableprefix' => 'p5up_']);
+		$p5UpSchema = new SchemaService($conn, $p5UpSys, $logger);
+		$p5UpConfig = new ConfigService(new ArrayAppConfig(), $p5UpSchema);
+		$p5UpExtractor = new ContentExtractor($p5UpConfig);
+		$p5UpVocab = new VocabularyService($conn, $p5UpSchema);
+		$p5UpDetector = new LanguageDetector($conn, $p5UpConfig, $logger);
+		$p5UpIndex = new IndexService($conn, $p5UpSchema, $p5UpConfig, $p5UpExtractor, $p5UpVocab, $logger, $p5UpDetector);
+		$p5UpSearch = new SearchService($conn, $p5UpSchema, $p5UpConfig, new TsQueryBuilder(), $p5UpVocab);
+		$p5UpPlatform = new PostgreSQLPlatform($p5UpConfig, $p5UpSchema, $p5UpIndex, $p5UpSearch, $logger, $p5UpExtractor);
+		$p5UpPlatform->initializeIndex();
+		$conn->executeStatement('ALTER TABLE ftspg_p5up_index DROP COLUMN IF EXISTS subtags_map');
+		same(true, $p5UpSchema->isCurrent(), 'P5 upgrade: schema v3 marker stays current when subtags_map is missing');
+		$conn->statements = [];
+		$p5UpPlatform->loadPlatform();
+		$tsvRewriteSqls = array_values(array_filter(
+			$conn->statements,
+			static fn (string $sql): bool => str_contains($sql, 'DROP COLUMN') || str_contains($sql, 'COMMENT ON COLUMN')
+		));
+		same([], $tsvRewriteSqls, 'P5 upgrade: adding subtags_map does not drop or rewrite tsv');
+		$p5UpPlatform->indexDocument(doc('P5_UP_DOC', 'alice', 'Upgraded.txt', 'upgraded content', ['subtags' => ['files' => 'local']], 'p5p'));
+		same(['files' => ['local']], $p5UpPlatform->getDocument('p5p', 'P5_UP_DOC')->getSubTags(false), 'P5 upgrade: upgraded table round-trips subtags_map');
+	} finally {
+		$p5Cleanup();
+		$config->setConfig(['language' => 'turkish']);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";
