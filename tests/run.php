@@ -4019,6 +4019,219 @@ try {
 		}
 		$conn->executeStatement("DROP DATABASE IF EXISTS $qH4BenchDb WITH (FORCE)");
 	}
+
+	section('P1: empty search with filters and newest-first ordering');
+	$platform->resetIndex('p1p');
+	$config->setConfig(['language' => 'english', 'use_trigram' => true, 'typo_correction' => true]);
+	try {
+		$platform->indexDocument(doc('P1_OLD_TAG', 'alice', 'Old Starred.txt', 'alpha preview text', [
+			'mtime' => 1000,
+			'metatags' => ['starred'],
+		], 'p1p'));
+		$platform->indexDocument(doc('P1_BOB_SHARED', 'bob', 'Shared Starred.txt', 'shared preview text', [
+			'users' => ['alice'],
+			'mtime' => 2000,
+			'metatags' => ['starred'],
+		], 'p1p'));
+		$platform->indexDocument(doc('P1_NEW_TAG', 'alice', 'New Starred.txt', '', [
+			'mtime' => 3000,
+			'metatags' => ['starred'],
+			'parts' => ['comments' => 'comment preview text'],
+		], 'p1p'));
+		$platform->indexDocument(doc('P1_BOB_PRIV', 'bob', 'Private Starred.txt', 'secret bob text', [
+			'mtime' => 4000,
+			'metatags' => ['starred'],
+		], 'p1p'));
+		$platform->indexDocument(doc('P1_UNTAGGED', 'alice', 'Newest Untagged.txt', 'untagged alice text', [
+			'mtime' => 5000,
+		], 'p1p'));
+
+		// 1. Disallowed empty search returns nothing even when filters match
+		$p1Disallowed = search($platform, 'alice', '', ['provider' => 'p1p', 'metatags' => ['starred']]);
+		same([], $p1Disallowed['ids'], 'P1: empty search returns nothing when request does not allow empty search');
+		same(0, $p1Disallowed['total'], 'P1: disallowed empty search reports total 0');
+
+		// 2. Empty search allowed via option returns viewer-visible tagged docs, newest first
+		$p1Tagged = search($platform, 'alice', '', [
+			'provider' => 'p1p',
+			'metatags' => ['starred'],
+			'options' => ['empty_search' => '1'],
+		]);
+		same(['P1_NEW_TAG', 'P1_BOB_SHARED', 'P1_OLD_TAG'], $p1Tagged['ids'], 'P1: empty search with meta-tag filter returns visible tagged docs newest first');
+		same(3, $p1Tagged['total'], 'P1: empty search with meta-tag filter reports accurate total');
+		same(false, $p1Tagged['timedOut'], 'P1: empty search sets timedOut false');
+		same('comment preview text', ($p1Tagged['docs'][0] ?? null)?->getExcerpts()[0]['excerpt'] ?? '', 'P1: empty search excerpts parts when content is empty');
+		same('alpha preview text', ($p1Tagged['docs'][2] ?? null)?->getExcerpts()[0]['excerpt'] ?? '', 'P1: empty search excerpts content');
+
+		$p1Whitespace = search($platform, 'alice', "  \t\n ", [
+			'provider' => 'p1p',
+			'metatags' => ['starred'],
+			'options' => ['empty_search' => 'true'],
+		]);
+		same(['P1_NEW_TAG', 'P1_BOB_SHARED', 'P1_OLD_TAG'], $p1Whitespace['ids'], 'P1: whitespace-only search with empty_search=true lists filtered docs newest first');
+
+		// 3. Concrete SearchRequest-style isEmptySearch() method (as Nextcloud FullTextSearch passes)
+		$runWithIsEmpty = static function (bool $allowEmpty, string $q = '') use ($platform): array {
+			$docs = [];
+			$total = -1;
+			$req = new class($q, $allowEmpty) implements ISearchRequest {
+				public function __construct(
+					private string $search,
+					private bool $empty,
+				) {
+				}
+				public function isEmptySearch(): bool {
+					return $this->empty;
+				}
+				public function getSize(): int {
+					return 20;
+				}
+				public function getPage(): int {
+					return 1;
+				}
+				public function getAuthor(): string {
+					return 'alice';
+				}
+				public function getSearch(): string {
+					return $this->search;
+				}
+				public function setSearch(string $search): ISearchRequest {
+					$this->search = $search;
+					return $this;
+				}
+				public function addSearch(string $search): ISearchRequest {
+					$this->search .= ' ' . $search;
+					return $this;
+				}
+				public function getOption(string $option, string $default = ''): string {
+					return $default;
+				}
+				public function getOptionArray(string $option, array $default = []): array {
+					return $default;
+				}
+				public function addPart(string $part): ISearchRequest {
+					return $this;
+				}
+				public function setParts(array $parts): ISearchRequest {
+					return $this;
+				}
+				public function getParts(): array {
+					return [];
+				}
+				public function addMetaTag(string $tag): ISearchRequest {
+					return $this;
+				}
+				public function getMetaTags(): array {
+					return [];
+				}
+				public function setMetaTags(array $tags): ISearchRequest {
+					return $this;
+				}
+				public function addSubTag(string $source, string $tag): ISearchRequest {
+					return $this;
+				}
+				public function getSubTags(bool $formatted): array {
+					return [];
+				}
+				public function setSubTags(array $tags): ISearchRequest {
+					return $this;
+				}
+				public function addLimitField(string $field): ISearchRequest {
+					return $this;
+				}
+				public function getLimitFields(): array {
+					return [];
+				}
+				public function addWildcardField(string $field): ISearchRequest {
+					return $this;
+				}
+				public function getWildcardFields(): array {
+					return [];
+				}
+				public function addRegexFilters(array $filters): ISearchRequest {
+					return $this;
+				}
+				public function getRegexFilters(): array {
+					return [];
+				}
+				public function addWildcardFilter(array $filter): ISearchRequest {
+					return $this;
+				}
+				public function getWildcardFilters(): array {
+					return [];
+				}
+				public function addField(string $field): ISearchRequest {
+					return $this;
+				}
+				public function getFields(): array {
+					return [];
+				}
+				public function addSimpleQuery(\OCP\FullTextSearch\Model\ISearchRequestSimpleQuery $query): ISearchRequest {
+					return $this;
+				}
+				public function getSimpleQueries(): array {
+					return [];
+				}
+			};
+			$prov = double(IFullTextSearchProvider::class, ['getId' => 'p1p']);
+			$res = double(ISearchResult::class, [
+				'getRequest' => $req,
+				'getProvider' => $prov,
+				'addDocument' => function (IIndexDocument $d) use (&$docs): void {
+					$docs[] = $d;
+				},
+				'setTotal' => function (int $t) use (&$total): void {
+					$total = $t;
+				},
+				'setTimedOut' => null,
+				'setTime' => null,
+				'setMaxScore' => null,
+			]);
+			$acc = new DocumentAccess();
+			$acc->setViewerId('alice');
+			$platform->searchRequest($res, $acc);
+			return ['ids' => array_map(static fn (IIndexDocument $d): string => $d->getId(), $docs), 'total' => $total];
+		};
+		same(['P1_UNTAGGED', 'P1_NEW_TAG', 'P1_BOB_SHARED', 'P1_OLD_TAG'], $runWithIsEmpty(true)['ids'], 'P1: SearchRequest::isEmptySearch() === true lists all visible docs newest first');
+		same([], $runWithIsEmpty(false)['ids'], 'P1: SearchRequest::isEmptySearch() === false returns empty');
+
+		// 4. Pagination, past-end total, non-empty exclusion/stopword queries, and guard checks
+		$p1Page1 = search($platform, 'alice', '', [
+			'provider' => 'p1p',
+			'metatags' => ['starred'],
+			'options' => ['empty_search' => '1'],
+			'size' => 2,
+			'page' => 1,
+		]);
+		$p1Page2 = search($platform, 'alice', '', [
+			'provider' => 'p1p',
+			'metatags' => ['starred'],
+			'options' => ['empty_search' => '1'],
+			'size' => 2,
+			'page' => 2,
+		]);
+		$p1Page5 = search($platform, 'alice', '', [
+			'provider' => 'p1p',
+			'metatags' => ['starred'],
+			'options' => ['empty_search' => '1'],
+			'size' => 2,
+			'page' => 5,
+		]);
+		same(['P1_NEW_TAG', 'P1_BOB_SHARED'], $p1Page1['ids'], 'P1: page 1 returns newest 2 results');
+		same(3, $p1Page1['total'], 'P1: page 1 reports total 3');
+		same(['P1_OLD_TAG'], $p1Page2['ids'], 'P1: page 2 returns remaining oldest result');
+		same(3, $p1Page2['total'], 'P1: page 2 reports total 3');
+		same([], $p1Page5['ids'], 'P1: past-end page returns empty ids');
+		same(3, $p1Page5['total'], 'P1: past-end page preserves total 3');
+
+		same([], search($platform, 'alice', '-alpha', ['provider' => 'p1p', 'options' => ['empty_search' => '1']])['ids'], 'P1: exclusion-only query still returns nothing when empty_search=1');
+		same([], search($platform, 'alice', 'the of', ['provider' => 'p1p', 'options' => ['empty_search' => '1']])['ids'], 'P1: stopword-only query still returns nothing when empty_search=1');
+		same([], search($platform, '', '', ['provider' => 'p1p', 'options' => ['empty_search' => '1']])['ids'], 'P1: unauthenticated viewer gets nothing on empty search');
+		same([], search($platform, 'alice', '', ['provider' => 'p1p', 'options' => ['empty_search' => '1'], 'limit' => ['unindexed_field']])['ids'], 'P1: limit to unindexed field returns nothing on empty search');
+	} finally {
+		$platform->resetIndex('p1p');
+		$config->setConfig(['language' => 'turkish']);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";

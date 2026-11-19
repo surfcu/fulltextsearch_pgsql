@@ -258,14 +258,43 @@ class SearchService {
 
 		$languages = $this->configService->getLanguages();
 		$search = $request->getSearch();
+		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
+
+		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
+		$page = max(1, $request->getPage());
+		$maxOffset = PHP_INT_MAX - $size;
+		$offset = ($page - 1) > intdiv($maxOffset, $size) ? $maxOffset : ($page - 1) * $size;
+
+		if (trim($search) === '') {
+			if (!self::allowsEmptySearch($request)) {
+				$result->setTotal(0);
+				return;
+			}
+			$filterSql = self::renderFilters($filterConditions, false);
+			$rows = $this->emptySearch($filterSql, $filterParams, $size, $offset);
+			if ($rows !== []) {
+				$total = (int)$rows[0]['total'];
+			} elseif ($page > 1) {
+				$total = $this->filterCount($filterSql, $filterParams);
+			} else {
+				$total = 0;
+			}
+			foreach ($rows as $row) {
+				$result->addDocument($this->toResultDocument($providerId, $row, '0', $access->getViewerId()));
+			}
+			$result->setTotal($total);
+			$result->setMaxScore(0);
+			$result->setTime((int)round((microtime(true) - $start) * 1000.0));
+			$result->setTimedOut(false);
+			return;
+		}
+
 		// Words as each language tokenizes them (Turkish lowercases I to ı), reused for alternatives and excerpts.
 		$words = [];
 		foreach ($languages as $language) {
 			array_push($words, ...$this->queryBuilder->searchWords($search, $language));
 		}
 		$words = array_values(array_unique($words));
-
-		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
 
 		$alternatives = [];
 		$typoOn = $this->configService->useTypoCorrection() && $words !== [];
@@ -283,10 +312,6 @@ class SearchService {
 		}
 		$query = $queries[$languages[0]];
 
-		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
-		$page = max(1, $request->getPage());
-		$maxOffset = PHP_INT_MAX - $size;
-		$offset = ($page - 1) > intdiv($maxOffset, $size) ? $maxOffset : ($page - 1) * $size;
 		$filtersFirst = $this->startFromFilters($queries, $filterConditions, $filterParams);
 		$filterSql = self::renderFilters($filterConditions, !$filtersFirst);
 
@@ -1359,6 +1384,52 @@ class SearchService {
 	/** A float as a SQL numeric literal, independent of the PHP locale. */
 	private static function number(float $value): string {
 		return sprintf('%.12F', $value);
+	}
+
+	private static function allowsEmptySearch(ISearchRequest $request): bool {
+		if (method_exists($request, 'isEmptySearch') && (bool)$request->isEmptySearch()) {
+			return true;
+		}
+		return in_array(strtolower($request->getOption('empty_search')), ['1', 'true'], true);
+	}
+
+	/**
+	 * @param list<string> $filterParams
+	 * @return list<array<string, mixed>>
+	 */
+	private function emptySearch(string $filterSql, array $filterParams, int $limit, int $offset): array {
+		$t = $this->schemaService->getQualifiedTableName();
+		$joined = "CASE WHEN m.content = '' THEN m.parts_text WHEN m.parts_text = '' THEN m.content ELSE m.content || ' ' || m.parts_text END";
+		$sql = <<<SQL
+			SELECT m.document_id, m.title, m.source, m.hash, m.modified_time,
+				   left($joined, 300) AS excerpt,
+				   m.total
+			FROM (
+				SELECT d.id, d.document_id, d.title, d.source, d.hash, d.modified_time,
+					   d.content, d.parts_text,
+					   count(*) OVER () AS total
+				FROM $t d
+				WHERE $filterSql
+				ORDER BY d.modified_time DESC, d.id
+				LIMIT ? OFFSET ?
+			) m
+			ORDER BY m.modified_time DESC, m.id
+			SQL;
+		$result = $this->db->executeQuery($sql, [...$filterParams, (string)$limit, (string)$offset]);
+		$rows = $result->fetchAll();
+		$result->closeCursor();
+		return $rows;
+	}
+
+	/**
+	 * @param list<string> $filterParams
+	 */
+	private function filterCount(string $filterSql, array $filterParams): int {
+		$t = $this->schemaService->getQualifiedTableName();
+		$result = $this->db->executeQuery("SELECT count(*) FROM $t d WHERE $filterSql", $filterParams);
+		$count = (int)$result->fetchOne();
+		$result->closeCursor();
+		return $count;
 	}
 
 	/**
