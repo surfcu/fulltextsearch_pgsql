@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Packaging, benchmark gate, and CI hygiene: fail `tests/bench/run.php` with non-zero exit codes on missing/invalid `--compare` baselines or `--check-budget` breaches, stage `make appstore` release files from `git archive HEAD` so untracked working-tree files cannot enter App Store archives, and update the lockfile comment in `live.yml`; no re-indexing is needed.
+
 ## [1.6.0] - 2026-11-18
 
 ### Added

@@ -22,7 +22,16 @@ scope:
 
 appstore: clean scope
 	mkdir -p $(build_dir)/source/$(app_name) $(dir $(artifact))
-	cp -r $(release_files) $(build_dir)/source/$(app_name)/
+	@if [ -d .git ] && command -v git >/dev/null 2>&1; then \
+		git -c safe.directory="$(CURDIR)" archive --format=tar -o $(build_dir)/source.tar HEAD -- $(release_files) \
+			&& tar -xf $(build_dir)/source.tar -C $(build_dir)/source/$(app_name) \
+			&& rm -f $(build_dir)/source.tar \
+			&& cp -r lib/Vendor $(build_dir)/source/$(app_name)/lib/Vendor; \
+	else \
+		cp -r $(release_files) $(build_dir)/source/$(app_name)/; \
+	fi
+	@test -f $(build_dir)/source/$(app_name)/appinfo/info.xml \
+		|| { echo "appinfo/info.xml is missing from staged source"; exit 1; }
 	@test -f $(build_dir)/source/$(app_name)/lib/Vendor/Smalot/PdfParser/Parser.php \
 		|| { echo "lib/Vendor is missing: the archive would ship without the PDF fallback"; exit 1; }
 	tar -czf $(artifact) -C $(build_dir)/source --sort=name --owner=0 --group=0 --numeric-owner \
