@@ -3928,6 +3928,97 @@ try {
 		@unlink($h3SpyPdfToText);
 		@rmdir($h3ToolDir);
 	}
+
+	section('H4: benchmark exit codes and make appstore git-tracked staging');
+	$h4BenchDb = 'ftspg_h4_bench_' . getmypid();
+	$qH4BenchDb = '"' . str_replace('"', '""', $h4BenchDb) . '"';
+	$h4BenchParts = $dsnParts;
+	$h4BenchParts['dbname'] = $h4BenchDb;
+	$h4BenchDsn = 'pgsql:' . implode(';', array_map(
+		static fn (string $k, string $v): string => "$k=$v",
+		array_keys($h4BenchParts),
+		array_values($h4BenchParts)
+	));
+	$h4Env = getenv();
+	if (!is_array($h4Env)) {
+		$h4Env = [];
+	}
+	$h4Env['FTSPG_TEST_DSN'] = $h4BenchDsn;
+	$benchScript = __DIR__ . '/bench/run.php';
+	$h4TightBaseline = sys_get_temp_dir() . '/ftspg_h4_tight_' . getmypid() . '.json';
+	$h4LooseBaseline = sys_get_temp_dir() . '/ftspg_h4_loose_' . getmypid() . '.json';
+	$repoRoot = dirname(__DIR__);
+	$hadBuildDir = is_dir($repoRoot . '/build');
+	$hasGitRepo = is_dir($repoRoot . '/.git');
+	$h4StrayFile = $repoRoot . '/lib/H4UntrackedProbe.php';
+
+	try {
+		// 1. Missing --compare file and --check-budget without --compare exit 2
+		[$missingCmpCode, , $missingCmpErr] = $runPgTool([PHP_BINARY, $benchScript, '--compare=/tmp/ftspg_missing_' . getmypid() . '.json'], $h4Env);
+		same(2, $missingCmpCode, 'H4: bench exits 2 when --compare file does not exist');
+		check($missingCmpErr !== '', 'H4: bench writes error to stderr on missing --compare file');
+
+		[$noCmpBudgetCode, , $noCmpBudgetErr] = $runPgTool([PHP_BINARY, $benchScript, '--check-budget=a3'], $h4Env);
+		same(2, $noCmpBudgetCode, 'H4: bench exits 2 when --check-budget is given without --compare');
+		check($noCmpBudgetErr !== '', 'H4: bench writes error to stderr when --check-budget lacks --compare');
+
+		// 2. --check-budget=a3 exits 1 on BREACH, cleans up on scenario-mismatch exit 2, and exits 0 when within budget
+		$conn->executeStatement("DROP DATABASE IF EXISTS $qH4BenchDb WITH (FORCE)");
+		$conn->executeStatement("CREATE DATABASE $qH4BenchDb TEMPLATE template0");
+
+		file_put_contents($h4TightBaseline, json_encode([
+			'results' => [['id' => 'a3-worst-case', 'median_ms' => 0.001]],
+		]));
+		[$breachCode, $breachOut, ] = $runPgTool([
+			PHP_BINARY, $benchScript, '--docs=20', '--runs=1', '--warmup=0',
+			'--only=a3-worst-case', "--compare=$h4TightBaseline", '--check-budget=a3',
+		], $h4Env);
+		same(1, $breachCode, 'H4: bench exits 1 when --check-budget=a3 detects a BREACH');
+		check(str_contains($breachOut, 'BREACH'), 'H4: bench output still includes BREACH status row');
+
+		[$mismatchCode, , ] = $runPgTool([
+			PHP_BINARY, $benchScript, '--docs=20', '--runs=1', '--warmup=0',
+			'--only=frequent', "--compare=$h4TightBaseline", '--check-budget=a3', '--cleanup',
+		], $h4Env);
+		same(2, $mismatchCode, 'H4: bench exits 2 when --check-budget has no matching scenario in baseline');
+		$h4CheckPdo = new PDO($h4BenchDsn);
+		same(0, (int)$h4CheckPdo->query('SELECT count(*) FROM ftspg_oc_index')->fetchColumn(), 'H4: bench --cleanup still truncates dataset on scenario-mismatch exit 2');
+		$h4CheckPdo = null;
+
+		file_put_contents($h4LooseBaseline, json_encode([
+			'results' => [['id' => 'a3-worst-case', 'median_ms' => 5000.0]],
+		]));
+		[$passCode, $passOut, ] = $runPgTool([
+			PHP_BINARY, $benchScript, '--docs=20', '--runs=1', '--warmup=0',
+			'--only=a3-worst-case', "--compare=$h4LooseBaseline", '--check-budget=a3', '--cleanup',
+		], $h4Env);
+		same(0, $passCode, 'H4: bench exits 0 when --check-budget=a3 passes');
+		check(str_contains($passOut, 'PASS'), 'H4: bench output includes PASS status row');
+
+		// 3. make appstore excludes untracked files inside lib/ while bundling lib/Vendor
+		if ($hasGitRepo) {
+			file_put_contents($h4StrayFile, "<?php\n// untracked probe\n");
+		}
+		[$makeCode, , $makeErr] = $runPgTool(['make', '-C', $repoRoot, 'appstore'], $h4Env);
+		same(0, $makeCode, 'H4: make appstore exits 0' . ($makeErr === '' ? '' : ': ' . trim($makeErr)));
+		$archivePath = $repoRoot . '/build/artifacts/appstore/fulltextsearch_pgsql.tar.gz';
+		[$tarCode, $tarList, ] = $runPgTool(['tar', '-tzf', $archivePath], $h4Env);
+		same(0, $tarCode, 'H4: built appstore archive is readable');
+		$archiveEntries = explode("\n", trim($tarList));
+		same(true, in_array('fulltextsearch_pgsql/appinfo/info.xml', $archiveEntries, true), 'H4: appstore archive includes appinfo/info.xml');
+		same(true, in_array('fulltextsearch_pgsql/lib/Vendor/Smalot/PdfParser/Parser.php', $archiveEntries, true), 'H4: appstore archive bundles scoped PdfParser');
+		if ($hasGitRepo) {
+			same(false, in_array('fulltextsearch_pgsql/lib/H4UntrackedProbe.php', $archiveEntries, true), 'H4: appstore archive excludes untracked file in lib/');
+		}
+	} finally {
+		@unlink($h4StrayFile);
+		@unlink($h4TightBaseline);
+		@unlink($h4LooseBaseline);
+		if (!$hadBuildDir) {
+			$runPgTool(['make', '-C', $repoRoot, 'clean'], $h4Env);
+		}
+		$conn->executeStatement("DROP DATABASE IF EXISTS $qH4BenchDb WITH (FORCE)");
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";

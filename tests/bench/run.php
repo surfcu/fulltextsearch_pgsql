@@ -145,6 +145,28 @@ $outputFile = is_string($options['output'] ?? null) ? $options['output'] : null;
 $compareFile = is_string($options['compare'] ?? null) ? $options['compare'] : null;
 $checkBudget = is_string($options['check-budget'] ?? null) ? $options['check-budget'] : null;
 
+$baseline = null;
+if ($checkBudget !== null && $checkBudget !== 'a3') {
+	fwrite(STDERR, "Unsupported --check-budget value: $checkBudget\n");
+	exit(2);
+}
+if ($checkBudget !== null && $compareFile === null) {
+	fwrite(STDERR, "--check-budget requires --compare=<file>\n");
+	exit(2);
+}
+if ($compareFile !== null) {
+	if (!is_file($compareFile)) {
+		fwrite(STDERR, "Baseline file not found: $compareFile\n");
+		exit(2);
+	}
+	$decodedBaseline = json_decode((string)file_get_contents($compareFile), true);
+	if (!is_array($decodedBaseline) || !isset($decodedBaseline['results']) || !is_array($decodedBaseline['results'])) {
+		fwrite(STDERR, "Invalid baseline JSON in: $compareFile\n");
+		exit(2);
+	}
+	$baseline = $decodedBaseline;
+}
+
 $dsn = getenv('FTSPG_TEST_DSN') ?: 'pgsql:host=localhost;port=5432;dbname=fts_test;user=postgres;password=postgres';
 $pdo = new PDO($dsn);
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -466,9 +488,51 @@ foreach ($scenarios as $sc) {
 }
 
 // Compare mode
-$baseline = null;
-if ($compareFile !== null && file_exists($compareFile)) {
-	$baseline = json_decode((string)file_get_contents($compareFile), true);
+$baseMap = [];
+if ($baseline !== null) {
+	foreach ($baseline['results'] as $bRow) {
+		if (is_array($bRow) && isset($bRow['id'])) {
+			$baseMap[(string)$bRow['id']] = $bRow;
+		}
+	}
+}
+$breached = false;
+$checkedBudgetRows = 0;
+$statuses = [];
+if ($baseline !== null) {
+	foreach ($results as $r) {
+		$b = $baseMap[$r['id']] ?? null;
+		if ($b === null) {
+			continue;
+		}
+		$bMedian = (float)($b['median_ms'] ?? 0.0);
+		$delta = $r['median_ms'] - $bMedian;
+		$pct = $bMedian > 0 ? ($delta / $bMedian) * 100 : 0;
+		$status = $pct > 10.0 ? 'REGRESSION (>10%)' : 'PASS';
+		if ($checkBudget === 'a3') {
+			if ($r['id'] === 'rare') {
+				$checkedBudgetRows++;
+				if ($delta > 2.0 || ($bMedian > 0 && ($r['median_ms'] / $bMedian) > 2.0)) {
+					$status = 'BREACH (>+2ms or >2x)';
+					$breached = true;
+				}
+			} elseif ($r['id'] === 'a3-worst-case') {
+				$checkedBudgetRows++;
+				if ($bMedian > 0 && ($r['median_ms'] / $bMedian) > 2.0) {
+					$status = 'BREACH (>2x)';
+					$breached = true;
+				}
+			}
+		}
+		$statuses[$r['id']] = [$bMedian, $delta, $pct, $status];
+	}
+	if ($checkBudget !== null && $checkedBudgetRows === 0) {
+		if ($cleanup) {
+			$schema->truncate();
+		}
+		fwrite(STDERR, "No matching scenarios in baseline for --check-budget=$checkBudget\n");
+		exit(2);
+	}
 }
 
 // Formatting
@@ -485,43 +549,19 @@ if ($format === 'json') {
 	$outStr = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
 } else {
 	if ($baseline !== null) {
-		$baseMap = [];
-		foreach ($baseline['results'] ?? [] as $bRow) {
-			$baseMap[$bRow['id']] = $bRow;
-		}
-
 		$outStr .= "| Search | Matches | Baseline | Candidate | Delta | % Change | Gate Status |\n";
 		$outStr .= "|---|---|---|---|---|---|---|\n";
 
 		foreach ($results as $r) {
-			$b = $baseMap[$r['id']] ?? null;
-			if ($b !== null) {
-				$delta = $r['median_ms'] - $b['median_ms'];
-				$pct = $b['median_ms'] > 0 ? ($delta / $b['median_ms']) * 100 : 0;
-				$status = 'PASS';
-				if ($pct > 10.0) {
-					$status = 'REGRESSION (>10%)';
-				}
-				if ($checkBudget === 'a3') {
-					if (
-						$r['id'] === 'rare'
-						&& ($delta > 2.0 || ($b['median_ms'] > 0 && ($r['median_ms'] / $b['median_ms']) > 2.0))
-					) {
-						$status = 'BREACH (>+2ms or >2x)';
-					} elseif (
-						$r['id'] === 'a3-worst-case'
-						&& $b['median_ms'] > 0
-						&& ($r['median_ms'] / $b['median_ms']) > 2.0
-					) {
-						$status = 'BREACH (>2x)';
-					}
-				}
+			$cmp = $statuses[$r['id']] ?? null;
+			if ($cmp !== null) {
+				[$bMedian, $delta, $pct, $status] = $cmp;
 				$sign = $delta >= 0 ? '+' : '';
 				$outStr .= sprintf(
 					"| %s | %s | %.2f ms | %.2f ms | %s%.2f ms | %s%.1f%% | %s |\n",
 					$r['name'],
 					number_format($r['matches']),
-					$b['median_ms'],
+					$bMedian,
 					$r['median_ms'],
 					$sign, $delta,
 					$sign, $pct,
@@ -558,3 +598,5 @@ if ($cleanup) {
 	echo "Cleaning up benchmark dataset...\n";
 	$schema->truncate();
 }
+
+exit($breached ? 1 : 0);
