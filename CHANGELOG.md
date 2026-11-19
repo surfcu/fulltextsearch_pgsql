@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Search transaction, pagination, and query-operator hardening: isolate caller-owned search transactions with a savepoint so handled timeouts or PHP errors never abort the caller's transaction or leak planner GUCs, explicitly set `statement_timeout` to `0` when `search_timeout = 0`, pin `pg_trgm.word_similarity_threshold` transaction-locally, clamp large page offsets against integer overflow, skip the trigram title fallback on stopword-only queries, scrub invalid UTF-8 and NUL bytes in tag filters and `PgArray`, preserve `+` and `-` operators past the 32-term cap, and schema-qualify `pg_catalog.simple` / `pg_catalog.regconfig`; no re-indexing is needed.
+
 ## [1.6.0] - 2026-11-18
 
 ### Added

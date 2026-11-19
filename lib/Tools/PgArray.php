@@ -12,7 +12,7 @@ final class PgArray {
 	/** @param list<string> $values */
 	public static function toLiteral(array $values): string {
 		$items = array_map(
-			static fn (string $v): string => '"' . addcslashes(str_replace("\0", '', $v), '"\\') . '"',
+			static fn (string $v): string => '"' . addcslashes(str_replace("\0", '', mb_scrub($v, 'UTF-8')), '"\\') . '"',
 			$values
 		);
 		return '{' . implode(',', $items) . '}';

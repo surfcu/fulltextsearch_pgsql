@@ -1767,17 +1767,17 @@ try {
 	[$punctTsSql, $punctTsParams] = $a3Qb->wordTsQuery('---', 'english');
 	same(0, (int)$conn->executeQuery("SELECT numnode($punctTsSql)", $punctTsParams)->fetchOne(), 'A3: wordTsQuery punctuation-only has numnode 0');
 	[$trTsSql, $trTsParams] = $a3Qb->wordTsQuery('İZMİR', 'turkish');
-	same(['to_tsquery(CAST(? AS regconfig), ?)', ['turkish', "'iZMiR':*"]], [$trTsSql, $trTsParams], 'A3: wordTsQuery maps Turkish İ -> i');
+	same(['to_tsquery(CAST(? AS pg_catalog.regconfig), ?)', ['turkish', "'iZMiR':*"]], [$trTsSql, $trTsParams], 'A3: wordTsQuery maps Turkish İ -> i');
 	same("'izmir':*", (string)$conn->executeQuery("SELECT ($trTsSql)::text", $trTsParams)->fetchOne(), 'A3: wordTsQuery Turkish İ compiles cleanly in PostgreSQL');
 	[$trDotlessSql, $trDotlessParams] = $a3Qb->wordTsQuery('ISIK', 'turkish');
-	same(['to_tsquery(CAST(? AS regconfig), ?)', ['turkish', "'ıSıK':*"]], [$trDotlessSql, $trDotlessParams], 'A3: wordTsQuery maps Turkish I -> ı');
+	same(['to_tsquery(CAST(? AS pg_catalog.regconfig), ?)', ['turkish', "'ıSıK':*"]], [$trDotlessSql, $trDotlessParams], 'A3: wordTsQuery maps Turkish I -> ı');
 	same("'ısık':*", (string)$conn->executeQuery("SELECT ($trDotlessSql)::text", $trDotlessParams)->fetchOne(), 'A3: wordTsQuery Turkish I compiles cleanly in PostgreSQL');
 	[$wTsSql, $wTsParams] = $a3Qb->wordTsQuery('budget', 'english', 'A');
-	same(['to_tsquery(CAST(? AS regconfig), ?)', ['english', "'budget':*A"]], [$wTsSql, $wTsParams], 'A3: wordTsQuery applies optional weight labels');
+	same(['to_tsquery(CAST(? AS pg_catalog.regconfig), ?)', ['english', "'budget':*A"]], [$wTsSql, $wTsParams], 'A3: wordTsQuery applies optional weight labels');
 	[$simpleExactSql, $simpleExactParams] = $a3Qb->wordTsQuery('receive', 'simple', null, false);
-	same(['to_tsquery(CAST(? AS regconfig), ?)', ['simple', "'receive'"]], [$simpleExactSql, $simpleExactParams], 'A3: wordTsQuery simple exact omits prefix wildcard');
+	same(['to_tsquery(CAST(? AS pg_catalog.regconfig), ?)', ['simple', "'receive'"]], [$simpleExactSql, $simpleExactParams], 'A3: wordTsQuery simple exact omits prefix wildcard');
 	[$simplePrefixSql, $simplePrefixParams] = $a3Qb->wordTsQuery('receive', 'simple', null, true);
-	same(['to_tsquery(CAST(? AS regconfig), ?)', ['simple', "'receive':*"]], [$simplePrefixSql, $simplePrefixParams], 'A3: wordTsQuery simple prefix keeps :*');
+	same(['to_tsquery(CAST(? AS pg_catalog.regconfig), ?)', ['simple', "'receive':*"]], [$simplePrefixSql, $simplePrefixParams], 'A3: wordTsQuery simple prefix keeps :*');
 
 	$platform->indexDocument(doc('A3_B_RECV', 'bob', 'Parcel', 'We will receive the parcel tomorrow.', [], 'a3'));
 	$platform->indexDocument(doc('A3_B_ACC', 'bob', 'Rapor', 'Yeni çözümleme raporu hazırlandı.', [], 'a3'));
@@ -3579,6 +3579,207 @@ try {
 		}
 		$platform->resetIndex('s3dump');
 		$config->setConfig(['language' => 'turkish']);
+	}
+
+	section('H1: search caller-tx savepoints, GUC hygiene, paging overflow, stopword fallback, UTF-8 filters, 33+ operators');
+	$platform->resetIndex('h1p');
+	$config->setConfig(['language' => 'english', 'use_trigram' => true, 'typo_correction' => true, 'search_timeout' => 10]);
+	$platform->indexDocument(doc('H1_DOC1', 'alice', 'The Annual Budget Report.txt', 'Quarterly budget numbers and forecasts', [
+		'metatags' => ['keep'],
+		'subtags' => ['files' => 'local'],
+	], 'h1p'));
+	$platform->indexDocument(doc('H1_SECRET', 'alice', 'Secret Draft.txt', 'word1 secret confidential note', [], 'h1p'));
+	$platform->indexDocument(doc('H1_PUBLIC', 'alice', 'Public Summary.txt', 'word1 must public summary', [], 'h1p'));
+	$platform->indexDocument(doc('H1_RUN', 'alice', 'Sprint Notes.txt', 'rédaction running tasks', [], 'h1p'));
+
+	try {
+		// 1. Timeout inside caller's transaction rolls back internal savepoint without leaving caller tx in 25P02
+		$conn->beginTransaction();
+		$conn->executeStatement("SET LOCAL statement_timeout = '80ms'");
+		$conn2->beginTransaction();
+		$conn2->exec('LOCK TABLE ftspg_oc_index IN ACCESS EXCLUSIVE MODE');
+		$h1TxTimeout = search($platform, 'alice', 'budget', ['provider' => 'h1p']);
+		$conn2->rollBack();
+		same(true, $h1TxTimeout['timedOut'], 'H1: timeout inside caller tx sets timedOut');
+		$callerHealthy = false;
+		try {
+			$callerHealthy = (int)$conn->executeQuery('SELECT 1')->fetchOne() === 1;
+		} catch (Throwable) {
+			$callerHealthy = false;
+		}
+		$conn->rollBack();
+		same(true, $callerHealthy, 'H1: caller transaction stays usable (not 25P02) after search timeout');
+
+		// 2. Non-SQL PHP exception inside caller's transaction does not leak planner GUCs
+		$conn->beginTransaction();
+		$seqBefore = (string)$conn->executeQuery("SELECT pg_catalog.current_setting('enable_seqscan')")->fetchOne();
+		$phpThrew = false;
+		try {
+			$reqThrow = double(ISearchRequest::class, [
+				'getSearch' => 'budget',
+				'getSize' => 20,
+				'getPage' => 1,
+				'getMetaTags' => [],
+				'getSubTags' => [],
+				'getOption' => '',
+				'getRegexFilters' => [],
+				'getWildcardFilters' => [],
+				'getLimitFields' => [],
+			]);
+			$provThrow = double(IFullTextSearchProvider::class, ['getId' => 'h1p']);
+			$resThrow = double(ISearchResult::class, [
+				'getRequest' => $reqThrow,
+				'getProvider' => $provThrow,
+				'addDocument' => function (): void {
+					throw new \RuntimeException('injected callback error');
+				},
+				'setTotal' => null,
+				'setTimedOut' => null,
+				'setTime' => null,
+				'setMaxScore' => null,
+			]);
+			$accThrow = new DocumentAccess();
+			$accThrow->setViewerId('alice');
+			$platform->searchRequest($resThrow, $accThrow);
+		} catch (\RuntimeException) {
+			$phpThrew = true;
+		}
+		$seqAfter = (string)$conn->executeQuery("SELECT pg_catalog.current_setting('enable_seqscan')")->fetchOne();
+		$conn->rollBack();
+		same(true, $phpThrew, 'H1: non-SQL PHP exception propagates to caller');
+		same($seqBefore, $seqAfter, 'H1: non-SQL PHP exception inside caller tx restores enable_seqscan');
+
+		// 3. Fresh session with unset pg_trgm thresholds inside caller tx restores 0.3 / 0.6 defaults
+		if ($schema->hasTrigram()) {
+			$freshPdo = new PDO($dsn);
+			$freshConn = new PdoConnection($freshPdo);
+			$freshSchema = new SchemaService($freshConn, new ArrayConfig(['dbtableprefix' => 'oc_']), $logger);
+			$freshConfig = new ConfigService($appConfig, $freshSchema, $logger);
+			$freshVocab = new VocabularyService($freshConn, $freshSchema);
+			$freshSearch = new SearchService($freshConn, $freshSchema, $freshConfig, new TsQueryBuilder(), $freshVocab);
+			$freshPlatform = new PostgreSQLPlatform($freshConfig, $freshSchema, $indexService, $freshSearch, $logger, $extractor);
+			$freshConn->beginTransaction();
+			$unsetBefore = $freshConn->executeQuery("SELECT pg_catalog.current_setting('pg_trgm.similarity_threshold', true)")->fetchOne();
+			same(null, $unsetBefore, 'H1: fresh session starts with null pg_trgm.similarity_threshold');
+			search($freshPlatform, 'alice', 'budget', ['provider' => 'h1p']);
+			$simAfter = (float)$freshConn->executeQuery("SELECT pg_catalog.current_setting('pg_trgm.similarity_threshold')")->fetchOne();
+			$wordSimAfter = (float)$freshConn->executeQuery("SELECT pg_catalog.current_setting('pg_trgm.word_similarity_threshold')")->fetchOne();
+			$freshConn->rollBack();
+			same(0.3, round($simAfter, 2), 'H1: fresh session restores pg_trgm.similarity_threshold to 0.3');
+			same(0.6, round($wordSimAfter, 2), 'H1: fresh session restores pg_trgm.word_similarity_threshold to 0.6');
+		}
+
+		// 4. search_timeout = 0 disables an inherited session statement_timeout during own-tx search
+		$config->setConfig(['search_timeout' => 0]);
+		$observedTimeout = null;
+		$timeoutInspectProxy = new class($conn, $observedTimeout) implements \OCP\IDBConnection {
+			public function __construct(
+				private \OCP\IDBConnection $inner,
+				private mixed &$observed,
+			) {
+			}
+			public function executeStatement($sql, array $params = [], array $types = []): int {
+				return $this->inner->executeStatement($sql, $params, $types);
+			}
+			public function executeQuery(string $sql, array $params = [], $types = []): \OCP\DB\IResult {
+				if (str_contains($sql, 'FROM "public"."ftspg_oc_index"') && $this->observed === null) {
+					$this->observed = (string)$this->inner->executeQuery("SELECT pg_catalog.current_setting('statement_timeout')")->fetchOne();
+				}
+				return $this->inner->executeQuery($sql, $params, $types);
+			}
+			public function inTransaction(): bool {
+				return $this->inner->inTransaction();
+			}
+			public function beginTransaction(): void {
+				$this->inner->beginTransaction();
+			}
+			public function commit(): void {
+				$this->inner->commit();
+			}
+			public function rollBack(): void {
+				$this->inner->rollBack();
+			}
+			public function getDatabaseProvider(): string {
+				return $this->inner->getDatabaseProvider();
+			}
+		};
+		$inspectSearch = new SearchService($timeoutInspectProxy, $schema, $config, new TsQueryBuilder(), $vocabulary);
+		$inspectPlatform = new PostgreSQLPlatform($config, $schema, $indexService, $inspectSearch, $logger, $extractor);
+		$conn->executeStatement("SET statement_timeout = '250ms'");
+		try {
+			search($inspectPlatform, 'alice', 'budget', ['provider' => 'h1p']);
+			$sessionAfter = (string)$conn->executeQuery("SELECT pg_catalog.current_setting('statement_timeout')")->fetchOne();
+		} finally {
+			$conn->executeStatement('SET statement_timeout = 0');
+			$config->setConfig(['search_timeout' => 10]);
+		}
+		same('0', $observedTimeout, 'H1: search_timeout = 0 sets statement_timeout to 0 inside own transaction');
+		same('250ms', $sessionAfter, 'H1: session statement_timeout restored after own transaction commits');
+
+		// 5. Pinned pg_trgm.word_similarity_threshold + stopword guard on title fallback
+		if ($schema->hasTrigram()) {
+			$config->setConfig(['typo_correction' => false]);
+			$conn->executeStatement('SET pg_trgm.word_similarity_threshold = 0.95');
+			try {
+				$wsHit = search($platform, 'alice', 'annuall', ['provider' => 'h1p']);
+				$wsSessionAfter = (float)$conn->executeQuery("SELECT pg_catalog.current_setting('pg_trgm.word_similarity_threshold')")->fetchOne();
+			} finally {
+				$conn->executeStatement('RESET pg_trgm.word_similarity_threshold');
+				$config->setConfig(['typo_correction' => true]);
+			}
+			same(['H1_DOC1'], $wsHit['ids'], 'H1: title similarity fallback pins word_similarity_threshold to 0.6');
+			same(0.95, round($wsSessionAfter, 2), 'H1: session word_similarity_threshold preserved after search');
+
+			$stopFallback = search($platform, 'alice', 'the', ['provider' => 'h1p']);
+			same([], $stopFallback['ids'], 'H1: stopword-only plain search does not match titles via trigram fallback');
+			same(0, $stopFallback['total'], 'H1: stopword-only plain search reports total 0');
+		}
+
+		// 6. Extreme page numbers clamp offset cleanly without TypeError or SQL error
+		$maxPageHit = search($platform, 'alice', 'budget', ['provider' => 'h1p', 'page' => PHP_INT_MAX, 'size' => 100]);
+		same([], $maxPageHit['ids'], 'H1: page=PHP_INT_MAX returns empty page without TypeError');
+		same(1, $maxPageHit['total'], 'H1: page=PHP_INT_MAX preserves accurate total');
+		if ($schema->hasTrigram()) {
+			$config->setConfig(['typo_correction' => false]);
+			$maxPageFallback = search($platform, 'alice', 'annuall', ['provider' => 'h1p', 'page' => PHP_INT_MAX, 'size' => 100]);
+			$config->setConfig(['typo_correction' => true]);
+			same([], $maxPageFallback['ids'], 'H1: fallback page=PHP_INT_MAX returns empty page without TypeError');
+			same(1, $maxPageFallback['total'], 'H1: fallback page=PHP_INT_MAX preserves accurate total');
+		}
+
+		// 7. Invalid UTF-8 and NUL in metatags / subtags filters and PgArray
+		$badMetaOnly = search($platform, 'alice', 'budget', ['provider' => 'h1p', 'metatags' => ["bad\xFFtag"]]);
+		same([], $badMetaOnly['ids'], 'H1: invalid UTF-8 metatag filter matches nothing without SQL error');
+		$badMetaMixed = search($platform, 'alice', 'budget', ['provider' => 'h1p', 'metatags' => ["bad\xFFtag", 'keep']]);
+		same(['H1_DOC1'], $badMetaMixed['ids'], 'H1: valid metatag alongside invalid UTF-8 metatag still matches');
+		$badSub = search($platform, 'alice', 'budget', ['provider' => 'h1p', 'subtags' => ['files_local', "bad\xFFsub"]]);
+		same([], $badSub['ids'], 'H1: invalid UTF-8 subtag filter fails closed without SQL error');
+		same(true, mb_check_encoding(\OCA\FullTextSearch_PgSql\Tools\PgArray::toLiteral(["ok\xFF\0val"]), 'UTF-8'), 'H1: PgArray::toLiteral scrubs invalid UTF-8 and NUL');
+
+		// 8. +required and -excluded operators at position 33+ are preserved
+		$pad32 = implode(' ', array_map(static fn (int $i): string => "word$i", range(1, 32)));
+		$res33Excl = search($platform, 'alice', "$pad32 -secret", ['provider' => 'h1p']);
+		same(['H1_PUBLIC'], $res33Excl['ids'], 'H1: 33rd term -secret exclusion is enforced');
+		$res33Req = search($platform, 'alice', "$pad32 +must", ['provider' => 'h1p']);
+		same(['H1_PUBLIC'], $res33Req['ids'], 'H1: 33rd term +must requirement is enforced');
+		$overReq = implode(' ', array_map(static fn (int $i): string => "+req$i", range(1, 33)));
+		same([], search($platform, 'alice', $overReq, ['provider' => 'h1p'])['ids'], 'H1: >32 required terms fail closed');
+
+		// 9. Shadowed 'simple' configuration ahead of pg_catalog does not alter surface visibility probes
+		$conn->executeStatement('CREATE SCHEMA IF NOT EXISTS h1_shadow');
+		$conn->executeStatement('DROP TEXT SEARCH CONFIGURATION IF EXISTS h1_shadow.simple');
+		$conn->executeStatement('CREATE TEXT SEARCH CONFIGURATION h1_shadow.simple (COPY = pg_catalog.english)');
+		$conn->executeStatement('SET search_path = h1_shadow, pg_catalog, public');
+		try {
+			// 'redaction' checks accent variant 'rédaction' via surface 'simple' probe
+			same(['H1_RUN'], search($platform, 'alice', 'redaction', ['provider' => 'h1p'])['ids'], 'H1: accent probe uses pg_catalog.simple under custom search_path');
+		} finally {
+			$conn->executeStatement('RESET search_path');
+			$conn->executeStatement('DROP SCHEMA h1_shadow CASCADE');
+		}
+	} finally {
+		$platform->resetIndex('h1p');
+		$config->setConfig(['language' => 'turkish', 'search_timeout' => 10]);
 	}
 } catch (Throwable $e) {
 	$failures++;
