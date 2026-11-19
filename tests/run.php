@@ -4019,6 +4019,176 @@ try {
 		}
 		$conn->executeStatement("DROP DATABASE IF EXISTS $qH4BenchDb WITH (FORCE)");
 	}
+
+	section('P4: batched vocabulary lookup and atomic shadow-table rebuild');
+	$p4DropTables = static function () use ($conn, $platform): void {
+		if ($conn->inTransaction()) {
+			$conn->rollBack();
+		}
+		$platform->resetIndex('p4p');
+		$conn->executeStatement('DROP TABLE IF EXISTS ftspg_p4_index, ftspg_p4_words, ftspg_p4_words_rebuild');
+		$conn->executeStatement('DROP FUNCTION IF EXISTS ftspg_p4_regconfig(text)');
+	};
+	$p4DropTables();
+	$config->setConfig(['language' => 'english', 'use_trigram' => true, 'typo_correction' => true]);
+	try {
+		$platform->indexDocument(doc('P4_ACC', 'alice', 'Toplantı Ozeti.txt', 'Yıllık çalışma ve öğrenci planı', [], 'p4p'));
+		$platform->indexDocument(doc('P4_TYP', 'alice', 'Quarterly Supplier.txt', 'We will receive quarterly shipments', [], 'p4p'));
+
+		// 1. Direct alternatives(..., true) issues a single batched query against ftspg_oc_words for all words
+		$conn->statements = [];
+		$directAlts = $vocabulary->alternatives(
+			['calisma', 'ogrenci', 'recieve', 'quartrly'],
+			true,
+			static fn (array $probeWords): array => array_values(array_intersect($probeWords, ['çalışma', 'öğrenci', 'receive', 'quarterly']))
+		);
+		$wordsTableSqls = array_values(array_filter(
+			$conn->statements,
+			static fn (string $sql): bool => str_contains($sql, 'ftspg_oc_words')
+		));
+		same(['çalışma'], $directAlts['calisma'] ?? [], 'P4: batched alternatives resolves accent variant for calisma');
+		same(['öğrenci'], $directAlts['ogrenci'] ?? [], 'P4: batched alternatives resolves accent variant for ogrenci');
+		if ($schema->hasTrigram()) {
+			same(['receive'], $directAlts['recieve'] ?? [], 'P4: batched alternatives resolves spelling correction for recieve');
+			same(['quarterly'], $directAlts['quartrly'] ?? [], 'P4: batched alternatives resolves spelling correction for quartrly');
+		}
+		same(1, count($wordsTableSqls), 'P4: alternatives() queries ftspg_oc_words once for all words combined');
+
+		// 2. Statement count per search drops (Pass 2 does not re-run Phase 1 or separate stopwords query)
+		$conn->statements = [];
+		$p4AccSearch = search($platform, 'alice', 'calisma ogrenci', ['provider' => 'p4p']);
+		same(['P4_ACC'], $p4AccSearch['ids'], 'P4: accent search finds document');
+		$p4AccWordsSqls = array_values(array_filter(
+			$conn->statements,
+			static fn (string $sql): bool => str_contains($sql, 'ftspg_oc_words')
+		));
+		same(1, count($p4AccWordsSqls), 'P4: < size search where words already have accents queries ftspg_oc_words once');
+		check(count($conn->statements) <= 8, 'P4: statement count for 2-word accent search stays <= 8 (got ' . count($conn->statements) . ')');
+
+		if ($schema->hasTrigram()) {
+			$conn->statements = [];
+			$p4MixSearch = search($platform, 'alice', 'calisma recieve with', ['provider' => 'p4p']);
+			same(['P4_ACC', 'P4_TYP'], sorted($p4MixSearch['ids']), 'P4: mixed accent + typo + stopword search finds both documents');
+			check(count($conn->statements) <= 15, 'P4: statement count for mixed accent + typo + stopword search drops to <= 15 (got ' . count($conn->statements) . ')');
+		}
+
+		// 3. Atomic shadow-table rebuild(): corrections keep working mid-rebuild, ID gaps page by id > ? ORDER BY id LIMIT n, concurrent rebuilds serialize
+		$p4SysConfig = new ArrayConfig(['dbtableprefix' => 'p4_']);
+		$p4Schema = new SchemaService($conn, $p4SysConfig, $logger);
+		$p4Config = new ConfigService(new ArrayAppConfig(), $p4Schema);
+		$p4Config->setConfig(['language' => 'english', 'use_trigram' => true, 'typo_correction' => true]);
+		$p4Extractor = new ContentExtractor($p4Config);
+		$p4Vocab = new VocabularyService($conn, $p4Schema);
+		$p4Detector = new LanguageDetector($conn, $p4Config, $logger);
+		$p4Index = new IndexService($conn, $p4Schema, $p4Config, $p4Extractor, $p4Vocab, $logger, $p4Detector);
+		$p4Search = new SearchService($conn, $p4Schema, $p4Config, new TsQueryBuilder(), $p4Vocab);
+		$p4Platform = new PostgreSQLPlatform($p4Config, $p4Schema, $p4Index, $p4Search, $logger, $p4Extractor);
+		$p4Platform->initializeIndex();
+
+		$p4Platform->indexDocument(doc('P4_R1', 'alice', 'First Doc', 'çalışma planı hazır', [], 'p4p'));
+		$p4Platform->indexDocument(doc('P4_R2', 'alice', 'Second Doc', 'receive invoice tomorrow', [], 'p4p'));
+		$p4Platform->indexDocument(doc('P4_R3', 'alice', 'Third Doc', 'sözleşme detayları', [], 'p4p'));
+		$conn->executeStatement("INSERT INTO ftspg_p4_words (word) VALUES ('staleobsoleteword') ON CONFLICT (word) DO NOTHING");
+		// Create a 2,000-ID gap to verify keyset paging (id > ? ORDER BY id LIMIT n)
+		$conn->executeStatement("UPDATE ftspg_p4_index SET id = id + 2000 WHERE document_id = 'P4_R3'");
+
+		$midRebuildIds = null;
+		$sawConcurrentWait = false;
+		$childProc = null;
+		$childPipes = [];
+		$conn->statements = [];
+
+		$rebuiltCount = $p4Vocab->rebuild(function (int $done, int $total) use (
+			$dsn,
+			$p4SysConfig,
+			$logger,
+			&$midRebuildIds,
+			&$sawConcurrentWait,
+			&$childProc,
+			&$childPipes
+		): void {
+			if ($done !== 1) {
+				return;
+			}
+			// A) Verify a second connection can still run accent + spelling corrections without blocking
+			$pdo2 = new PDO($dsn);
+			$pdo2->exec("SET lock_timeout = '500ms'");
+			$connConcurrent = new PdoConnection($pdo2, 'p4_');
+			$s2 = new SchemaService($connConcurrent, $p4SysConfig, $logger);
+			$c2 = new ConfigService(new ArrayAppConfig(), $s2);
+			$c2->setConfig(['language' => 'english', 'use_trigram' => true, 'typo_correction' => true]);
+			$e2 = new ContentExtractor($c2);
+			$v2 = new VocabularyService($connConcurrent, $s2);
+			$d2 = new LanguageDetector($connConcurrent, $c2, $logger);
+			$i2 = new IndexService($connConcurrent, $s2, $c2, $e2, $v2, $logger, $d2);
+			$sr2 = new SearchService($connConcurrent, $s2, $c2, new TsQueryBuilder(), $v2);
+			$pl2 = new PostgreSQLPlatform($c2, $s2, $i2, $sr2, $logger, $e2);
+			$midRebuildIds = sorted(search($pl2, 'alice', 'calisma recieve', ['provider' => 'p4p'])['ids']);
+
+			// B) Spawn a concurrent rebuild() and verify it blocks on pg_advisory_xact_lock
+			$childCode = '<?php' . "\n"
+				. 'declare(strict_types=1);' . "\n"
+				. 'require ' . var_export(__DIR__ . '/bootstrap.php', true) . ';' . "\n"
+				. '$c = new \OCA\FullTextSearch_PgSql\Tests\PdoConnection(new \PDO(' . var_export($dsn, true) . '), "p4_");' . "\n"
+				. '$s = new \OCA\FullTextSearch_PgSql\Service\SchemaService($c, new \OCA\FullTextSearch_PgSql\Tests\ArrayConfig(["dbtableprefix" => "p4_"]), new \OCA\FullTextSearch_PgSql\Tests\MemoryLogger());' . "\n"
+				. '$v = new \OCA\FullTextSearch_PgSql\Service\VocabularyService($c, $s);' . "\n"
+				. 'echo json_encode(["count" => $v->rebuild(null, 2)]);' . "\n";
+			$pipes = [];
+			$proc = proc_open([PHP_BINARY], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+			if (is_resource($proc)) {
+				fwrite($pipes[0], $childCode);
+				fclose($pipes[0]);
+				$childProc = $proc;
+				$childPipes = $pipes;
+				$deadline = microtime(true) + 5.0;
+				while (microtime(true) < $deadline) {
+					$waiting = (int)$pdo2->query("SELECT count(*) FROM pg_locks WHERE pid <> pg_backend_pid() AND locktype = 'advisory' AND NOT granted")->fetchColumn();
+					if ($waiting > 0) {
+						$sawConcurrentWait = true;
+						break;
+					}
+					if (!proc_get_status($proc)['running']) {
+						break;
+					}
+					usleep(10000);
+				}
+			}
+		}, 1);
+
+		$gapStatements = count($conn->statements);
+		$childOut = '';
+		$childErr = '';
+		$childCodeExit = -1;
+		if (is_resource($childProc)) {
+			$childOut = (string)stream_get_contents($childPipes[1]);
+			$childErr = (string)stream_get_contents($childPipes[2]);
+			fclose($childPipes[1]);
+			fclose($childPipes[2]);
+			$childCodeExit = proc_close($childProc);
+		}
+
+		$expectedMid = $p4Schema->hasTrigram() ? ['P4_R1', 'P4_R2'] : ['P4_R1'];
+		same($expectedMid, $midRebuildIds, 'P4: accent and spelling corrections keep working uninterrupted during rebuild()');
+		same(true, $sawConcurrentWait, 'P4: concurrent rebuild() blocks on pg_advisory_xact_lock');
+		same(0, $childCodeExit, 'P4: serialized concurrent rebuild() exits 0' . ($childErr !== '' ? ": $childErr" : ''));
+		$childDecoded = json_decode($childOut, true);
+		same($rebuiltCount, $childDecoded['count'] ?? -1, 'P4: serialized concurrent rebuild() reports identical word count');
+		check($gapStatements < 40, 'P4: rebuild() pages across 2,000-ID gap in < 40 statements via id > ? ORDER BY id LIMIT n (got ' . $gapStatements . ')');
+
+		$remainingWords = $conn->executeQuery('SELECT word FROM ftspg_p4_words')->fetchAll(PDO::FETCH_COLUMN);
+		same(false, in_array('staleobsoleteword', $remainingWords, true), 'P4: rebuild() drops stale words via atomic table swap');
+		same(true, in_array('sözleşme', $remainingWords, true), 'P4: rebuild() includes words from high-ID row past gap');
+		same(false, (bool)$conn->executeQuery("SELECT to_regclass('ftspg_p4_words_rebuild') IS NOT NULL")->fetchOne(), 'P4: shadow rebuild table is renamed away cleanly');
+		$p4IdxNames = $conn->executeQuery("SELECT indexname FROM pg_indexes WHERE tablename = 'ftspg_p4_words'")->fetchAll(PDO::FETCH_COLUMN);
+		same(true, in_array('ftspg_p4_words_pkey', $p4IdxNames, true), 'P4: swapped words table keeps ftspg_<prefix>words_pkey index name');
+		same(true, in_array('ftspg_p4_words_folded_idx', $p4IdxNames, true), 'P4: swapped words table keeps ftspg_<prefix>words_folded_idx index name');
+		if ($p4Schema->hasTrigram()) {
+			same(true, in_array('ftspg_p4_words_folded_trgm_idx', $p4IdxNames, true), 'P4: swapped words table keeps ftspg_<prefix>words_folded_trgm_idx index name');
+		}
+	} finally {
+		$p4DropTables();
+		$config->setConfig(['language' => 'turkish']);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";

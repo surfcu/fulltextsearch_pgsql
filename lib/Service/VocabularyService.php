@@ -53,31 +53,116 @@ class VocabularyService {
 	}
 
 	/**
-	 * Recreate the vocabulary from the whole index, in batches of documents.
+	 * Recreate the vocabulary from the whole index in keyset batches into a shadow table,
+	 * then swap it into place atomically under an advisory lock so corrections keep working.
 	 *
 	 * @param callable(int $done, int $total): void|null $progress
 	 * @return int number of distinct words
 	 */
 	public function rebuild(?callable $progress = null, int $batchSize = 500): int {
+		$batchSize = max(1, $batchSize);
 		$t = $this->schemaService->getQualifiedTableName();
-		$w = $this->schemaService->getQualifiedWordsTableName();
+		$w = $this->schemaService->getWordsTableName();
+		$qw = $this->schemaService->getQualifiedWordsTableName();
+		$qs = $this->schemaService->getQualifiedSchemaName();
+		$shadow = $w . '_rebuild';
+		$qShadow = $qs . '.' . $this->schemaService->quoteIdentifier($shadow);
+		$qWordsIdent = $this->schemaService->quoteIdentifier($w);
 
-		$result = $this->db->executeQuery("SELECT count(*), coalesce(max(id), 0) FROM $t");
-		[$total, $maxId] = array_map('intval', $result->fetch(\PDO::FETCH_NUM) ?: [0, 0]);
-		$result->closeCursor();
-
-		$this->db->executeStatement("TRUNCATE $w");
-		$done = 0;
-		for ($from = 0; $from < $maxId; $from += $batchSize) {
-			$range = [(string)$from, (string)($from + $batchSize)];
-			$this->db->executeStatement($this->insertSql('d.id > ? AND d.id <= ?'), $range);
-			$done = min($total, $done + $this->countBetween($from, $from + $batchSize));
-			if ($progress !== null) {
-				$progress($done, $total);
-			}
+		$ownTransaction = !$this->db->inTransaction();
+		$savepoint = 'ftspg_vocab_rebuild';
+		if ($ownTransaction) {
+			$this->db->beginTransaction();
+		} else {
+			$this->db->executeStatement("SAVEPOINT $savepoint");
 		}
 
-		return $this->count();
+		try {
+			$this->db->executeQuery(
+				'SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))',
+				['fulltextsearch_pgsql', $w]
+			)->closeCursor();
+
+			$totalRes = $this->db->executeQuery("SELECT count(*) FROM $t");
+			$total = (int)$totalRes->fetchOne();
+			$totalRes->closeCursor();
+
+			$this->db->executeStatement("DROP TABLE IF EXISTS $qShadow");
+			$this->db->executeStatement(sprintf(<<<'SQL'
+				CREATE TABLE %1$s (
+					word   text COLLATE "C" PRIMARY KEY,
+					folded text COLLATE "C" GENERATED ALWAYS AS (translate(word, '%2$s', '%3$s')) STORED
+				)
+				SQL, $qShadow, Fold::FROM, Fold::TO));
+
+			$done = 0;
+			$lastId = 0;
+			while (true) {
+				$batchRes = $this->db->executeQuery(
+					"SELECT count(*), coalesce(max(b.id), 0) FROM (SELECT d.id FROM $t d WHERE d.id > ? ORDER BY d.id LIMIT $batchSize) b",
+					[(string)$lastId]
+				);
+				[$batchCount, $nextId] = array_map('intval', $batchRes->fetch(\PDO::FETCH_NUM) ?: [0, 0]);
+				$batchRes->closeCursor();
+				if ($batchCount === 0) {
+					break;
+				}
+
+				$this->db->executeStatement($this->insertSql('d.id > ? AND d.id <= ?', true, true, $qShadow), [(string)$lastId, (string)$nextId]);
+				$lastId = $nextId;
+				$done = min($total, $done + $batchCount);
+				if ($progress !== null) {
+					$progress($done, $total);
+				}
+			}
+
+			$qShadowPkey = $qs . '.' . $this->schemaService->quoteIdentifier("{$shadow}_pkey");
+			$qShadowFoldedIdx = $this->schemaService->quoteIdentifier("{$shadow}_folded_idx");
+			$qWordsPkey = $this->schemaService->quoteIdentifier("{$w}_pkey");
+			$qWordsFoldedIdx = $this->schemaService->quoteIdentifier("{$w}_folded_idx");
+
+			$this->db->executeStatement("CREATE INDEX $qShadowFoldedIdx ON $qShadow (folded)");
+			$ts = $this->schemaService->getTrigramSchema();
+			if ($ts !== null) {
+				$qShadowTrgmIdx = $this->schemaService->quoteIdentifier("{$shadow}_folded_trgm_idx");
+				$this->db->executeStatement("CREATE INDEX $qShadowTrgmIdx ON $qShadow USING GIN (folded {$ts}.gin_trgm_ops)");
+			}
+			$this->db->executeStatement("ANALYZE $qShadow");
+
+			$this->db->executeStatement("DROP TABLE IF EXISTS $qw");
+			$this->db->executeStatement("ALTER TABLE $qShadow RENAME TO $qWordsIdent");
+			$this->db->executeStatement("ALTER INDEX $qShadowPkey RENAME TO $qWordsPkey");
+			$this->db->executeStatement("ALTER INDEX {$qs}.{$qShadowFoldedIdx} RENAME TO $qWordsFoldedIdx");
+			if ($ts !== null) {
+				$qShadowTrgmIdx = $this->schemaService->quoteIdentifier("{$shadow}_folded_trgm_idx");
+				$qWordsTrgmIdx = $this->schemaService->quoteIdentifier("{$w}_folded_trgm_idx");
+				$this->db->executeStatement("ALTER INDEX {$qs}.{$qShadowTrgmIdx} RENAME TO $qWordsTrgmIdx");
+			}
+
+			$wordCount = $this->count();
+			if ($ownTransaction) {
+				$this->db->commit();
+			} else {
+				$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+			}
+			return $wordCount;
+		} catch (\Throwable $e) {
+			if ($ownTransaction) {
+				if ($this->db->inTransaction()) {
+					try {
+						$this->db->rollBack();
+					} catch (\Throwable) {
+					}
+				}
+			} elseif ($this->db->inTransaction()) {
+				try {
+					$this->db->executeStatement("ROLLBACK TO SAVEPOINT $savepoint");
+					$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+				} catch (\Throwable) {
+				}
+			}
+			throw $e;
+		}
 	}
 
 	public function count(): int {
@@ -95,52 +180,76 @@ class VocabularyService {
 	 * @return array<string, list<string>> word => alternative words to OR into the query
 	 */
 	public function alternatives(array $words, bool $spelling, callable $visible, ?callable $stopwords = null): array {
-		/** @var list<string> $validWords */
-		$validWords = [];
-		foreach (array_unique($words) as $word) {
-			$length = mb_strlen($word);
-			if ($length >= self::MIN_LENGTH && $length <= self::MAX_LENGTH && preg_match('/^\p{L}+$/u', $word) === 1) {
-				$validWords[] = $word;
-			}
-		}
+		$validWords = self::filterValidWords($words);
 		if ($validWords === []) {
 			return [];
 		}
 
+		$canSpell = $spelling && $this->schemaService->hasTrigram();
 		$w = $this->schemaService->getQualifiedWordsTableName();
+		$ts = $canSpell ? $this->schemaService->getTrigramSchema() : null;
+		$simFn = $ts !== null ? "{$ts}.similarity" : 'similarity';
+		$simOp = $ts !== null ? "OPERATOR({$ts}.%)" : '%';
+
 		$branches = [];
 		$params = [];
+		$foldedInputs = [];
+		$maxDistances = [];
 		foreach ($validWords as $idx => $word) {
 			$folded = Fold::fold($word);
 			$prefix = mb_strlen($word) >= self::MIN_TYPO_LENGTH;
-			$branches[] = "(SELECT $idx AS idx, word FROM $w WHERE "
+			$branches[] = "(SELECT $idx AS idx, 0 AS kind, word, ''::text AS folded, 0.0::float8 AS score FROM $w WHERE "
 				. ($prefix ? 'folded LIKE ?' : 'folded = ?')
 				. ' AND word NOT LIKE ? ORDER BY length(word), word LIMIT ' . self::ACCENT_LIMIT . ')';
 			$params[] = $prefix ? $this->likePrefix($folded) : $folded;
 			$params[] = $this->likePrefix($word);
 
-			if ($spelling && $prefix) {
-				// Skip probing ftspg_oc_index when no vocabulary word starts with this prefix.
-				$branches[] = "(SELECT $idx AS idx, ''::text AS word FROM $w WHERE word LIKE ? LIMIT 1)";
+			if ($canSpell && $prefix) {
+				$branches[] = "(SELECT $idx AS idx, 1 AS kind, ''::text AS word, ''::text AS folded, 0.0::float8 AS score FROM $w WHERE word LIKE ? LIMIT 1)";
 				$params[] = $this->likePrefix($word);
+
+				$length = mb_strlen($folded);
+				$maxDistance = $length >= 7 ? 2 : 1;
+				$foldedInputs[$idx] = $folded;
+				$maxDistances[$idx] = $maxDistance;
+				$branches[] = "(SELECT $idx AS idx, 2 AS kind, word, folded, {$simFn}(folded, ?) AS score
+					FROM $w
+					WHERE folded {$simOp} ? AND length(folded) BETWEEN ? AND ?
+					ORDER BY score DESC, word
+					LIMIT " . self::SHORTLIST . ')';
+				$params = [
+					...$params,
+					$folded,
+					$folded,
+					(string)($length - $maxDistance),
+					(string)($length + $maxDistance),
+				];
 			}
 		}
 
 		$result = $this->db->executeQuery(implode(' UNION ALL ', $branches), $params);
-		$phase1Rows = $result->fetchAll(\PDO::FETCH_NUM);
+		$rows = $result->fetchAll(\PDO::FETCH_NUM);
 		$result->closeCursor();
 
 		/** @var array<int, list<string>> $accentCandidates */
 		$accentCandidates = [];
 		/** @var array<int, bool> $hasVocabPrefix */
 		$hasVocabPrefix = [];
-		foreach ($phase1Rows as $row) {
+		/** @var array<int, list<array{0: int, 1: float, 2: string}>> $scoredByIdx */
+		$scoredByIdx = [];
+		foreach ($rows as $row) {
 			$idx = (int)$row[0];
-			$candidate = (string)$row[1];
-			if ($candidate === '') {
+			$kind = (int)$row[1];
+			if ($kind === 0) {
+				$accentCandidates[$idx][] = (string)$row[2];
+			} elseif ($kind === 1) {
 				$hasVocabPrefix[$idx] = true;
-			} else {
-				$accentCandidates[$idx][] = $candidate;
+			} elseif (isset($foldedInputs[$idx], $maxDistances[$idx])) {
+				$candidate = (string)$row[2];
+				$distance = self::editDistance($foldedInputs[$idx], (string)$row[3]);
+				if ($distance <= $maxDistances[$idx]) {
+					$scoredByIdx[$idx][] = [$distance, -(float)$row[4], $candidate];
+				}
 			}
 		}
 
@@ -156,7 +265,7 @@ class VocabularyService {
 				);
 				array_push($accentProbe, ...$accentCandidates[$idx]);
 			}
-			if ($spelling && mb_strlen($word) >= self::MIN_TYPO_LENGTH && ($hasVocabPrefix[$idx] ?? false)) {
+			if ($canSpell && mb_strlen($word) >= self::MIN_TYPO_LENGTH && ($hasVocabPrefix[$idx] ?? false)) {
 				$typedProbe[] = $word;
 			}
 		}
@@ -177,9 +286,272 @@ class VocabularyService {
 			}
 		}
 
-		$alternatives = [];
-		/** @var list<string> $needSpelling */
+		$alternatives = self::selectAccentVariants($validWords, $accentCandidates, $accentVisibleMap);
+
+		/** @var array<int, string> $needSpelling */
 		$needSpelling = [];
+		foreach ($validWords as $idx => $word) {
+			if (!isset($alternatives[$word]) && $canSpell && mb_strlen($word) >= self::MIN_TYPO_LENGTH && !isset($typedVisibleMap[$word])) {
+				$needSpelling[$idx] = $word;
+			}
+		}
+
+		if ($needSpelling !== [] && $stopwords !== null) {
+			$stopMap = array_flip($stopwords(array_values($needSpelling)));
+			foreach ($needSpelling as $idx => $word) {
+				if (isset($stopMap[$word])) {
+					unset($needSpelling[$idx]);
+				}
+			}
+		}
+
+		if ($needSpelling === []) {
+			return $alternatives;
+		}
+
+		/** @var list<string> $probePhase2 */
+		$probePhase2 = [];
+		foreach ($needSpelling as $idx => $_) {
+			foreach ($scoredByIdx[$idx] ?? [] as $scored) {
+				$probePhase2[] = $scored[2];
+			}
+		}
+		if ($probePhase2 === []) {
+			return $alternatives;
+		}
+
+		/** @var array<string, true> $visibleMap2 */
+		$visibleMap2 = [];
+		foreach ($visible(array_values(array_unique($probePhase2)), false) as $v) {
+			$visibleMap2[$v] = true;
+		}
+
+		foreach ($needSpelling as $idx => $word) {
+			$chosen = self::pickClosestCorrections($scoredByIdx[$idx] ?? [], $visibleMap2);
+			if ($chosen !== []) {
+				$alternatives[$word] = $chosen;
+			}
+		}
+
+		return $alternatives;
+	}
+
+	/**
+	 * Pass-1 lookup for SearchService: fetches accent variants and per-word vocabulary prefix
+	 * presence in one statement so Pass 2 never re-queries Phase 1.
+	 *
+	 * @param list<string> $words
+	 * @param callable(list<string>, bool=): list<string> $visible
+	 * @return array{0: array<string, list<string>>, 1: array<string, bool>}
+	 */
+	public function accentAndPrefixLookup(array $words, callable $visible): array {
+		$validWords = self::filterValidWords($words);
+		if ($validWords === []) {
+			return [[], []];
+		}
+
+		$w = $this->schemaService->getQualifiedWordsTableName();
+		$branches = [];
+		$params = [];
+		foreach ($validWords as $idx => $word) {
+			$folded = Fold::fold($word);
+			$prefix = mb_strlen($word) >= self::MIN_TYPO_LENGTH;
+			$branches[] = "(SELECT $idx AS idx, word FROM $w WHERE "
+				. ($prefix ? 'folded LIKE ?' : 'folded = ?')
+				. ' AND word NOT LIKE ? ORDER BY length(word), word LIMIT ' . self::ACCENT_LIMIT . ')';
+			$params[] = $prefix ? $this->likePrefix($folded) : $folded;
+			$params[] = $this->likePrefix($word);
+
+			if ($prefix) {
+				$branches[] = "(SELECT $idx AS idx, ''::text AS word FROM $w WHERE word LIKE ? LIMIT 1)";
+				$params[] = $this->likePrefix($word);
+			}
+		}
+
+		$result = $this->db->executeQuery(implode(' UNION ALL ', $branches), $params);
+		$rows = $result->fetchAll(\PDO::FETCH_NUM);
+		$result->closeCursor();
+
+		/** @var array<int, list<string>> $accentCandidates */
+		$accentCandidates = [];
+		/** @var array<string, bool> $hasVocabPrefix */
+		$hasVocabPrefix = [];
+		foreach ($rows as $row) {
+			$idx = (int)$row[0];
+			$candidate = (string)$row[1];
+			if ($candidate === '') {
+				$hasVocabPrefix[$validWords[$idx]] = true;
+			} else {
+				$accentCandidates[$idx][] = $candidate;
+			}
+		}
+
+		/** @var list<string> $accentProbe */
+		$accentProbe = [];
+		foreach ($validWords as $idx => $_) {
+			if (isset($accentCandidates[$idx])) {
+				usort(
+					$accentCandidates[$idx],
+					static fn (string $a, string $b): int => (mb_strlen($a) <=> mb_strlen($b)) ?: strcmp($a, $b)
+				);
+				array_push($accentProbe, ...$accentCandidates[$idx]);
+			}
+		}
+
+		/** @var array<string, true> $accentVisibleMap */
+		$accentVisibleMap = [];
+		if ($accentProbe !== []) {
+			foreach ($visible(array_values(array_unique($accentProbe)), false) as $v) {
+				$accentVisibleMap[$v] = true;
+			}
+		}
+
+		return [self::selectAccentVariants($validWords, $accentCandidates, $accentVisibleMap), $hasVocabPrefix];
+	}
+
+	/**
+	 * Pass-2 spelling lookup reusing Pass-1 accent variants and vocabulary prefix flags.
+	 *
+	 * @param list<string> $words
+	 * @param array<string, list<string>> $accentAlternatives
+	 * @param array<string, bool> $hasVocabPrefix
+	 * @param callable(list<string>, list<string>, list<string>): array{0: list<string>, 1: list<string>, 2: list<string>} $batchProbe
+	 * @param array<string, bool> $knownInvisible
+	 * @return array<string, list<string>>
+	 */
+	public function spellingFromLookup(
+		array $words,
+		array $accentAlternatives,
+		array $hasVocabPrefix,
+		callable $batchProbe,
+		array $knownInvisible = [],
+	): array {
+		if (!$this->schemaService->hasTrigram()) {
+			return $accentAlternatives;
+		}
+		$validWords = self::filterValidWords($words);
+		$candidates = [];
+		$typedProbe = [];
+		foreach ($validWords as $word) {
+			if (isset($accentAlternatives[$word]) || mb_strlen($word) < self::MIN_TYPO_LENGTH) {
+				continue;
+			}
+			$candidates[] = $word;
+			if (($hasVocabPrefix[$word] ?? false) && !isset($knownInvisible[$word])) {
+				$typedProbe[] = $word;
+			}
+		}
+		if ($candidates === []) {
+			return $accentAlternatives;
+		}
+
+		$deferredStopCheck = ($typedProbe === []);
+		if (!$deferredStopCheck) {
+			[, $typedVisible, $stops] = $batchProbe([], $typedProbe, $candidates);
+			$typedVisibleMap = array_fill_keys($typedVisible, true);
+			$stopMap = array_fill_keys($stops, true);
+			$candidates = array_values(array_filter(
+				$candidates,
+				static fn (string $word): bool => !isset($typedVisibleMap[$word]) && !isset($stopMap[$word])
+			));
+			if ($candidates === []) {
+				return $accentAlternatives;
+			}
+		}
+
+		$w = $this->schemaService->getQualifiedWordsTableName();
+		$ts = $this->schemaService->getTrigramSchema();
+		$simFn = $ts !== null ? "{$ts}.similarity" : 'similarity';
+		$simOp = $ts !== null ? "OPERATOR({$ts}.%)" : '%';
+		$spellingBranches = [];
+		$spellingParams = [];
+		$foldedInputs = [];
+		$maxDistances = [];
+		foreach ($candidates as $idx => $word) {
+			$folded = Fold::fold($word);
+			$length = mb_strlen($folded);
+			$maxDistance = $length >= 7 ? 2 : 1;
+			$foldedInputs[$idx] = $folded;
+			$maxDistances[$idx] = $maxDistance;
+			$spellingBranches[] = "(SELECT $idx AS idx, word, folded, {$simFn}(folded, ?) AS score
+				FROM $w
+				WHERE folded {$simOp} ? AND length(folded) BETWEEN ? AND ?
+				ORDER BY score DESC, word
+				LIMIT " . self::SHORTLIST . ')';
+			$spellingParams = [
+				...$spellingParams,
+				$folded,
+				$folded,
+				(string)($length - $maxDistance),
+				(string)($length + $maxDistance),
+			];
+		}
+
+		$result = $this->db->executeQuery(implode(' UNION ALL ', $spellingBranches), $spellingParams);
+		$rows = $result->fetchAll(\PDO::FETCH_NUM);
+		$result->closeCursor();
+
+		/** @var array<int, list<array{0: int, 1: float, 2: string}>> $scoredByIdx */
+		$scoredByIdx = [];
+		/** @var list<string> $probePhase2 */
+		$probePhase2 = [];
+		foreach ($rows as $row) {
+			$idx = (int)$row[0];
+			$candidate = (string)$row[1];
+			$distance = self::editDistance($foldedInputs[$idx], (string)$row[2]);
+			if ($distance <= $maxDistances[$idx]) {
+				$scoredByIdx[$idx][] = [$distance, -(float)$row[3], $candidate];
+				$probePhase2[] = $candidate;
+			}
+		}
+		if ($probePhase2 === []) {
+			return $accentAlternatives;
+		}
+
+		[$exactVisible, , $deferredStops] = $batchProbe(
+			array_values(array_unique($probePhase2)),
+			[],
+			$deferredStopCheck ? $candidates : []
+		);
+		$visibleMap2 = array_fill_keys($exactVisible, true);
+		$stopMap2 = array_fill_keys($deferredStops, true);
+
+		$alternatives = $accentAlternatives;
+		foreach ($candidates as $idx => $word) {
+			if (isset($stopMap2[$word])) {
+				continue;
+			}
+			$chosen = self::pickClosestCorrections($scoredByIdx[$idx] ?? [], $visibleMap2);
+			if ($chosen !== []) {
+				$alternatives[$word] = $chosen;
+			}
+		}
+		return $alternatives;
+	}
+
+	/**
+	 * @param list<string> $words
+	 * @return list<string>
+	 */
+	private static function filterValidWords(array $words): array {
+		$valid = [];
+		foreach (array_unique($words) as $word) {
+			$length = mb_strlen($word);
+			if ($length >= self::MIN_LENGTH && $length <= self::MAX_LENGTH && preg_match('/^\p{L}+$/u', $word) === 1) {
+				$valid[] = $word;
+			}
+		}
+		return $valid;
+	}
+
+	/**
+	 * @param list<string> $validWords
+	 * @param array<int, list<string>> $accentCandidates
+	 * @param array<string, true> $accentVisibleMap
+	 * @return array<string, list<string>>
+	 */
+	private static function selectAccentVariants(array $validWords, array $accentCandidates, array $accentVisibleMap): array {
+		$alternatives = [];
 		foreach ($validWords as $idx => $word) {
 			$variants = [];
 			foreach ($accentCandidates[$idx] ?? [] as $candidate) {
@@ -197,99 +569,33 @@ class VocabularyService {
 					break;
 				}
 			}
-
 			if ($variants !== []) {
 				$alternatives[$word] = $variants;
-			} elseif ($spelling && mb_strlen($word) >= self::MIN_TYPO_LENGTH && !isset($typedVisibleMap[$word])) {
-				$needSpelling[] = $word;
 			}
 		}
-
-		if ($needSpelling !== [] && $stopwords !== null) {
-			$stopMap = array_flip($stopwords($needSpelling));
-			$needSpelling = array_values(array_filter(
-				$needSpelling,
-				static fn (string $word): bool => !isset($stopMap[$word])
-			));
-		}
-
-		if ($needSpelling === []) {
-			return $alternatives;
-		}
-
-		$ts = $this->schemaService->getTrigramSchema();
-		$simFn = $ts !== null ? "{$ts}.similarity" : 'similarity';
-		$simOp = $ts !== null ? "OPERATOR({$ts}.%)" : '%';
-		$spellingBranches = [];
-		$spellingParams = [];
-		$foldedInputs = [];
-		$maxDistances = [];
-		foreach ($needSpelling as $idx => $word) {
-			$folded = Fold::fold($word);
-			$length = mb_strlen($folded);
-			$maxDistance = $length >= 7 ? 2 : 1;
-			$foldedInputs[$idx] = $folded;
-			$maxDistances[$idx] = $maxDistance;
-			$spellingBranches[] = "(SELECT $idx AS idx, word, folded, {$simFn}(folded, ?) AS score
-				FROM $w
-				WHERE folded {$simOp} ? AND length(folded) BETWEEN ? AND ?
-				ORDER BY score DESC, word
-				LIMIT " . self::SHORTLIST . ')';
-			array_push(
-				$spellingParams,
-				$folded,
-				$folded,
-				(string)($length - $maxDistance),
-				(string)($length + $maxDistance)
-			);
-		}
-
-		$result = $this->db->executeQuery(implode(' UNION ALL ', $spellingBranches), $spellingParams);
-		$phase2Rows = $result->fetchAll(\PDO::FETCH_NUM);
-		$result->closeCursor();
-
-		/** @var array<int, list<array{0: int, 1: float, 2: string}>> $scoredByIdx */
-		$scoredByIdx = [];
-		/** @var list<string> $probePhase2 */
-		$probePhase2 = [];
-		foreach ($phase2Rows as $row) {
-			$idx = (int)$row[0];
-			$candidate = (string)$row[1];
-			$distance = self::editDistance($foldedInputs[$idx], (string)$row[2]);
-			if ($distance <= $maxDistances[$idx]) {
-				$scoredByIdx[$idx][] = [$distance, -(float)$row[3], $candidate];
-				$probePhase2[] = $candidate;
-			}
-		}
-
-		if ($probePhase2 === []) {
-			return $alternatives;
-		}
-
-		/** @var array<string, true> $visibleMap2 */
-		$visibleMap2 = [];
-		foreach ($visible(array_values(array_unique($probePhase2)), false) as $v) {
-			$visibleMap2[$v] = true;
-		}
-
-		foreach ($needSpelling as $idx => $word) {
-			$visibleScored = array_values(array_filter(
-				$scoredByIdx[$idx] ?? [],
-				static fn (array $c): bool => isset($visibleMap2[$c[2]])
-			));
-			if ($visibleScored === []) {
-				continue;
-			}
-			usort(
-				$visibleScored,
-				static fn (array $a, array $b): int => ($a[0] <=> $b[0]) ?: ($a[1] <=> $b[1]) ?: strcmp($a[2], $b[2])
-			);
-			$best = $visibleScored[0][0];
-			$closest = array_filter($visibleScored, static fn (array $c): bool => $c[0] === $best);
-			$alternatives[$word] = array_slice(array_column($closest, 2), 0, self::MAX_CORRECTIONS);
-		}
-
 		return $alternatives;
+	}
+
+	/**
+	 * @param list<array{0: int, 1: float, 2: string}> $scored
+	 * @param array<string, true> $visibleMap
+	 * @return list<string>
+	 */
+	private static function pickClosestCorrections(array $scored, array $visibleMap): array {
+		$visibleScored = array_values(array_filter(
+			$scored,
+			static fn (array $c): bool => isset($visibleMap[$c[2]])
+		));
+		if ($visibleScored === []) {
+			return [];
+		}
+		usort(
+			$visibleScored,
+			static fn (array $a, array $b): int => ($a[0] <=> $b[0]) ?: ($a[1] <=> $b[1]) ?: strcmp($a[2], $b[2])
+		);
+		$best = $visibleScored[0][0];
+		$closest = array_filter($visibleScored, static fn (array $c): bool => $c[0] === $best);
+		return array_slice(array_column($closest, 2), 0, self::MAX_CORRECTIONS);
 	}
 
 	/**
@@ -320,9 +626,9 @@ class VocabularyService {
 		return $d[$n][$m];
 	}
 
-	private function insertSql(string $where, bool $withContent = true, bool $withParts = true): string {
+	private function insertSql(string $where, bool $withContent = true, bool $withParts = true, ?string $targetWordsTable = null): string {
 		$t = $this->schemaService->getQualifiedTableName();
-		$w = $this->schemaService->getQualifiedWordsTableName();
+		$w = $targetWordsTable ?? $this->schemaService->getQualifiedWordsTableName();
 		$s = $this->schemaService;
 		// The 'simple' configuration lowercases without stemming or stopwords: surface words.
 		$fields = [
@@ -347,16 +653,6 @@ class VocabularyService {
 			ORDER BY word
 			ON CONFLICT (word) DO NOTHING
 			SQL;
-	}
-
-	private function countBetween(int $from, int $to): int {
-		$result = $this->db->executeQuery(
-			'SELECT count(*) FROM ' . $this->schemaService->getQualifiedTableName() . ' WHERE id > ? AND id <= ?',
-			[(string)$from, (string)$to]
-		);
-		$count = (int)$result->fetchOne();
-		$result->closeCursor();
-		return $count;
 	}
 
 	private function likePrefix(string $value): string {
