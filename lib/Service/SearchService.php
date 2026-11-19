@@ -41,6 +41,8 @@ class SearchService {
 	private const FIELD_WEIGHTS = ['title' => 'A', 'tags' => 'B', 'parts' => 'C', 'content' => 'D'];
 	/** Columns regex and wildcard filters can test. */
 	private const FILTER_COLUMNS = ['title' => 'd.title', 'content' => 'd.content'];
+	private const DEFAULT_TRIGRAM_THRESHOLD = 0.3;
+	private const WORD_SIMILARITY_THRESHOLD = 0.6;
 	private const HEADLINE_OPTIONS = 'StartSel="",StopSel="",MaxFragments=3,MaxWords=30,MinWords=12,FragmentDelimiter="' . self::FRAGMENT_DELIMITER . '"';
 
 	public function __construct(
@@ -145,19 +147,25 @@ class SearchService {
 	 */
 	private function withSearchPlanning(callable $search): void {
 		$ownTransaction = !$this->db->inTransaction();
+		$savepoint = 'ftspg_search_plan';
 		if ($ownTransaction) {
 			$this->db->beginTransaction();
 		}
+		$savepointCreated = false;
 		$failed = true;
 		$previous = false;
 		$hasTrigram = false;
 		try {
-			$timeout = $ownTransaction ? $this->configService->getSearchTimeout() : 0;
+			if (!$ownTransaction) {
+				$this->db->executeStatement("SAVEPOINT $savepoint");
+				$savepointCreated = true;
+			}
+			$timeout = $ownTransaction ? $this->configService->getSearchTimeout() : null;
 			$hasTrigram = $this->schemaService->hasTrigram();
 
 			// Snapshot previous settings before changing them, inside the try so failures roll back.
 			$prevResult = $this->db->executeQuery(
-				"SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit'), current_setting('pg_trgm.similarity_threshold', true)"
+				"SELECT current_setting('enable_seqscan'), current_setting('random_page_cost'), current_setting('jit'), current_setting('pg_trgm.similarity_threshold', true), current_setting('pg_trgm.word_similarity_threshold', true)"
 			);
 			$previous = $prevResult->fetch(\PDO::FETCH_NUM);
 			$prevResult->closeCursor();
@@ -173,10 +181,12 @@ class SearchService {
 			if ($hasTrigram) {
 				$setCols[] = "set_config('pg_trgm.similarity_threshold', CAST(? AS text), true)";
 				$params[] = (string)VocabularyService::TRIGRAM_THRESHOLD;
+				$setCols[] = "set_config('pg_trgm.word_similarity_threshold', CAST(? AS text), true)";
+				$params[] = (string)self::WORD_SIMILARITY_THRESHOLD;
 			}
-			if ($timeout > 0) {
+			if ($timeout !== null) {
 				$setCols[] = "set_config('statement_timeout', CAST(? AS text), true)";
-				$params[] = ($timeout * 1000) . 'ms';
+				$params[] = $timeout > 0 ? ($timeout * 1000) . 'ms' : '0';
 			}
 			$this->db->executeQuery('SELECT ' . implode(', ', $setCols), $params)->closeCursor();
 
@@ -184,20 +194,46 @@ class SearchService {
 			$failed = false;
 		} finally {
 			if (!$ownTransaction) {
-				// Inside someone else's transaction: put the settings back for the rest of it. After
-				// an error that transaction is aborted, and its rollback discards them anyway.
-				if (!$failed && is_array($previous)) {
-					$restoreCols = [
-						"set_config('enable_seqscan', ?, true)",
-						"set_config('random_page_cost', ?, true)",
-						"set_config('jit', ?, true)",
-					];
-					$restoreParams = [(string)$previous[0], (string)$previous[1], (string)$previous[2]];
-					if ($hasTrigram && ($previous[3] ?? null) !== null) {
-						$restoreCols[] = "set_config('pg_trgm.similarity_threshold', ?, true)";
-						$restoreParams[] = (string)$previous[3];
+				// Inside a caller's transaction: roll back the savepoint on error so neither aborted
+				// state nor modified GUCs leak; on success restore GUCs and release the savepoint.
+				if ($failed) {
+					if ($savepointCreated && $this->db->inTransaction()) {
+						try {
+							$this->db->executeStatement("ROLLBACK TO SAVEPOINT $savepoint");
+							$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+						} catch (\Throwable) {
+						}
 					}
-					$this->db->executeQuery('SELECT ' . implode(', ', $restoreCols), $restoreParams)->closeCursor();
+				} else {
+					try {
+						if (is_array($previous)) {
+							$restoreCols = [
+								"set_config('enable_seqscan', ?, true)",
+								"set_config('random_page_cost', ?, true)",
+								"set_config('jit', ?, true)",
+							];
+							$restoreParams = [(string)$previous[0], (string)$previous[1], (string)$previous[2]];
+							if ($hasTrigram) {
+								$restoreCols[] = "set_config('pg_trgm.similarity_threshold', ?, true)";
+								$restoreParams[] = ($previous[3] ?? null) !== null ? (string)$previous[3] : (string)self::DEFAULT_TRIGRAM_THRESHOLD;
+								$restoreCols[] = "set_config('pg_trgm.word_similarity_threshold', ?, true)";
+								$restoreParams[] = ($previous[4] ?? null) !== null ? (string)$previous[4] : (string)self::WORD_SIMILARITY_THRESHOLD;
+							}
+							$this->db->executeQuery('SELECT ' . implode(', ', $restoreCols), $restoreParams)->closeCursor();
+						}
+						if ($savepointCreated && $this->db->inTransaction()) {
+							$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+						}
+					} catch (\Throwable $restoreEx) {
+						if ($savepointCreated && $this->db->inTransaction()) {
+							try {
+								$this->db->executeStatement("ROLLBACK TO SAVEPOINT $savepoint");
+								$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+							} catch (\Throwable) {
+							}
+						}
+						throw $restoreEx;
+					}
 				}
 			} elseif ($failed) {
 				$this->db->rollBack();
@@ -249,10 +285,12 @@ class SearchService {
 
 		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
 		$page = max(1, $request->getPage());
+		$maxOffset = PHP_INT_MAX - $size;
+		$offset = ($page - 1) > intdiv($maxOffset, $size) ? $maxOffset : ($page - 1) * $size;
 		$filtersFirst = $this->startFromFilters($queries, $filterConditions, $filterParams);
 		$filterSql = self::renderFilters($filterConditions, !$filtersFirst);
 
-		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, ($page - 1) * $size, $words);
+		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, $offset, $words);
 
 		// Gate spelling correction to first-page searches with fewer than $size uncorrected hits.
 		if ($typoOn && $this->fuzzyAvailable() && $visible !== null && $stopwords !== null && $page === 1 && count($rows) < $size) {
@@ -302,12 +340,13 @@ class SearchService {
 
 		$titlesSearched = $weights === null || str_contains($weights, 'A');
 		if ($total === 0 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '' && $query->plainWordsOnly) {
+			[$nonStopSql, $nonStopParams] = $this->nonStopwordCondition($queries);
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
-			$rows = $this->titleSimilaritySearch($query->plainText, $filterSql, $filterParams, $size, ($page - 1) * $size);
+			$rows = $this->titleSimilaritySearch($query->plainText, $nonStopSql, $nonStopParams, $filterSql, $filterParams, $size, $offset);
 			if ($rows !== []) {
 				$total = (int)$rows[0]['total'];
 			} elseif ($page > 1) {
-				$total = $this->titleSimilarityCount($query->plainText, $filterSql, $filterParams);
+				$total = $this->titleSimilarityCount($query->plainText, $nonStopSql, $nonStopParams, $filterSql, $filterParams);
 			}
 		}
 
@@ -418,16 +457,16 @@ class SearchService {
 					$simpleTsSql = '';
 					$simpleTsParams = [];
 					if (!$prefix) {
-						[$simpleTsSql, $simpleTsParams] = $this->queryBuilder->wordTsQuery($word, 'simple', null, false);
+						[$simpleTsSql, $simpleTsParams] = $this->queryBuilder->wordTsQuery($word, 'pg_catalog.simple', null, false);
 					}
 					$surfaceMatch = static function (string $expr) use ($prefix, $needle, $simpleTsSql, $simpleTsParams): array {
 						if ($prefix) {
 							return [
-								"EXISTS (SELECT 1 FROM unnest(to_tsvector('simple', $expr)) AS w WHERE w.lexeme ~ '^[[:alpha:]]{3,40}$' AND starts_with(w.lexeme, ?))",
+								"EXISTS (SELECT 1 FROM unnest(to_tsvector('pg_catalog.simple', $expr)) AS w WHERE w.lexeme ~ '^[[:alpha:]]{3,40}$' AND starts_with(w.lexeme, ?))",
 								[$needle],
 							];
 						}
-						return ["to_tsvector('simple', $expr) @@ $simpleTsSql", $simpleTsParams];
+						return ["to_tsvector('pg_catalog.simple', $expr) @@ $simpleTsSql", $simpleTsParams];
 					};
 					$surfaceBranches = [];
 					$surfaceParams = [];
@@ -561,18 +600,29 @@ class SearchService {
 		$conditions = ['d.provider_id = ?', 'd.access && CAST(? AS text[])'];
 		$params = [$providerId, PgArray::toLiteral($viewerTokens)];
 
-		$metaTags = array_values(array_map('strval', $request->getMetaTags()));
-		if ($metaTags !== []) {
-			// any of the requested meta tags
-			$conditions[] = 'd.metatags && CAST(? AS text[])';
-			$params[] = PgArray::toLiteral($metaTags);
+		$rawMetaTags = $request->getMetaTags();
+		if ($rawMetaTags !== []) {
+			$metaTags = self::validFilterStrings($rawMetaTags);
+			if ($metaTags === []) {
+				$conditions[] = 'FALSE';
+			} else {
+				// any of the requested meta tags
+				$conditions[] = 'd.metatags && CAST(? AS text[])';
+				$params[] = PgArray::toLiteral($metaTags);
+			}
 		}
 
-		$subTags = array_values(array_map('strval', $request->getSubTags(true)));
-		if ($subTags !== []) {
-			// all of the requested sub tags
-			$conditions[] = 'd.subtags @> CAST(? AS text[])';
-			$params[] = PgArray::toLiteral($subTags);
+		$rawSubTags = $request->getSubTags(true);
+		if ($rawSubTags !== []) {
+			$allSubStrings = array_values(array_map('strval', $rawSubTags));
+			$subTags = self::validFilterStrings($rawSubTags);
+			if (count($subTags) !== count($allSubStrings)) {
+				$conditions[] = 'FALSE';
+			} elseif ($subTags !== []) {
+				// all of the requested sub tags
+				$conditions[] = 'd.subtags @> CAST(? AS text[])';
+				$params[] = PgArray::toLiteral($subTags);
+			}
 		}
 
 		// Modification date range from unified search's date filter (Unix timestamps, inclusive).
@@ -1331,10 +1381,45 @@ class SearchService {
 	}
 
 	/**
+	 * @param array<array-key, mixed> $values
+	 * @return list<string>
+	 */
+	private static function validFilterStrings(array $values): array {
+		$valid = [];
+		foreach ($values as $value) {
+			$str = (string)$value;
+			if (!str_contains($str, "\0") && mb_check_encoding($str, 'UTF-8')) {
+				$valid[] = $str;
+			}
+		}
+		return $valid;
+	}
+
+	/**
+	 * Restricts the title fallback to rows whose language treats at least one search word as
+	 * a non-stopword; PostgreSQL constant-folds numnode(...) while planning.
+	 *
+	 * @param non-empty-array<string, ParsedQuery> $queries
+	 * @return array{0: string, 1: list<string>}
+	 */
+	private function nonStopwordCondition(array $queries): array {
+		$conditions = self::languageConditions(array_keys($queries));
+		$branches = [];
+		$params = [];
+		foreach (array_values($queries) as $i => $query) {
+			[$condition, $conditionParams] = $conditions[$i];
+			$branches[] = "($condition AND numnode({$query->rankSql}) > 0)";
+			array_push($params, ...$conditionParams, ...$query->rankParams);
+		}
+		return [count($branches) === 1 ? $branches[0] : '(' . implode(' OR ', $branches) . ')', $params];
+	}
+
+	/**
+	 * @param list<string> $nonStopParams
 	 * @param list<string> $filterParams
 	 * @return list<array<string, mixed>>
 	 */
-	private function titleSimilaritySearch(string $text, string $filterSql, array $filterParams, int $limit, int $offset = 0): array {
+	private function titleSimilaritySearch(string $text, string $nonStopSql, array $nonStopParams, string $filterSql, array $filterParams, int $limit, int $offset = 0): array {
 		$t = $this->schemaService->getQualifiedTableName();
 		$ts = $this->schemaService->getTrigramSchema();
 		$wordSim = $ts !== null ? "{$ts}.word_similarity" : 'word_similarity';
@@ -1346,13 +1431,13 @@ class SearchService {
 				   count(*) OVER () AS total,
 				   left($joined, 300) AS excerpt
 			FROM $t d
-			WHERE ? {$wordOp} d.title_search AND $filterSql
+			WHERE ? {$wordOp} d.title_search AND $nonStopSql AND $filterSql
 			ORDER BY rank DESC, d.modified_time DESC, d.id
 			LIMIT ? OFFSET ?
 			SQL;
 
 		$text = mb_strtolower($text, 'UTF-8');
-		$params = array_merge([$text, $text], $filterParams, [(string)$limit, (string)$offset]);
+		$params = array_merge([$text, $text], $nonStopParams, $filterParams, [(string)$limit, (string)$offset]);
 		$result = $this->db->executeQuery($sql, $params);
 		$rows = $result->fetchAll();
 		$result->closeCursor();
@@ -1360,16 +1445,17 @@ class SearchService {
 	}
 
 	/**
+	 * @param list<string> $nonStopParams
 	 * @param list<string> $filterParams
 	 */
-	private function titleSimilarityCount(string $text, string $filterSql, array $filterParams): int {
+	private function titleSimilarityCount(string $text, string $nonStopSql, array $nonStopParams, string $filterSql, array $filterParams): int {
 		$t = $this->schemaService->getQualifiedTableName();
 		$ts = $this->schemaService->getTrigramSchema();
 		$wordOp = $ts !== null ? "OPERATOR({$ts}.<%)" : '<%';
 		$text = mb_strtolower($text, 'UTF-8');
 		$result = $this->db->executeQuery(
-			"SELECT count(*) FROM $t d WHERE ? {$wordOp} d.title_search AND $filterSql",
-			array_merge([$text], $filterParams)
+			"SELECT count(*) FROM $t d WHERE ? {$wordOp} d.title_search AND $nonStopSql AND $filterSql",
+			array_merge([$text], $nonStopParams, $filterParams)
 		);
 		$count = (int)$result->fetchOne();
 		$result->closeCursor();

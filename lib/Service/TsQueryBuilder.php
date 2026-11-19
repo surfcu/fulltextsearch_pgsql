@@ -49,7 +49,8 @@ class TsQueryBuilder {
 	 * @return list<string>
 	 */
 	public function searchWords(string $search, string $language): array {
-		$words = [];
+		$required = [];
+		$optional = [];
 		foreach ($this->tokenize($search, $language) as $m) {
 			$isPhrase = !isset($m[4]) || $m[4] === '';
 			if ($isPhrase || $m[3] === '-') {
@@ -57,10 +58,15 @@ class TsQueryBuilder {
 			}
 			$word = $this->trimTerm($m[4]);
 			if ($word !== '' && !in_array($word, ['OR', 'AND'], true)) {
-				$words[] = mb_strtolower($word, 'UTF-8');
+				$lower = mb_strtolower($word, 'UTF-8');
+				if ($m[3] === '+') {
+					$required[] = $lower;
+				} elseif (count($optional) < self::MAX_TERMS) {
+					$optional[] = $lower;
+				}
 			}
 		}
-		return array_slice(array_values(array_unique($words)), 0, self::MAX_TERMS);
+		return array_slice(array_values(array_unique(array_merge($required, $optional))), 0, self::MAX_TERMS);
 	}
 
 	/**
@@ -76,7 +82,7 @@ class TsQueryBuilder {
 		}
 		$word = $this->trimTerm($word);
 		$query = $word === '' ? '' : $this->wordQuery($word, $prefix, [], $weights ?? '');
-		return ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $query]];
+		return ['to_tsquery(CAST(? AS pg_catalog.regconfig), ?)', [$language, $query]];
 	}
 
 	/**
@@ -93,16 +99,14 @@ class TsQueryBuilder {
 		}
 		$filterWeights = $weights === null ? null : '{' . implode(',', str_split(strtolower($weights))) . '}';
 
-		/** @var array<string, list<array{ts: array{0: string, 1: list<string>}, pred: array{0: string, 1: list<string>}, phrase: bool}>> $terms */
-		$terms = ['optional' => [], 'required' => [], 'excluded' => []];
-		$words = [];
+		/** @var list<array{kind: 'optional'|'required'|'excluded', text: string, phrase: bool}> $selected */
+		$selected = [];
+		$requiredTokens = [];
+		$optionalTokens = [];
+		$excludedTokens = [];
 		$plainWordsOnly = true;
-		$count = 0;
 
 		foreach ($matches as $m) {
-			if ($count >= self::MAX_TERMS) {
-				break;
-			}
 			$isPhrase = !isset($m[4]) || $m[4] === '';
 			$operator = $isPhrase ? $m[1] : $m[3];
 			$text = $this->trimTerm($isPhrase ? $m[2] : $m[4]);
@@ -110,7 +114,6 @@ class TsQueryBuilder {
 				// Boolean keywords are not needed: optional terms are already ORed.
 				continue;
 			}
-
 			$kind = match ($operator) {
 				'+' => 'required',
 				'-' => 'excluded',
@@ -119,9 +122,35 @@ class TsQueryBuilder {
 			if ($isPhrase || $kind !== 'optional') {
 				$plainWordsOnly = false;
 			}
+			if ($kind === 'required') {
+				if (count($requiredTokens) >= self::MAX_TERMS) {
+					return null;
+				}
+				$requiredTokens[] = ['kind' => 'required', 'text' => $text, 'phrase' => $isPhrase];
+			} elseif ($kind === 'excluded') {
+				if (count($excludedTokens) >= self::MAX_TERMS) {
+					return null;
+				}
+				$excludedTokens[] = ['kind' => 'excluded', 'text' => $text, 'phrase' => $isPhrase];
+			} elseif (count($optionalTokens) < self::MAX_TERMS) {
+				$optionalTokens[] = ['kind' => 'optional', 'text' => $text, 'phrase' => $isPhrase];
+			}
+		}
+
+		$optionalBudget = self::MAX_TERMS - count($requiredTokens);
+		$selected = array_merge($requiredTokens, array_slice($optionalTokens, 0, $optionalBudget), $excludedTokens);
+
+		/** @var array<string, list<array{ts: array{0: string, 1: list<string>}, pred: array{0: string, 1: list<string>}, phrase: bool}>> $terms */
+		$terms = ['optional' => [], 'required' => [], 'excluded' => []];
+		$words = [];
+
+		foreach ($selected as $tok) {
+			$isPhrase = $tok['phrase'];
+			$kind = $tok['kind'];
+			$text = $tok['text'];
 
 			if ($isPhrase) {
-				$ts = ['phraseto_tsquery(CAST(? AS regconfig), ?)', [$language, $text]];
+				$ts = ['phraseto_tsquery(CAST(? AS pg_catalog.regconfig), ?)', [$language, $text]];
 			} else {
 				$alts = $kind === 'excluded' ? [] : ($alternatives[mb_strtolower($text, 'UTF-8')] ?? []);
 				$withAlts = $this->wordQuery($text, $kind !== 'excluded', $alts, $weights ?? '');
@@ -129,11 +158,11 @@ class TsQueryBuilder {
 					// A stopword in $language must stay empty even if accented/typo alternatives exist.
 					$baseQuery = $this->wordQuery($text, true, [], $weights ?? '');
 					$ts = [
-						"CASE WHEN numnode(to_tsquery(CAST(? AS regconfig), ?)) = 0 THEN CAST('' AS tsquery) ELSE to_tsquery(CAST(? AS regconfig), ?) END",
+						"CASE WHEN numnode(to_tsquery(CAST(? AS pg_catalog.regconfig), ?)) = 0 THEN CAST('' AS tsquery) ELSE to_tsquery(CAST(? AS pg_catalog.regconfig), ?) END",
 						[$language, $baseQuery, $language, $withAlts],
 					];
 				} else {
-					$ts = ['to_tsquery(CAST(? AS regconfig), ?)', [$language, $withAlts]];
+					$ts = ['to_tsquery(CAST(? AS pg_catalog.regconfig), ?)', [$language, $withAlts]];
 				}
 			}
 
@@ -159,7 +188,6 @@ class TsQueryBuilder {
 			if ($kind !== 'excluded') {
 				$words[] = $text;
 			}
-			$count++;
 		}
 
 		/** @var list<array{0: string, 1: list<string>}> $required */
