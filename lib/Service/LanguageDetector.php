@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OCA\FullTextSearch_PgSql\Service;
 
+use OCA\FullTextSearch_PgSql\Tools\PgArray;
 use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
 use Throwable;
@@ -83,22 +84,38 @@ class LanguageDetector {
 	 */
 	public function scores(string $text, array $languages): array {
 		$scores = array_fill_keys($languages, 0);
+		$savepoint = 'ftspg_lang_detect';
+		$inTx = $this->db->inTransaction();
+		if ($inTx) {
+			$this->db->executeStatement("SAVEPOINT $savepoint");
+		}
 		try {
 			// Turkish is lowercased the Turkish way (I -> ı, İ -> i), as indexed text is.
 			$result = $this->db->executeQuery(
-				"SELECT cfg::text AS language,
+				"SELECT u.name AS language,
 						count(*) FILTER (WHERE t.lexemes = '{}' AND t.dictionary IS NOT NULL) AS stopwords
-				 FROM unnest(CAST(? AS regconfig[])) AS cfg,
-					  LATERAL ts_debug(cfg, CASE WHEN cfg = 'turkish'::regconfig THEN translate(?, 'Iİ', 'ıi') ELSE ? END) AS t
+				 FROM unnest(CAST(? AS text[])) AS u(name),
+					  LATERAL (SELECT pg_catalog.quote_ident(u.name)::pg_catalog.regconfig) AS c(cfg),
+					  LATERAL ts_debug(c.cfg, CASE WHEN c.cfg = 'pg_catalog.turkish'::pg_catalog.regconfig THEN translate(?, 'Iİ', 'ıi') ELSE ? END) AS t
 				 WHERE t.alias = ANY (CAST(? AS text[]))
-				 GROUP BY cfg",
-				['{' . implode(',', $languages) . '}', $text, $text, '{' . implode(',', self::WORD_TOKENS) . '}']
+				 GROUP BY u.name",
+				[PgArray::toLiteral($languages), $text, $text, PgArray::toLiteral(self::WORD_TOKENS)]
 			);
 			foreach ($result->fetchAll() as $row) {
 				$scores[(string)$row['language']] = (int)$row['stopwords'];
 			}
 			$result->closeCursor();
+			if ($inTx) {
+				$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+			}
 		} catch (Throwable $e) {
+			if ($inTx && $this->db->inTransaction()) {
+				try {
+					$this->db->executeStatement("ROLLBACK TO SAVEPOINT $savepoint");
+					$this->db->executeStatement("RELEASE SAVEPOINT $savepoint");
+				} catch (Throwable) {
+				}
+			}
 			// A language removed from the server since it was configured, for instance.
 			$this->logger->warning('Language detection failed, using the fallback language', ['exception' => $e]);
 		}

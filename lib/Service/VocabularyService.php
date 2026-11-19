@@ -341,10 +341,10 @@ class VocabularyService {
 		$max = self::MAX_LENGTH;
 		return <<<SQL
 			INSERT INTO $w (word)
-			SELECT DISTINCT w.word
-			FROM $t d, unnest(tsvector_to_array(to_tsvector('simple', $text))) AS w(word)
+			SELECT DISTINCT w.word COLLATE "C" AS word
+			FROM $t d, unnest(tsvector_to_array(to_tsvector('pg_catalog.simple', $text))) AS w(word)
 			WHERE $where AND w.word ~ '^[[:alpha:]]{{$min},{$max}}$'
-			ORDER BY w.word
+			ORDER BY word
 			ON CONFLICT (word) DO NOTHING
 			SQL;
 	}
