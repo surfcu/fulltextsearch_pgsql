@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Content extraction and `max_content_size` handling: clamp `max_content_size` to `0`–`1,000,000` when read, skip body extraction cleanly when `max_content_size = 0` without spawning extraction tools, emitting false warnings, or wiping document tags and parts, unlink temporary files if writing an office zip fails, and reject NUL-free high-byte binary streams instead of indexing them as Windows-1254 text. Re-index affected documents if `max_content_size = 0` or binary files were previously indexed.
+
 ## [1.6.0] - 2026-11-18
 
 ### Added

@@ -63,7 +63,7 @@ class ContentExtractor {
 
 	public function extract(IIndexDocument $document): ExtractedContent {
 		$content = $document->getContent();
-		if ($content === '') {
+		if ($content === '' || $this->configService->getMaxContentSize() === 0) {
 			return new ExtractedContent('');
 		}
 
@@ -81,6 +81,9 @@ class ContentExtractor {
 	}
 
 	public function extractFromBytes(string $raw, string $title = ''): ExtractedContent {
+		if ($this->configService->getMaxContentSize() === 0) {
+			return new ExtractedContent('');
+		}
 		if (str_starts_with($raw, '%PDF-')) {
 			return $this->extractPdf($raw);
 		}
@@ -164,9 +167,10 @@ class ContentExtractor {
 		$text = trim((string)preg_replace('/\s+/u', ' ', $text));
 
 		$max = $this->configService->getMaxContentSize();
-		if (strlen($text) > $max) {
+		$cap = $max > 0 ? $max : ConfigService::MAX_CONTENT_SIZE_LIMIT;
+		if (strlen($text) > $cap) {
 			// mb_strcut never splits a multibyte character.
-			$text = mb_strcut($text, 0, $max, 'UTF-8');
+			$text = mb_strcut($text, 0, $cap, 'UTF-8');
 		}
 		return $text;
 	}
@@ -509,6 +513,9 @@ class ContentExtractor {
 
 		$tmp = tempnam(sys_get_temp_dir(), 'ftspg');
 		if ($tmp === false || file_put_contents($tmp, $raw) === false) {
+			if ($tmp !== false) {
+				@unlink($tmp);
+			}
 			return new ExtractedContent('', 'could not write temporary file');
 		}
 
@@ -572,9 +579,14 @@ class ContentExtractor {
 				return true;
 			}
 		}
-		// Legacy 8-bit encodings: accept when control characters are rare.
+		// Legacy 8-bit encodings: accept when control characters are rare and printable ASCII / whitespace is present.
+		$len = strlen($sample);
+		if ($len === 0) {
+			return true;
+		}
 		$controls = preg_match_all('/[\x00-\x08\x0E-\x1F\x7F]/', $sample);
-		return (float)$controls < (float)strlen($sample) * 0.02;
+		$ascii = preg_match_all('/[\x09\x0A\x0D\x20-\x7E]/', $sample);
+		return (float)$controls < (float)$len * 0.02 && (float)$ascii >= (float)$len * 0.15;
 	}
 
 	private function toUtf8(string $text): string {

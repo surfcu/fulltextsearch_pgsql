@@ -91,7 +91,7 @@ occ fulltextsearch_pgsql:configure '{"language":"turkish,english"}'   # several 
 | `typo_correction` | `true` | Accent variants and spelling corrections from the vocabulary of indexed words. Accent variants work without `pg_trgm`. |
 | `max_results` | `100` | Upper limit for the page size a client may request (`1`–`10000`). |
 | `search_timeout` | `10` | Seconds before a search query is cancelled (`0`–`300`; `0` disables the timeout). Timed-out searches return cleanly with no results. |
-| `max_content_size` | `512000` | Bytes of extracted text indexed per document. Larger documents are truncated. PostgreSQL rejects search vectors over 1 MB; oversized documents degrade gracefully in bounded steps with a warning. |
+| `max_content_size` | `512000` | Bytes of extracted body text indexed per document (`0`–`1000000`; `0` skips body extraction while keeping title, tags, and parts). Larger documents are truncated. PostgreSQL rejects search vectors over 1 MB; oversized documents degrade gracefully in bounded steps with a warning. |
 | `pdftotext_path` | *(empty)* | Path to `pdftotext` (`occ`-only; shown read-only in the admin panel). Empty means look it up on `PATH`. |
 | `pdf_extractor` | `auto` | `auto`: `pdftotext` when found, otherwise the bundled parser (also used when `pdftotext` fails to run). `pdftotext`: never fall back. `pdfparser`: always use the bundled parser. |
 

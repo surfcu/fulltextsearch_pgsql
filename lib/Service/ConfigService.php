@@ -31,6 +31,7 @@ class ConfigService {
 
 	/** Each extra language costs one ts_debug pass per indexed document and one query branch. */
 	public const MAX_LANGUAGES = 5;
+	public const MAX_CONTENT_SIZE_LIMIT = 1000000;
 
 	public const DEFAULTS = [
 		// One language, or several separated by commas: the first is the fallback when a
@@ -131,7 +132,7 @@ class ConfigService {
 			$writes[] = fn () => $this->appConfig->setValueBool(Application::APP_ID, $key, $value);
 		}
 
-		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, 1000000], self::SEARCH_TIMEOUT => [0, 300]] as $key => [$min, $max]) {
+		foreach ([self::MAX_RESULTS => [1, 10000], self::MAX_CONTENT_SIZE => [0, self::MAX_CONTENT_SIZE_LIMIT], self::SEARCH_TIMEOUT => [0, 300]] as $key => [$min, $max]) {
 			if (!array_key_exists($key, $config)) {
 				continue;
 			}
@@ -254,7 +255,8 @@ class ConfigService {
 	}
 
 	public function getMaxContentSize(): int {
-		return max(0, $this->appConfig->getValueInt(Application::APP_ID, self::MAX_CONTENT_SIZE, self::DEFAULTS[self::MAX_CONTENT_SIZE]));
+		$value = $this->appConfig->getValueInt(Application::APP_ID, self::MAX_CONTENT_SIZE, self::DEFAULTS[self::MAX_CONTENT_SIZE]);
+		return max(0, min(self::MAX_CONTENT_SIZE_LIMIT, $value));
 	}
 
 	public function getSearchTimeout(): int {
