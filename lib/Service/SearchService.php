@@ -341,12 +341,13 @@ class SearchService {
 		$words = array_values(array_unique($words));
 
 		$alternatives = [];
+		$hasVocabPrefix = [];
 		$typoOn = $this->configService->useTypoCorrection() && $words !== [];
 		$visible = null;
-		$stopwords = null;
+		$batchProbe = null;
 		if ($typoOn) {
-			[$visible, $stopwords] = $this->vocabularyProbes($languages, $weights, $filterConditions, $filterParams);
-			$alternatives = $this->vocabulary->alternatives($words, false, $visible, $stopwords);
+			[$visible, $batchProbe] = $this->vocabularyProbes($languages, $weights, $filterConditions, $filterParams);
+			[$alternatives, $hasVocabPrefix] = $this->vocabulary->accentAndPrefixLookup($words, $visible);
 		}
 
 		$queries = $this->buildQueries($search, $languages, $alternatives, $weights);
@@ -362,8 +363,8 @@ class SearchService {
 		$rows = $this->fullTextSearch($queries, $filterSql, $filterParams, $filtersFirst, $size, $offset, $words);
 
 		// Gate spelling correction to first-page searches with fewer than $size uncorrected hits.
-		if ($typoOn && $this->fuzzyAvailable() && $visible !== null && $stopwords !== null && $page === 1 && count($rows) < $size) {
-			$pass2Visible = $visible;
+		if ($typoOn && $this->fuzzyAvailable() && $batchProbe !== null && $page === 1 && count($rows) < $size) {
+			$knownInvisible = [];
 			if ($rows === [] && $query->plainWordsOnly && $alternatives === []) {
 				// Pass 1 already proved none of the words tested in $queries match under the active filters.
 				$tested = [];
@@ -375,17 +376,8 @@ class SearchService {
 					}
 				}
 				$knownInvisible = array_intersect_key($tested, array_flip($words));
-				if ($knownInvisible !== []) {
-					$pass2Visible = static function (array $probeWords, bool $prefix = false) use ($visible, $knownInvisible): array {
-						$toProbe = array_values(array_filter(
-							$probeWords,
-							static fn (string $w): bool => !isset($knownInvisible[$w])
-						));
-						return $toProbe === [] ? [] : $visible($toProbe, $prefix);
-					};
-				}
 			}
-			$withSpelling = $this->vocabulary->alternatives($words, true, $pass2Visible, $stopwords);
+			$withSpelling = $this->vocabulary->spellingFromLookup($words, $alternatives, $hasVocabPrefix, $batchProbe, $knownInvisible);
 			if ($withSpelling !== $alternatives) {
 				$queries = $this->buildQueries($search, $languages, $withSpelling, $weights);
 				if ($queries === null) {
@@ -457,7 +449,10 @@ class SearchService {
 	 * @param non-empty-list<string> $languages
 	 * @param list<string> $filterConditions
 	 * @param list<string> $filterParams
-	 * @return array{0: callable(list<string>, bool=): list<string>, 1: callable(list<string>): list<string>}
+	 * @return array{
+	 *   0: callable(list<string>, bool=): list<string>,
+	 *   1: callable(list<string>, list<string>, list<string>): array{0: list<string>, 1: list<string>, 2: list<string>}
+	 * }
 	 */
 	private function vocabularyProbes(array $languages, ?string $weights, array $filterConditions, array $filterParams): array {
 		$t = $this->schemaService->getQualifiedTableName();
@@ -480,7 +475,7 @@ class SearchService {
 		/** @var array<string, bool> $stopwordCache */
 		$stopwordCache = [];
 
-		$visible = function (array $probeWords, bool $prefix = false) use (
+		$buildExistsColumn = function (string $word, bool $prefix) use (
 			$t,
 			$languages,
 			$langConditions,
@@ -494,79 +489,125 @@ class SearchService {
 			$titleExpr,
 			$tagsNorm,
 			$partsNorm,
-			$contentNorm,
+			$contentNorm
+		): array {
+			$branches = [];
+			$branchParams = [];
+			$stopChecks = [];
+			$stopParams = [];
+			foreach ($languages as $langIdx => $language) {
+				[$langCond, $langCondParams] = $langConditions[$langIdx];
+				[$tsSql, $tsParams] = $this->queryBuilder->wordTsQuery($word, $language, $weights);
+				$branches[] = "(numnode($tsSql) > 0 AND $langCond AND d.tsv @@ $tsSql)";
+				array_push($branchParams, ...$tsParams, ...$langCondParams, ...$tsParams);
+				$stopChecks[] = "numnode($tsSql) = 0";
+				array_push($stopParams, ...$tsParams);
+			}
+			$matchSql = count($branches) === 1 ? $branches[0] : '(' . implode(' OR ', $branches) . ')';
+
+			$needle = mb_strtolower($word, 'UTF-8');
+			$simpleTsSql = '';
+			$simpleTsParams = [];
+			if (!$prefix) {
+				[$simpleTsSql, $simpleTsParams] = $this->queryBuilder->wordTsQuery($word, 'pg_catalog.simple', null, false);
+			}
+			$surfaceMatch = static function (string $expr) use ($prefix, $needle, $simpleTsSql, $simpleTsParams): array {
+				if ($prefix) {
+					return [
+						"EXISTS (SELECT 1 FROM unnest(to_tsvector('pg_catalog.simple', $expr)) AS w WHERE w.lexeme ~ '^[[:alpha:]]{3,40}$' AND starts_with(w.lexeme, ?))",
+						[$needle],
+					];
+				}
+				return ["to_tsvector('pg_catalog.simple', $expr) @@ $simpleTsSql", $simpleTsParams];
+			};
+			$surfaceBranches = [];
+			$surfaceParams = [];
+			if ($hasA) {
+				[$exprSql, $exprParams] = $surfaceMatch($titleExpr);
+				$surfaceBranches[] = "((d.title <> '') IS TRUE AND $exprSql)";
+				array_push($surfaceParams, ...$exprParams);
+			}
+			if ($hasB) {
+				[$exprSql, $exprParams] = $surfaceMatch($tagsNorm);
+				$surfaceBranches[] = "((d.tags_text <> '') IS TRUE AND $exprSql)";
+				array_push($surfaceParams, ...$exprParams);
+			}
+			if ($hasC) {
+				[$exprSql, $exprParams] = $surfaceMatch($partsNorm);
+				$surfaceBranches[] = "((d.parts_text <> '') IS TRUE AND strpos(lower($partsNorm), ?) > 0 AND $exprSql)";
+				$surfaceParams[] = $needle;
+				array_push($surfaceParams, ...$exprParams);
+			}
+			if ($hasD) {
+				[$exprSql, $exprParams] = $surfaceMatch($contentNorm);
+				$surfaceBranches[] = "((d.content <> '') IS TRUE AND strpos(lower($contentNorm), ?) > 0 AND $exprSql)";
+				$surfaceParams[] = $needle;
+				array_push($surfaceParams, ...$exprParams);
+			}
+			$surfaceSql = $surfaceBranches === [] ? 'FALSE' : (count($surfaceBranches) === 1 ? $surfaceBranches[0] : '(' . implode(' OR ', $surfaceBranches) . ')');
+
+			return [
+				"EXISTS (SELECT 1 FROM $t d WHERE $matchSql AND $surfaceSql AND $probeFilterSql)",
+				[...$branchParams, ...$surfaceParams, ...$filterParams],
+				'(' . implode(' OR ', $stopChecks) . ')',
+				$stopParams,
+			];
+		};
+
+		$batchProbe = function (array $exactWords, array $prefixWords, array $stopCheckWords) use (
+			$languages,
+			$weights,
+			$buildExistsColumn,
 			&$stopwordCache
 		): array {
-			$unique = array_values(array_unique($probeWords));
-			if ($unique === []) {
-				return [];
+			$uniqueExact = array_values(array_unique($exactWords));
+			$uniquePrefix = array_values(array_unique($prefixWords));
+			$uniqueStops = array_values(array_unique($stopCheckWords));
+
+			/** @var list<array{kind: 'exact'|'prefix'|'stop', word: string}> $items */
+			$items = [];
+			$scheduledStop = [];
+			foreach ($uniqueExact as $w) {
+				$items[] = ['kind' => 'exact', 'word' => $w];
+				$scheduledStop[$w] = true;
 			}
-			$visibleWords = [];
-			foreach (array_chunk($unique, 200) as $chunk) {
+			foreach ($uniquePrefix as $w) {
+				$items[] = ['kind' => 'prefix', 'word' => $w];
+				$scheduledStop[$w] = true;
+			}
+			foreach ($uniqueStops as $w) {
+				if (!array_key_exists($w, $stopwordCache) && !isset($scheduledStop[$w])) {
+					$items[] = ['kind' => 'stop', 'word' => $w];
+				}
+			}
+
+			$visibleExact = [];
+			$visiblePrefix = [];
+			foreach (array_chunk($items, 200) as $chunk) {
 				$selects = [];
 				$params = [];
-				foreach ($chunk as $word) {
-					$branches = [];
-					$branchParams = [];
-					$stopChecks = [];
-					$stopParams = [];
-					foreach ($languages as $langIdx => $language) {
-						[$langCond, $langCondParams] = $langConditions[$langIdx];
-						[$tsSql, $tsParams] = $this->queryBuilder->wordTsQuery($word, $language, $weights);
-						$branches[] = "(numnode($tsSql) > 0 AND $langCond AND d.tsv @@ $tsSql)";
-						array_push($branchParams, ...$tsParams, ...$langCondParams, ...$tsParams);
-						$stopChecks[] = "numnode($tsSql) = 0";
-						array_push($stopParams, ...$tsParams);
-					}
-					$matchSql = count($branches) === 1 ? $branches[0] : '(' . implode(' OR ', $branches) . ')';
-
-					// Verify unstemmed surface occurrence ('simple') across active weighted fields so stemmed/prefix neighbors cannot leak.
-					// When $prefix is true, match only ^[[:alpha:]]{3,40}$ lexemes like VocabularyService::insertSql().
-					$needle = mb_strtolower($word, 'UTF-8');
-					$simpleTsSql = '';
-					$simpleTsParams = [];
-					if (!$prefix) {
-						[$simpleTsSql, $simpleTsParams] = $this->queryBuilder->wordTsQuery($word, 'pg_catalog.simple', null, false);
-					}
-					$surfaceMatch = static function (string $expr) use ($prefix, $needle, $simpleTsSql, $simpleTsParams): array {
-						if ($prefix) {
-							return [
-								"EXISTS (SELECT 1 FROM unnest(to_tsvector('pg_catalog.simple', $expr)) AS w WHERE w.lexeme ~ '^[[:alpha:]]{3,40}$' AND starts_with(w.lexeme, ?))",
-								[$needle],
-							];
+				$colMap = [];
+				foreach ($chunk as $item) {
+					$word = $item['word'];
+					if ($item['kind'] === 'stop') {
+						$stopChecks = [];
+						foreach ($languages as $language) {
+							[$tsSql, $tsParams] = $this->queryBuilder->wordTsQuery($word, $language, $weights);
+							$stopChecks[] = "numnode($tsSql) = 0";
+							array_push($params, ...$tsParams);
 						}
-						return ["to_tsvector('pg_catalog.simple', $expr) @@ $simpleTsSql", $simpleTsParams];
-					};
-					$surfaceBranches = [];
-					$surfaceParams = [];
-					if ($hasA) {
-						[$exprSql, $exprParams] = $surfaceMatch($titleExpr);
-						$surfaceBranches[] = "((d.title <> '') IS TRUE AND $exprSql)";
-						array_push($surfaceParams, ...$exprParams);
+						$colMap[] = ['kind' => 'stop', 'word' => $word, 'col' => count($selects)];
+						$selects[] = '(' . implode(' OR ', $stopChecks) . ')';
+					} else {
+						[$existsSql, $existsParams, $stopSql, $stopParams] = $buildExistsColumn($word, $item['kind'] === 'prefix');
+						$visCol = count($selects);
+						$selects[] = $existsSql;
+						array_push($params, ...$existsParams);
+						$stopCol = count($selects);
+						$selects[] = $stopSql;
+						array_push($params, ...$stopParams);
+						$colMap[] = ['kind' => $item['kind'], 'word' => $word, 'col' => $visCol, 'stopCol' => $stopCol];
 					}
-					if ($hasB) {
-						[$exprSql, $exprParams] = $surfaceMatch($tagsNorm);
-						$surfaceBranches[] = "((d.tags_text <> '') IS TRUE AND $exprSql)";
-						array_push($surfaceParams, ...$exprParams);
-					}
-					if ($hasC) {
-						[$exprSql, $exprParams] = $surfaceMatch($partsNorm);
-						$surfaceBranches[] = "((d.parts_text <> '') IS TRUE AND strpos(lower($partsNorm), ?) > 0 AND $exprSql)";
-						$surfaceParams[] = $needle;
-						array_push($surfaceParams, ...$exprParams);
-					}
-					if ($hasD) {
-						[$exprSql, $exprParams] = $surfaceMatch($contentNorm);
-						$surfaceBranches[] = "((d.content <> '') IS TRUE AND strpos(lower($contentNorm), ?) > 0 AND $exprSql)";
-						$surfaceParams[] = $needle;
-						array_push($surfaceParams, ...$exprParams);
-					}
-					$surfaceSql = $surfaceBranches === [] ? 'FALSE' : (count($surfaceBranches) === 1 ? $surfaceBranches[0] : '(' . implode(' OR ', $surfaceBranches) . ')');
-
-					$selects[] = "EXISTS (SELECT 1 FROM $t d WHERE $matchSql AND $surfaceSql AND $probeFilterSql)";
-					array_push($params, ...$branchParams, ...$surfaceParams, ...$filterParams);
-					$selects[] = '(' . implode(' OR ', $stopChecks) . ')';
-					array_push($params, ...$stopParams);
 				}
 				$result = $this->db->executeQuery('SELECT ' . implode(', ', $selects), $params);
 				$row = $result->fetch(\PDO::FETCH_NUM);
@@ -574,44 +615,35 @@ class SearchService {
 				if (!is_array($row)) {
 					continue;
 				}
-				foreach ($chunk as $i => $word) {
-					$stopwordCache[$word] = in_array($row[$i * 2 + 1] ?? false, [true, 1, '1', 't'], true);
-					if (in_array($row[$i * 2] ?? false, [true, 1, '1', 't'], true)) {
-						$visibleWords[] = $word;
+				foreach ($colMap as $entry) {
+					$word = $entry['word'];
+					if ($entry['kind'] === 'stop') {
+						$stopwordCache[$word] = in_array($row[$entry['col']] ?? false, [true, 1, '1', 't'], true);
+					} else {
+						$stopwordCache[$word] = in_array($row[$entry['stopCol']] ?? false, [true, 1, '1', 't'], true);
+						if (in_array($row[$entry['col']] ?? false, [true, 1, '1', 't'], true)) {
+							if ($entry['kind'] === 'exact') {
+								$visibleExact[] = $word;
+							} else {
+								$visiblePrefix[] = $word;
+							}
+						}
 					}
 				}
 			}
-			return $visibleWords;
+
+			$matchedStops = array_values(array_filter($uniqueStops, static fn (string $w): bool => $stopwordCache[$w] ?? false));
+			return [$visibleExact, $visiblePrefix, $matchedStops];
 		};
 
-		$stopwords = function (array $checkWords) use ($languages, $weights, &$stopwordCache): array {
-			$unique = array_values(array_unique($checkWords));
-			$missing = array_values(array_filter($unique, static fn (string $w): bool => !array_key_exists($w, $stopwordCache)));
-			foreach (array_chunk($missing, 200) as $chunk) {
-				$selects = [];
-				$params = [];
-				foreach ($chunk as $word) {
-					$stopChecks = [];
-					foreach ($languages as $language) {
-						[$tsSql, $tsParams] = $this->queryBuilder->wordTsQuery($word, $language, $weights);
-						$stopChecks[] = "numnode($tsSql) = 0";
-						array_push($params, ...$tsParams);
-					}
-					$selects[] = '(' . implode(' OR ', $stopChecks) . ')';
-				}
-				$result = $this->db->executeQuery('SELECT ' . implode(', ', $selects), $params);
-				$row = $result->fetch(\PDO::FETCH_NUM);
-				$result->closeCursor();
-				if (is_array($row)) {
-					foreach ($chunk as $i => $word) {
-						$stopwordCache[$word] = in_array($row[$i] ?? false, [true, 1, '1', 't'], true);
-					}
-				}
-			}
-			return array_values(array_filter($unique, static fn (string $w): bool => $stopwordCache[$w] ?? false));
+		$visible = static function (array $probeWords, bool $prefix = false) use ($batchProbe): array {
+			[$visExact, $visPrefix] = $prefix
+				? $batchProbe([], $probeWords, [])
+				: $batchProbe($probeWords, [], []);
+			return $prefix ? $visPrefix : $visExact;
 		};
 
-		return [$visible, $stopwords];
+		return [$visible, $batchProbe];
 	}
 
 	/**

@@ -78,6 +78,14 @@ class SchemaService {
 		return $this->quoteIdent($this->getSchemaName()) . '.' . $this->quoteIdent($this->getRegconfigFunctionName());
 	}
 
+	public function getQualifiedSchemaName(): string {
+		return $this->quoteIdent($this->getSchemaName());
+	}
+
+	public function quoteIdentifier(string $ident): string {
+		return $this->quoteIdent($ident);
+	}
+
 	public function getTrigramSchema(): ?string {
 		$this->hasTrigram();
 		return $this->trigramSchema;
