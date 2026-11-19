@@ -97,7 +97,11 @@ class VocabularyService {
 	public function alternatives(array $words, bool $spelling, callable $visible, ?callable $stopwords = null): array {
 		/** @var list<string> $validWords */
 		$validWords = [];
-		foreach (array_unique($words) as $word) {
+		foreach ($words as $rawWord) {
+			$word = Fold::lowercase($rawWord);
+			if (in_array($word, $validWords, true)) {
+				continue;
+			}
 			$length = mb_strlen($word);
 			if ($length >= self::MIN_LENGTH && $length <= self::MAX_LENGTH && preg_match('/^\p{L}+$/u', $word) === 1) {
 				$validWords[] = $word;

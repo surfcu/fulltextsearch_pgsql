@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\FullTextSearch_PgSql\Service;
 
 use OCA\FullTextSearch_PgSql\Model\ParsedQuery;
+use OCA\FullTextSearch_PgSql\Tools\Fold;
 
 /**
  * Turns a user's search string into parameterised SQL.
@@ -58,7 +59,7 @@ class TsQueryBuilder {
 			}
 			$word = $this->trimTerm($m[4]);
 			if ($word !== '' && !in_array($word, ['OR', 'AND'], true)) {
-				$lower = mb_strtolower($word, 'UTF-8');
+				$lower = Fold::lowercase($word);
 				if ($m[3] === '+') {
 					$required[] = $lower;
 				} elseif (count($optional) < self::MAX_TERMS) {
@@ -152,7 +153,7 @@ class TsQueryBuilder {
 			if ($isPhrase) {
 				$ts = ['phraseto_tsquery(CAST(? AS pg_catalog.regconfig), ?)', [$language, $text]];
 			} else {
-				$alts = $kind === 'excluded' ? [] : ($alternatives[mb_strtolower($text, 'UTF-8')] ?? []);
+				$alts = $kind === 'excluded' ? [] : ($alternatives[Fold::lowercase($text)] ?? []);
 				$withAlts = $this->wordQuery($text, $kind !== 'excluded', $alts, $weights ?? '');
 				if ($alts !== []) {
 					// A stopword in $language must stay empty even if accented/typo alternatives exist.
@@ -175,7 +176,7 @@ class TsQueryBuilder {
 				];
 			}
 			if ($substring && !$isPhrase && $kind !== 'excluded' && mb_strlen($text) >= self::MIN_SUBSTRING_LENGTH) {
-				$pattern = '%' . addcslashes(mb_strtolower($text, 'UTF-8'), '\\%_') . '%';
+				$pattern = '%' . addcslashes(Fold::lowercase($text), '\\%_') . '%';
 				// numnode() = 0 for stopwords ("the"), which must not substring-match "Other".
 				// Its arguments are constants, so PostgreSQL evaluates it once while planning.
 				$pred = [
