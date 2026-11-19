@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-20
+
 ### Added
 - Support empty search requests (`SearchRequest::isEmptySearch()` / `empty_search` option): when a request allows an empty search and the search text is blank, return the viewer-accessible documents matching the active filters ordered newest first (`modified_time DESC`); no re-indexing is needed.
 - Support `ISearchRequestSimpleQuery` (`getSimpleQueries()`) comparisons (`TEXT`, `KEYWORD`, `ARRAY`, `BOOL`, `INT_EQ`/`GTE`/`GT`/`LTE`/`LT`, `WILDCARD`, `REGEX`) across `info` keys and known document columns, enforcing the search regex/wildcard bounds and matching nothing on unknown, reserved, or type-mismatched fields; no re-indexing is needed.
