@@ -102,6 +102,16 @@ class SchemaService {
 		return $exists;
 	}
 
+	public function hasSubtagsMapColumn(): bool {
+		$result = $this->db->executeQuery(
+			"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid = pg_catalog.to_regclass(?) AND attname = 'subtags_map' AND NOT attisdropped)",
+			[$this->getQualifiedTableName()]
+		);
+		$exists = (bool)$result->fetchOne();
+		$result->closeCursor();
+		return $exists;
+	}
+
 	/**
 	 * Create the table and indexes if they are missing. Serialized and atomic.
 	 */
@@ -143,10 +153,15 @@ class SchemaService {
 				$this->ensureIndexTableIndexes($t, $qt);
 				$this->ensureWordsTable();
 				$this->db->executeStatement("ANALYZE $qt");
-			} elseif (!$this->hasAllIndexesAndWords($qs, $t, $w, $qfn)) {
-				$this->ensureRegconfigFunction($qfn);
-				$this->ensureIndexTableIndexes($t, $qt);
-				$this->ensureWordsTable();
+			} else {
+				if (!$this->hasSubtagsMapColumn()) {
+					$this->db->executeStatement("ALTER TABLE $qt ADD COLUMN IF NOT EXISTS subtags_map jsonb NOT NULL DEFAULT '{}'");
+				}
+				if (!$this->hasAllIndexesAndWords($qs, $t, $w, $qfn)) {
+					$this->ensureRegconfigFunction($qfn);
+					$this->ensureIndexTableIndexes($t, $qt);
+					$this->ensureWordsTable();
+				}
 			}
 
 			if ($ownTransaction) {
@@ -191,6 +206,7 @@ class SchemaService {
 				tags          text[]       NOT NULL DEFAULT '{}',
 				metatags      text[]       NOT NULL DEFAULT '{}',
 				subtags       text[]       NOT NULL DEFAULT '{}',
+				subtags_map   jsonb        NOT NULL DEFAULT '{}',
 				source        text         NOT NULL DEFAULT '',
 				hash          text         NOT NULL DEFAULT '',
 				modified_time bigint       NOT NULL DEFAULT 0,
@@ -296,7 +312,7 @@ class SchemaService {
 		}
 		$typeResult->closeCursor();
 
-		$alterClauses = [];
+		$alterClauses = ["ADD COLUMN IF NOT EXISTS subtags_map jsonb NOT NULL DEFAULT '{}'"];
 		foreach ($columns as $col) {
 			if (($currentTypes[$col] ?? '') !== 'text') {
 				$alterClauses[] = $col === 'config'

@@ -60,14 +60,19 @@ class PostgreSQLPlatform implements IFullTextSearchPlatform {
 	}
 
 	public function loadPlatform() {
+		if (!$this->schemaService->isPostgres()) {
+			return;
+		}
 		// Create a missing table on first load, but never rebuild an existing schema on a request path.
-		if ($this->schemaService->isPostgres() && !$this->schemaService->isCurrent()) {
+		if (!$this->schemaService->isCurrent()) {
 			if ($this->schemaService->tableExists()) {
 				throw new RuntimeException(sprintf(
 					'Full text search index table "%s" uses an outdated schema; run "occ upgrade" or "occ maintenance:repair" to upgrade it.',
 					$this->schemaService->getTableName()
 				));
 			}
+			$this->schemaService->ensureSchema();
+		} elseif (!$this->schemaService->hasSubtagsMapColumn()) {
 			$this->schemaService->ensureSchema();
 		}
 	}
