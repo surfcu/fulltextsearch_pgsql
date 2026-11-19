@@ -535,7 +535,11 @@ class VocabularyService {
 	 */
 	private static function filterValidWords(array $words): array {
 		$valid = [];
-		foreach (array_unique($words) as $word) {
+		foreach ($words as $rawWord) {
+			$word = Fold::lowercase($rawWord);
+			if (in_array($word, $valid, true)) {
+				continue;
+			}
 			$length = mb_strlen($word);
 			if ($length >= self::MIN_LENGTH && $length <= self::MAX_LENGTH && preg_match('/^\p{L}+$/u', $word) === 1) {
 				$valid[] = $word;

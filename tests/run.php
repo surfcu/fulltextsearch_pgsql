@@ -4688,6 +4688,65 @@ try {
 		$p5Cleanup();
 		$config->setConfig(['language' => 'turkish']);
 	}
+
+	section('P6: dotted İ outside Turkish and per-language title fallback');
+	$platform->resetIndex('p6p');
+	$config->setConfig(['language' => 'english', 'use_trigram' => true, 'typo_correction' => true]);
+	try {
+		$p6Qb = new TsQueryBuilder();
+		same(['izmir', 'inönü'], $p6Qb->searchWords('İzmir İnönü', 'english'), 'P6 unit: TsQueryBuilder::searchWords maps İ to i before mb_strtolower outside turkish');
+
+		$platform->indexDocument(doc('P6_ACC_IZMIR', 'alice', 'Aegean Notes', 'regional ízmir harbour statistics', [], 'p6p'));
+		$platform->indexDocument(doc('P6_ACC_INONU', 'alice', 'History Notes', 'bridge inonu boulevard traffic', [], 'p6p'));
+		$platform->indexDocument(doc('P6_TYP_IZMIR', 'alice', 'Port Notes', 'cargo izmir terminal manifest', [], 'p6p'));
+		$platform->indexDocument(doc('P6_SUB_TITLE', 'alice', 'AnadoluİzmirBranchPlan.pdf', '', [], 'p6p'));
+
+		same(['P6_ACC_IZMIR', 'P6_SUB_TITLE', 'P6_TYP_IZMIR'], sorted(search($platform, 'alice', 'İzmir', ['provider' => 'p6p'])['ids']), 'P6: İzmir under english gets accent variants (ízmir) and mid-word title-substring matches (AnadoluİzmirBranchPlan.pdf)');
+		same(['P6_ACC_INONU'], search($platform, 'alice', 'İnönü', ['provider' => 'p6p'])['ids'], 'P6: İnönü under english gets accent variant inonu');
+		same(['izmir' => ['ízmir']], $vocabulary->alternatives(['İzmir'], false, static fn (array $w): array => $w), 'P6: VocabularyService::alternatives normalizes İ to i before mb_strtolower');
+		if ($schema->hasTrigram()) {
+			same(['P6_SUB_TITLE'], search($platform, 'alice', 'İzmirBran', ['provider' => 'p6p'])['ids'], 'P6: İzmirBran under english matches mid-word compound title via title_search substring');
+			same(['P6_ACC_IZMIR', 'P6_TYP_IZMIR'], sorted(search($platform, 'alice', 'İzmirx', ['provider' => 'p6p'])['ids']), 'P6: İzmirx under english gets spelling corrections to izmir and ízmir');
+
+			// Title similarity fallback with İ under english and per-language I/İ in multi-language configs
+			$platform->resetIndex('p6p');
+			$config->setConfig(['language' => 'english', 'use_trigram' => true, 'typo_correction' => false]);
+			$platform->indexDocument(doc('P6_FB_IZMIR', 'alice', 'İzmir Annual Summary', 'unrelated text', [], 'p6p'));
+			same(['P6_FB_IZMIR'], search($platform, 'alice', 'İzmirr', ['provider' => 'p6p'])['ids'], 'P6: İzmirr under english matches title via similarity fallback');
+
+			$platform->resetIndex('p6p');
+			$config->setConfig(['language' => 'english,turkish', 'use_trigram' => true, 'typo_correction' => false]);
+			$platform->indexDocument(doc(
+				'P6_ML_TR',
+				'alice',
+				'ISPARTA GÜNLÜĞÜ',
+				'Bu yıl ve geçen yıl için tüm çalışmalar ofiste özenle yapıldı.',
+				[],
+				'p6p'
+			));
+			$platform->indexDocument(doc(
+				'P6_ML_EN',
+				'alice',
+				'ILLINOIS ARCHIVE',
+				'The archive for the state board was published in the journal.',
+				[],
+				'p6p'
+			));
+			same('turkish', (string)$conn->executeQuery("SELECT config FROM ftspg_oc_index WHERE provider_id = 'p6p' AND document_id = 'P6_ML_TR'")->fetchOne(), 'P6 setup: P6_ML_TR detected as turkish');
+			same('english', (string)$conn->executeQuery("SELECT config FROM ftspg_oc_index WHERE provider_id = 'p6p' AND document_id = 'P6_ML_EN'")->fetchOne(), 'P6 setup: P6_ML_EN detected as english');
+
+			same(['P6_ML_TR'], search($platform, 'alice', 'ISPARTAK', ['provider' => 'p6p'])['ids'], 'P6: under english,turkish, title fallback builds Turkish ıspartak for turkish rows');
+			$p6PastEnd = search($platform, 'alice', 'ISPARTAK', ['provider' => 'p6p', 'size' => 1, 'page' => 3]);
+			same([], $p6PastEnd['ids'], 'P6: past-end page of per-language title fallback returns empty ids');
+			same(1, $p6PastEnd['total'], 'P6: past-end page of per-language title fallback preserves total 1');
+
+			$config->setConfig(['language' => 'turkish,english', 'use_trigram' => true, 'typo_correction' => false]);
+			same(['P6_ML_EN'], search($platform, 'alice', 'ILLINOIZ', ['provider' => 'p6p'])['ids'], 'P6: under turkish,english, title fallback builds English illinoiz for english rows');
+		}
+	} finally {
+		$platform->resetIndex('p6p');
+		$config->setConfig(['language' => 'turkish', 'use_trigram' => true, 'typo_correction' => true]);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";

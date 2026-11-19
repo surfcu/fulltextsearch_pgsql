@@ -8,6 +8,7 @@ use OC\FullTextSearch\Model\DocumentAccess;
 use OC\FullTextSearch\Model\IndexDocument;
 use OCA\FullTextSearch_PgSql\Exceptions\DocumentNotFoundException;
 use OCA\FullTextSearch_PgSql\Model\ParsedQuery;
+use OCA\FullTextSearch_PgSql\Tools\Fold;
 use OCA\FullTextSearch_PgSql\Tools\PgArray;
 use OCP\FullTextSearch\Model\IDocumentAccess;
 use OCP\FullTextSearch\Model\IIndexDocument;
@@ -370,7 +371,7 @@ class SearchService {
 				$tested = [];
 				foreach ($queries as $q) {
 					if ($q->plainText !== '') {
-						foreach (explode(' ', mb_strtolower($q->plainText, 'UTF-8')) as $tw) {
+						foreach (explode(' ', Fold::lowercase($q->plainText)) as $tw) {
 							$tested[$tw] = true;
 						}
 					}
@@ -401,13 +402,12 @@ class SearchService {
 
 		$titlesSearched = $weights === null || str_contains($weights, 'A');
 		if ($total === 0 && $titlesSearched && $this->fuzzyAvailable() && $query->plainText !== '' && $query->plainWordsOnly) {
-			[$nonStopSql, $nonStopParams] = $this->nonStopwordCondition($queries);
 			// Nothing matched exactly: fall back to typo-tolerant matching on titles ("rapr" -> "rapor").
-			$rows = $this->titleSimilaritySearch($query->plainText, $nonStopSql, $nonStopParams, $filterSql, $filterParams, $size, $offset);
+			$rows = $this->titleSimilaritySearch($queries, $filterSql, $filterParams, $size, $offset);
 			if ($rows !== []) {
 				$total = (int)$rows[0]['total'];
 			} elseif ($page > 1) {
-				$total = $this->titleSimilarityCount($query->plainText, $nonStopSql, $nonStopParams, $filterSql, $filterParams);
+				$total = $this->titleSimilarityCount($queries, $filterSql, $filterParams);
 			}
 		}
 
@@ -505,7 +505,7 @@ class SearchService {
 			}
 			$matchSql = count($branches) === 1 ? $branches[0] : '(' . implode(' OR ', $branches) . ')';
 
-			$needle = mb_strtolower($word, 'UTF-8');
+			$needle = Fold::lowercase($word);
 			$simpleTsSql = '';
 			$simpleTsParams = [];
 			if (!$prefix) {
@@ -1809,48 +1809,71 @@ class SearchService {
 	}
 
 	/**
-	 * Restricts the title fallback to rows whose language treats at least one search word as
-	 * a non-stopword; PostgreSQL constant-folds numnode(...) while planning.
+	 * Per-language rank expression and GIN-indexable (<%) match condition for the title fallback,
+	 * gated on numnode(rank_tsquery) > 0 so stopword-only searches never match via trigrams.
 	 *
 	 * @param non-empty-array<string, ParsedQuery> $queries
-	 * @return array{0: string, 1: list<string>}
+	 * @return array{0: string, 1: list<string>, 2: string, 3: list<string>}
 	 */
-	private function nonStopwordCondition(array $queries): array {
-		$conditions = self::languageConditions(array_keys($queries));
-		$branches = [];
-		$params = [];
-		foreach (array_values($queries) as $i => $query) {
-			[$condition, $conditionParams] = $conditions[$i];
-			$branches[] = "($condition AND numnode({$query->rankSql}) > 0)";
-			array_push($params, ...$conditionParams, ...$query->rankParams);
-		}
-		return [count($branches) === 1 ? $branches[0] : '(' . implode(' OR ', $branches) . ')', $params];
-	}
-
-	/**
-	 * @param list<string> $nonStopParams
-	 * @param list<string> $filterParams
-	 * @return list<array<string, mixed>>
-	 */
-	private function titleSimilaritySearch(string $text, string $nonStopSql, array $nonStopParams, string $filterSql, array $filterParams, int $limit, int $offset = 0): array {
-		$t = $this->schemaService->getQualifiedTableName();
+	private function titleSimilarityComponents(array $queries): array {
 		$ts = $this->schemaService->getTrigramSchema();
 		$wordSim = $ts !== null ? "{$ts}.word_similarity" : 'word_similarity';
 		$wordOp = $ts !== null ? "OPERATOR({$ts}.<%)" : '<%';
+		$conditions = self::languageConditions(array_keys($queries));
+		$queryList = array_values($queries);
+
+		$whereBranches = [];
+		$whereParams = [];
+		$rankCases = [];
+		$rankCaseParams = [];
+		$firstText = Fold::lowercase($queryList[0]->plainText);
+
+		foreach ($queryList as $i => $q) {
+			[$langCond, $langParams] = $conditions[$i];
+			$text = Fold::lowercase($q->plainText);
+			if ($langCond === 'TRUE') {
+				$whereBranches[] = "(? {$wordOp} d.title_search AND numnode({$q->rankSql}) > 0)";
+				$whereParams = [...$whereParams, $text, ...$q->rankParams];
+			} else {
+				$whereBranches[] = "($langCond AND ? {$wordOp} d.title_search AND numnode({$q->rankSql}) > 0)";
+				$whereParams = [...$whereParams, ...$langParams, $text, ...$q->rankParams];
+			}
+			if ($i > 0) {
+				$rankCases[] = "WHEN $langCond THEN {$wordSim}(?, d.title_search)";
+				$rankCaseParams = [...$rankCaseParams, ...$langParams, $text];
+			}
+		}
+
+		$rankSql = $rankCases === []
+			? "{$wordSim}(?, d.title_search)"
+			: 'CASE ' . implode(' ', $rankCases) . " ELSE {$wordSim}(?, d.title_search) END";
+		$rankParams = [...$rankCaseParams, $firstText];
+		$whereSql = count($whereBranches) === 1 ? $whereBranches[0] : '(' . implode(' OR ', $whereBranches) . ')';
+
+		return [$rankSql, $rankParams, $whereSql, $whereParams];
+	}
+
+	/**
+	 * @param non-empty-array<string, ParsedQuery> $queries
+	 * @param list<string> $filterParams
+	 * @return list<array<string, mixed>>
+	 */
+	private function titleSimilaritySearch(array $queries, string $filterSql, array $filterParams, int $limit, int $offset = 0): array {
+		$t = $this->schemaService->getQualifiedTableName();
+		[$rankSql, $rankParams, $whereSql, $whereParams] = $this->titleSimilarityComponents($queries);
 		$joined = "CASE WHEN d.content = '' THEN d.parts_text WHEN d.parts_text = '' THEN d.content ELSE d.content || ' ' || d.parts_text END";
 		$sql = <<<SQL
 			SELECT d.document_id, d.title, d.source, d.hash, d.modified_time,
-				   {$wordSim}(?, d.title_search) AS rank,
+				   $rankSql AS rank,
 				   count(*) OVER () AS total,
 				   left($joined, 300) AS excerpt
 			FROM $t d
-			WHERE ? {$wordOp} d.title_search AND $nonStopSql AND $filterSql
+			WHERE $whereSql AND $filterSql
 			ORDER BY rank DESC, d.modified_time DESC, d.id
 			LIMIT ? OFFSET ?
 			SQL;
 
-		$text = mb_strtolower($text, 'UTF-8');
-		$params = array_merge([$text, $text], $nonStopParams, $filterParams, [(string)$limit, (string)$offset]);
+		$params = array_merge($rankParams, $whereParams, $filterParams, [(string)$limit, (string)$offset]);
 		$result = $this->db->executeQuery($sql, $params);
 		$rows = $result->fetchAll();
 		$result->closeCursor();
@@ -1858,17 +1881,15 @@ class SearchService {
 	}
 
 	/**
-	 * @param list<string> $nonStopParams
+	 * @param non-empty-array<string, ParsedQuery> $queries
 	 * @param list<string> $filterParams
 	 */
-	private function titleSimilarityCount(string $text, string $nonStopSql, array $nonStopParams, string $filterSql, array $filterParams): int {
+	private function titleSimilarityCount(array $queries, string $filterSql, array $filterParams): int {
 		$t = $this->schemaService->getQualifiedTableName();
-		$ts = $this->schemaService->getTrigramSchema();
-		$wordOp = $ts !== null ? "OPERATOR({$ts}.<%)" : '<%';
-		$text = mb_strtolower($text, 'UTF-8');
+		[, , $whereSql, $whereParams] = $this->titleSimilarityComponents($queries);
 		$result = $this->db->executeQuery(
-			"SELECT count(*) FROM $t d WHERE ? {$wordOp} d.title_search AND $nonStopSql AND $filterSql",
-			array_merge([$text], $nonStopParams, $filterParams)
+			"SELECT count(*) FROM $t d WHERE $whereSql AND $filterSql",
+			array_merge($whereParams, $filterParams)
 		);
 		$count = (int)$result->fetchOne();
 		$result->closeCursor();

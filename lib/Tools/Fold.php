@@ -21,6 +21,14 @@ final class Fold {
 		return strtr($word, self::map());
 	}
 
+	/**
+	 * Lowercase UTF-8 text the way PostgreSQL's lower() does outside tr_TR: PHP's mb_strtolower()
+	 * turns U+0130 ("İ") into "i\u{0307}", whereas PostgreSQL produces plain "i".
+	 */
+	public static function lowercase(string $text): string {
+		return mb_strtolower(str_replace(['İ', "i\u{0307}"], 'i', $text), 'UTF-8');
+	}
+
 	/** @return array<string, string> */
 	private static function map(): array {
 		static $map = null;
