@@ -4372,6 +4372,58 @@ try {
 		$platform->resetIndex('p2p');
 		$config->setConfig(['language' => 'turkish']);
 	}
+
+	section('P3: owner named __all uses o:__all token and remains private');
+	$platform->resetIndex('p3p');
+	$config->setConfig(['language' => 'english', 'typo_correction' => true]);
+	try {
+		$accOwnedPriv = new DocumentAccess('__all');
+		same(['o:__all'], \OCA\FullTextSearch_PgSql\Service\AccessTokens::forDocument($accOwnedPriv), 'P3 unit: owner __all emits o:__all instead of u:__all');
+
+		$accOwnedPub = new DocumentAccess('__all');
+		$accOwnedPub->setUsers(['__all', 'bob']);
+		same(['o:__all', 'u:__all', 'u:bob'], \OCA\FullTextSearch_PgSql\Service\AccessTokens::forDocument($accOwnedPub), 'P3 unit: public doc owned by __all emits both o:__all and u:__all');
+
+		$viewerCarol = new DocumentAccess();
+		$viewerCarol->setViewerId('carol');
+		same(['u:carol', 'u:__all'], \OCA\FullTextSearch_PgSql\Service\AccessTokens::forViewer($viewerCarol), 'P3 unit: viewer carol does not receive o:__all');
+
+		$viewerAll = new DocumentAccess();
+		$viewerAll->setViewerId('__all');
+		same(['o:__all', 'u:__all'], \OCA\FullTextSearch_PgSql\Service\AccessTokens::forViewer($viewerAll), 'P3 unit: viewer __all receives o:__all and u:__all');
+
+		$viewerBadNul = new DocumentAccess();
+		$viewerBadNul->setViewerId("bad\0viewer");
+		same([], \OCA\FullTextSearch_PgSql\Service\AccessTokens::forViewer($viewerBadNul), 'P3 unit: viewer with NUL byte receives no tokens');
+
+		$viewerBadUtf8 = new DocumentAccess();
+		$viewerBadUtf8->setViewerId("bad\xFFviewer");
+		same([], \OCA\FullTextSearch_PgSql\Service\AccessTokens::forViewer($viewerBadUtf8), 'P3 unit: viewer with invalid UTF-8 receives no tokens');
+
+		$docBadTokens = new DocumentAccess('alice');
+		$docBadTokens->setUsers(['bob', '', "bad\0user", "bad\xFFuser"]);
+		$docBadTokens->setGroups(['g1', '', "bad\0grp"]);
+		same(['u:alice', 'u:bob', 'g:g1'], \OCA\FullTextSearch_PgSql\Service\AccessTokens::forDocument($docBadTokens), 'P3 unit: forDocument skips empty, NUL, and invalid UTF-8 principals');
+
+		$platform->indexDocument(doc('P3_OWNED_PRIV', '__all', 'All Owner Secret.txt', 'quokka private note', [], 'p3p'));
+		$platform->indexDocument(doc('P3_SHARED_CAROL', '__all', 'Shared With Carol.txt', 'quokka shared note', ['users' => ['carol']], 'p3p'));
+		$platform->indexDocument(doc('P3_PUBLIC', 'alice', 'Public Alice Doc.txt', 'quokka public announcement', ['users' => ['__all']], 'p3p'));
+		$platform->indexDocument(doc('P3_OWNED_PUB', '__all', 'Public All Doc.txt', 'quokka owned public announcement', ['users' => ['__all']], 'p3p'));
+
+		same(['P3_OWNED_PUB', 'P3_PUBLIC', 'P3_SHARED_CAROL'], sorted(search($platform, 'carol', 'quokka', ['provider' => 'p3p'])['ids']), 'P3: Carol cannot find private document owned by __all, while public and shared docs stay visible');
+		same(['P3_OWNED_PRIV', 'P3_OWNED_PUB', 'P3_PUBLIC', 'P3_SHARED_CAROL'], sorted(search($platform, '__all', 'quokka', ['provider' => 'p3p'])['ids']), 'P3: viewer __all finds own private doc and public docs');
+
+		$p3PrivDoc = $platform->getDocument('p3p', 'P3_OWNED_PRIV');
+		same('__all', $p3PrivDoc->getAccess()->getOwnerId(), 'P3: getDocument preserves owner __all');
+		same([], $p3PrivDoc->getAccess()->getUsers(), 'P3: getDocument keeps users empty for private doc owned by __all');
+
+		$p3PubDoc = $platform->getDocument('p3p', 'P3_OWNED_PUB');
+		same('__all', $p3PubDoc->getAccess()->getOwnerId(), 'P3: getDocument preserves owner __all on public doc');
+		same(['__all'], $p3PubDoc->getAccess()->getUsers(), 'P3: getDocument preserves __all public marker on doc owned by __all');
+	} finally {
+		$platform->resetIndex('p3p');
+		$config->setConfig(['language' => 'turkish']);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";
