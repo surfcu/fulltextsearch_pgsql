@@ -3580,6 +3580,85 @@ try {
 		$platform->resetIndex('s3dump');
 		$config->setConfig(['language' => 'turkish']);
 	}
+
+	section('H2: indexing caller-tx savepoints, parts key sanitization, LanguageDetector PgArray, vocabulary COLLATE C');
+	$platform->resetIndex('h2p');
+	$config->setConfig(['language' => 'english', 'typo_correction' => true]);
+
+	try {
+		// 1. Vocabulary update failure inside a caller's transaction rolls back its savepoint instead of leaving 25P02
+		$conn->beginTransaction();
+		$conn->executeStatement("SET LOCAL lock_timeout = '50ms'");
+		$conn2->beginTransaction();
+		$conn2->exec('LOCK TABLE ftspg_oc_words IN ACCESS EXCLUSIVE MODE');
+		$h2VocabWarnings = $indexService->indexDocument(doc('H2_VOCAB_TX', 'alice', 'Tx Doc.txt', 'vocabulary savepoint test body', [], 'h2p'));
+		$conn2->rollBack();
+		same([], $h2VocabWarnings, 'H2: vocabulary failure logs warning without failing indexDocument');
+		$h2TxAlive = false;
+		try {
+			$h2TxAlive = (int)$conn->executeQuery('SELECT 1')->fetchOne() === 1;
+		} catch (Throwable) {
+			$h2TxAlive = false;
+		}
+		$conn->rollBack();
+		same(true, $h2TxAlive, 'H2: caller transaction remains usable (not 25P02) after vocabulary failure');
+
+		// 2. LanguageDetector::scores() failure inside a caller's transaction preserves caller transaction
+		$conn->beginTransaction();
+		$h2BadScores = $detector->scores('the quick brown fox jumps over the lazy dog', ['nonexistent_cfg_xyz', 'english']);
+		$h2DetectTxAlive = false;
+		try {
+			$h2DetectTxAlive = (int)$conn->executeQuery('SELECT 1')->fetchOne() === 1;
+		} catch (Throwable) {
+			$h2DetectTxAlive = false;
+		}
+		$conn->rollBack();
+		same(['nonexistent_cfg_xyz' => 0, 'english' => 0], $h2BadScores, 'H2: LanguageDetector::scores() falls back cleanly on invalid config');
+		same(true, $h2DetectTxAlive, 'H2: caller transaction remains usable (not 25P02) after LanguageDetector::scores() error');
+
+		// 3. LanguageDetector::scores() handles custom regconfig names containing commas via PgArray::toLiteral()
+		$conn->executeStatement('DROP TEXT SEARCH CONFIGURATION IF EXISTS "custom,cfg"');
+		$conn->executeStatement('CREATE TEXT SEARCH CONFIGURATION "custom,cfg" (COPY = pg_catalog.english)');
+		try {
+			$logger->records = [];
+			$commaScores = $detector->scores('the quick brown fox jumps over the lazy dog', ['custom,cfg', 'simple']);
+			check(($commaScores['custom,cfg'] ?? 0) >= 2, 'H2: LanguageDetector::scores() counts stopwords for custom regconfig containing a comma');
+			same([], $logger->records, 'H2: LanguageDetector::scores() logs no warning for custom regconfig containing a comma');
+		} finally {
+			$conn->executeStatement('DROP TEXT SEARCH CONFIGURATION IF EXISTS "custom,cfg"');
+		}
+
+		// 4. NUL byte in parts map key is sanitized instead of failing jsonb cast with 22P05
+		$nulPartIdx = $platform->indexDocument(doc('H2_NUL_PART', 'alice', 'Part Key NUL.txt', 'body content', [
+			'parts' => ["comment\0key" => 'searchableparttoken'],
+		], 'h2p'));
+		same(true, $nulPartIdx->isStatus(IIndex::INDEX_DONE), 'H2: document with NUL byte in parts key indexes cleanly');
+		same(['H2_NUL_PART'], search($platform, 'alice', 'searchableparttoken', ['provider' => 'h2p'])['ids'], 'H2: sanitized part value remains searchable');
+		same(['commentkey' => 'searchableparttoken'], $platform->getDocument('h2p', 'H2_NUL_PART')->getParts(), 'H2: getDocument() returns NUL-stripped part key');
+
+		// 5. VocabularyService::insertSql() uses pg_catalog.simple and ORDER BY w.word COLLATE "C"
+		$conn->executeStatement('CREATE SCHEMA IF NOT EXISTS h2_shadow');
+		$conn->executeStatement('DROP TEXT SEARCH CONFIGURATION IF EXISTS h2_shadow.simple');
+		$conn->executeStatement('CREATE TEXT SEARCH CONFIGURATION h2_shadow.simple (COPY = pg_catalog.english)');
+		$conn->executeStatement('SET search_path = h2_shadow, pg_catalog, public');
+		try {
+			$conn->log = [];
+			$platform->indexDocument(doc('H2_SHADOW_VOCAB', 'alice', 'Shadow Vocab.txt', 'the xylophonerunning', [], 'h2p'));
+			$vocabSqls = array_values(array_filter(
+				array_column($conn->log, 0),
+				static fn (string $sql): bool => str_contains($sql, 'INSERT INTO "public"."ftspg_oc_words"')
+			));
+			check($vocabSqls !== [] && str_contains($vocabSqls[0], 'w.word COLLATE "C"'), 'H2: vocabulary insert orders by COLLATE "C"');
+			$hasUnstemmed = (bool)$conn->executeQuery("SELECT EXISTS (SELECT 1 FROM public.ftspg_oc_words WHERE word = 'xylophonerunning')")->fetchOne();
+			same(true, $hasUnstemmed, 'H2: vocabulary insert uses pg_catalog.simple even when shadow simple exists in search_path');
+		} finally {
+			$conn->executeStatement('RESET search_path');
+			$conn->executeStatement('DROP SCHEMA h2_shadow CASCADE');
+		}
+	} finally {
+		$platform->resetIndex('h2p');
+		$config->setConfig(['language' => 'turkish']);
+	}
 } catch (Throwable $e) {
 	$failures++;
 	echo "\n  ERROR " . get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n";

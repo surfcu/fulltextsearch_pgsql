@@ -72,9 +72,13 @@ class IndexService {
 
 		$parts = [];
 		foreach ($document->getParts() as $name => $value) {
+			$cleanName = $extractor->sanitize((string)$name);
 			$val = (string)$value;
 			$strip = $extractor->looksLikeMarkup($val, '', true);
-			$parts[(string)$name] = $extractor->clean($val, $strip);
+			$cleanVal = $extractor->clean($val, $strip);
+			$parts[$cleanName] = isset($parts[$cleanName]) && $parts[$cleanName] !== ''
+				? ($cleanVal !== '' ? $parts[$cleanName] . ' ' . $cleanVal : $parts[$cleanName])
+				: $cleanVal;
 		}
 
 		$partsText = implode(' ', $parts);
@@ -283,9 +287,14 @@ class IndexService {
 		}
 
 		if ($this->configService->useTypoCorrection()) {
+			$savepointVocab = 'ftspg_vocab';
+			$this->createSavepoint($savepointVocab);
 			try {
 				$this->vocabulary->addDocument($document->getProviderId(), $document->getId(), $updateContent, $updateParts);
+				$this->releaseSavepoint($savepointVocab);
 			} catch (Throwable $e) {
+				$this->rollbackSavepoint($savepointVocab);
+				$this->releaseSavepoint($savepointVocab);
 				// Typo correction is a nicety; never fail indexing over it.
 				$this->logger->warning('Could not update the typo correction vocabulary', ['exception' => $e]);
 			}

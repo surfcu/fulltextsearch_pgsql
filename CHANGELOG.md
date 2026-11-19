@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Indexing transaction, metadata, and vocabulary hardening: isolate vocabulary updates and language detection in savepoints when indexing inside a caller's transaction, sanitize `parts` keys against NUL bytes and invalid UTF-8 before `jsonb` encoding, escape `regconfig[]` literals with `PgArray` in `LanguageDetector`, and schema-qualify `pg_catalog.simple` while ordering vocabulary inserts by `COLLATE "C"` to match the primary key; no re-indexing is needed.
+
 ## [1.6.0] - 2026-11-18
 
 ### Added
