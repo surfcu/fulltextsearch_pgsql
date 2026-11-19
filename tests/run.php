@@ -117,6 +117,17 @@ function doc(string $id, string $owner, string $title, string $content, array $s
 	}
 	$document->setTags($share['tags'] ?? []);
 	$document->setParts($share['parts'] ?? []);
+	if (isset($share['source'])) {
+		$document->setSource((string)$share['source']);
+	}
+	foreach ($share['info'] ?? [] as $infoKey => $infoVal) {
+		match (true) {
+			is_array($infoVal) => $document->setInfoArray((string)$infoKey, $infoVal),
+			is_bool($infoVal) => $document->setInfoBool((string)$infoKey, $infoVal),
+			is_int($infoVal) => $document->setInfoInt((string)$infoKey, $infoVal),
+			default => $document->setInfo((string)$infoKey, (string)$infoVal),
+		};
+	}
 	return $document;
 }
 
@@ -135,6 +146,7 @@ function search(PostgreSQLPlatform $platform, string $viewer, string $q, array $
 		'getRegexFilters' => $opts['regex'] ?? [],
 		'getWildcardFilters' => $opts['wildcard'] ?? [],
 		'getLimitFields' => $opts['limit'] ?? [],
+		'getSimpleQueries' => $opts['simple'] ?? [],
 	]);
 	$provider = double(IFullTextSearchProvider::class, ['getId' => $opts['provider'] ?? 'files']);
 	$result = double(ISearchResult::class, [
@@ -4018,6 +4030,130 @@ try {
 			$runPgTool(['make', '-C', $repoRoot, 'clean'], $h4Env);
 		}
 		$conn->executeStatement("DROP DATABASE IF EXISTS $qH4BenchDb WITH (FORCE)");
+	}
+
+	section('P2: ISearchRequestSimpleQuery comparisons on info keys and known columns');
+	$platform->resetIndex('p2p');
+	$config->setConfig(['language' => 'english', 'use_trigram' => true, 'typo_correction' => true]);
+	$sq = static fn (int $type, string $field, array $values) => double(
+		\OCP\FullTextSearch\Model\ISearchRequestSimpleQuery::class,
+		['getType' => $type, 'getField' => $field, 'getValues' => $values]
+	);
+	try {
+		$platform->indexDocument(doc('P2_A', 'alice', 'Report_2025.pdf', 'harbour budget studies overview', [
+			'mtime' => 1000,
+			'source' => 'files_local',
+			'tags' => ['finance', 'q1'],
+			'metatags' => ['starred'],
+			'subtags' => ['files' => 'local'],
+			'parts' => ['comments' => 'audited by treasury'],
+			'info' => [
+				'mime' => 'application/pdf',
+				'pages' => 10,
+				'pinned' => true,
+				'labels' => ['urgent', 'board'],
+				'notes' => 'quarterly executive summary',
+			],
+		], 'p2p'));
+		$platform->indexDocument(doc('P2_B', 'alice', 'Plan%Draft.odt', 'harbour construction timeline', [
+			'mtime' => 2000,
+			'source' => 'files_external',
+			'tags' => ['engineering'],
+			'metatags' => ['recent'],
+			'subtags' => ['files' => 'external'],
+			'parts' => ['comments' => 'pending review'],
+			'info' => [
+				'mime' => 'application/vnd.oasis.opendocument.text',
+				'pages' => 25,
+				'pinned' => false,
+				'labels' => ['draft', 'internal'],
+				'notes' => 'harbour pier blueprint',
+			],
+		], 'p2p'));
+		$platform->indexDocument(doc('P2_C', 'bob', 'Notes_2026.txt', 'harbour maintenance log', [
+			'users' => ['alice'],
+			'mtime' => 3000,
+			'source' => 'files_shared',
+			'tags' => ['ops', 'q1'],
+			'info' => [
+				'mime' => 'text/plain',
+				'pages' => 40,
+				'pinned' => true,
+				'labels' => ['ops'],
+				'notes' => 'dock inspection checklist',
+			],
+		], 'p2p'));
+
+		$SQ = \OCP\FullTextSearch\Model\ISearchRequestSimpleQuery::class;
+		$p2 = ['provider' => 'p2p'];
+
+		// 1. COMPARE_TYPE_KEYWORD (info string, info array element, info.<key> alias, known scalar & array columns)
+		same(['P2_A'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_KEYWORD, 'mime', ['application/pdf'])]])['ids'], 'P2 KEYWORD: info string key');
+		same(['P2_A'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_KEYWORD, 'info.mime', ['application/pdf'])]])['ids'], 'P2 KEYWORD: info.<key> alias');
+		same(['P2_A'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_KEYWORD, 'labels', ['board'])]])['ids'], 'P2 KEYWORD: info string array element');
+		same(['P2_B'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_KEYWORD, 'source', ['files_external'])]])['ids'], 'P2 KEYWORD: known column source');
+		same(['P2_C'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_KEYWORD, 'owner', ['bob'])]])['ids'], 'P2 KEYWORD: known column owner');
+		same(['P2_A', 'P2_C'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_KEYWORD, 'tags', ['q1'])]])['ids']), 'P2 KEYWORD: known array column tags');
+
+		// 2. Integer comparisons (INT_EQ, INT_GTE, INT_GT, INT_LTE, INT_LT) on info keys and modified_time / lastModified
+		same(['P2_B'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_EQ, 'pages', [25])]])['ids'], 'P2 INT_EQ: info integer key');
+		same(['P2_B', 'P2_C'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_GTE, 'pages', [25])]])['ids']), 'P2 INT_GTE: info integer key');
+		same(['P2_C'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_GT, 'pages', [25])]])['ids'], 'P2 INT_GT: info integer key');
+		same(['P2_A', 'P2_B'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_LTE, 'pages', [25])]])['ids']), 'P2 INT_LTE: info integer key');
+		same(['P2_A'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_LT, 'pages', [25])]])['ids'], 'P2 INT_LT: info integer key');
+		same(['P2_B', 'P2_C'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_GTE, 'modified_time', [2000])]])['ids']), 'P2 INT_GTE: known column modified_time');
+		same(['P2_A'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_LT, 'lastModified', [2000])]])['ids'], 'P2 INT_LT: known column alias lastModified');
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_EQ, 'pages', ["10\n"])]])['ids'], 'P2 INT_EQ: trailing newline in numeric string fails closed');
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_GT, 'pages', [str_repeat('9', 140000)])]])['ids'], 'P2 INT_GT: >131k-digit string fails closed without SQLSTATE 22003');
+
+		// 3. COMPARE_TYPE_BOOL
+		same(['P2_A', 'P2_C'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_BOOL, 'pinned', [true])]])['ids']), 'P2 BOOL: info boolean true');
+		same(['P2_B'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_BOOL, 'pinned', [false])]])['ids'], 'P2 BOOL: info boolean false');
+
+		// 4. COMPARE_TYPE_ARRAY
+		same(['P2_A', 'P2_C'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_ARRAY, 'mime', [['application/pdf', 'text/plain']])]])['ids']), 'P2 ARRAY: info string key in list');
+		same(['P2_B', 'P2_C'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_ARRAY, 'labels', [['internal', 'ops']])]])['ids']), 'P2 ARRAY: info array overlaps list');
+		same(['P2_A', 'P2_B'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_ARRAY, 'metatags', [['starred', 'recent']])]])['ids']), 'P2 ARRAY: known array column metatags');
+
+		// 5. COMPARE_TYPE_TEXT
+		same(['P2_A'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_TEXT, 'content', ['study'])]])['ids'], 'P2 TEXT: stemmed content field');
+		same(['P2_A'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_TEXT, 'parts.comments', ['treasury'])]])['ids'], 'P2 TEXT: specific document part');
+		same(['P2_B'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_TEXT, 'notes', ['blueprint'])]])['ids'], 'P2 TEXT: info string key');
+
+		// 6. COMPARE_TYPE_WILDCARD and COMPARE_TYPE_REGEX following A1's rules
+		same(['P2_B'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_WILDCARD, 'title', ['plan%*'])]])['ids'], 'P2 WILDCARD: known column title treats % literally');
+		same(['P2_A', 'P2_B'], sorted(search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_WILDCARD, 'mime', ['application/*'])]])['ids']), 'P2 WILDCARD: info string key');
+		same(['P2_A'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_REGEX, 'title', ['report_2025\.pdf'])]])['ids'], 'P2 REGEX: whole-value case-insensitive match on title');
+		same(['P2_C'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_REGEX, 'mime', ['text/[a-z]+'])]])['ids'], 'P2 REGEX: info string key');
+		foreach ([
+			'backreference' => '(a)\1.*',
+			'quantifier > 255' => 'a{300}.*',
+			'PCRE word boundary' => '\breport.*',
+			'NUL byte' => "report\0.*",
+			'invalid UTF-8' => "report\xff\xfe.*",
+			'overlength > 256' => str_repeat('a', 260),
+		] as $a1Case => $badPattern) {
+			same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_REGEX, 'title', [$badPattern])]])['ids'], "P2 REGEX A1 rule ($a1Case) matches nothing without SQL error");
+		}
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_WILDCARD, 'title', ["plan\0*"])]])['ids'], 'P2 WILDCARD A1 rule (NUL byte) matches nothing');
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_WILDCARD, 'title', ["plan\xff*"])]])['ids'], 'P2 WILDCARD A1 rule (invalid UTF-8) matches nothing');
+
+		// 7. Multiple SimpleQueries are ANDed; unknown/reserved/mismatched fields match nothing
+		same(['P2_C'], search($platform, 'alice', 'harbour', $p2 + ['simple' => [
+			$sq($SQ::COMPARE_TYPE_BOOL, 'pinned', [true]),
+			$sq($SQ::COMPARE_TYPE_INT_GT, 'pages', [20]),
+		]])['ids'], 'P2: multiple simple queries are ANDed');
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_KEYWORD, 'unknown_field', ['anything'])]])['ids'], 'P2: unknown field KEYWORD matches nothing');
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_WILDCARD, 'unknown_field', ['*'])]])['ids'], 'P2: unknown field WILDCARD * matches nothing');
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_REGEX, 'unknown_field', ['.*'])]])['ids'], 'P2: unknown field REGEX .* matches nothing');
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_GTE, 'title', [0])]])['ids'], 'P2: integer comparison on string column title matches nothing without 22P02');
+		same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_INT_GTE, 'mime', [0])]])['ids'], 'P2: integer comparison on string info key matches nothing without 22P02');
+		foreach (['users', 'groups', 'circles', 'access', 'tsv', 'config', '_internal'] as $reservedField) {
+			same([], search($platform, 'alice', 'harbour', $p2 + ['simple' => [$sq($SQ::COMPARE_TYPE_WILDCARD, $reservedField, ['*'])]])['ids'], "P2: reserved field '$reservedField' matches nothing");
+		}
+	} finally {
+		$platform->resetIndex('p2p');
+		$config->setConfig(['language' => 'turkish']);
 	}
 } catch (Throwable $e) {
 	$failures++;
