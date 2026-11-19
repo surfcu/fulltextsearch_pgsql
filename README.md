@@ -169,7 +169,7 @@ Which files are sent for indexing at all (size limits, external storage, etc.) i
 - Excerpts are generated from at most `max_content_size` bytes of each document.
 - Corrections are applied silently: the Full Text Search interface has no place for a "did you mean …" hint.
 - Only words of three letters or more get accent variants, and four or more get spelling corrections. Both only suggest words present in documents the searching user can open under the active filters, and spelling correction runs on page 1 when the uncorrected search returns fewer results than the requested page size (and the word does not already match a visible document).
-- Ignored `ISearchRequest` fields: `getSimpleQueries()` (planned for `1.6.x`), and `getFields()`, `getParts()`, and `getWildcardFields()` (left unimplemented because every document part is already indexed and title substring matching is always active when `use_trigram` is on).
+- Ignored `ISearchRequest` fields: `getFields()`, `getParts()`, and `getWildcardFields()` (left unimplemented because every document part is already indexed and title substring matching is always active when `use_trigram` is on).
 - Everything lives in your Nextcloud database, so index size counts toward its storage and backups (roughly 1–2× the extracted text).
 
 ## How it works

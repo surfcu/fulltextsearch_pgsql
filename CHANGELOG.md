@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Support empty search requests (`SearchRequest::isEmptySearch()` / `empty_search` option): when a request allows an empty search and the search text is blank, return the viewer-accessible documents matching the active filters ordered newest first (`modified_time DESC`); no re-indexing is needed.
+- Support `ISearchRequestSimpleQuery` (`getSimpleQueries()`) comparisons (`TEXT`, `KEYWORD`, `ARRAY`, `BOOL`, `INT_EQ`/`GTE`/`GT`/`LTE`/`LT`, `WILDCARD`, `REGEX`) across `info` keys and known document columns, enforcing the search regex/wildcard bounds and matching nothing on unknown, reserved, or type-mismatched fields; no re-indexing is needed.
 
 ### Fixed
 - Search transaction, pagination, and query-operator hardening: isolate caller-owned search transactions with a savepoint so handled timeouts or PHP errors never abort the caller's transaction or leak planner GUCs, explicitly set `statement_timeout` to `0` when `search_timeout = 0`, pin `pg_trgm.word_similarity_threshold` transaction-locally, clamp large page offsets against integer overflow, skip the trigram title fallback on stopword-only queries, scrub invalid UTF-8 and NUL bytes in tag filters and `PgArray`, preserve `+` and `-` operators past the 32-term cap, and schema-qualify `pg_catalog.simple` / `pg_catalog.regconfig`; no re-indexing is needed.

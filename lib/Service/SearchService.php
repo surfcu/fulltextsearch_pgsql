@@ -12,6 +12,7 @@ use OCA\FullTextSearch_PgSql\Tools\PgArray;
 use OCP\FullTextSearch\Model\IDocumentAccess;
 use OCP\FullTextSearch\Model\IIndexDocument;
 use OCP\FullTextSearch\Model\ISearchRequest;
+use OCP\FullTextSearch\Model\ISearchRequestSimpleQuery;
 use OCP\FullTextSearch\Model\ISearchResult;
 use OCP\IDBConnection;
 
@@ -41,6 +42,49 @@ class SearchService {
 	private const FIELD_WEIGHTS = ['title' => 'A', 'tags' => 'B', 'parts' => 'C', 'content' => 'D'];
 	/** Columns regex and wildcard filters can test. */
 	private const FILTER_COLUMNS = ['title' => 'd.title', 'content' => 'd.content'];
+	/** Scalar string columns addressable through ISearchRequestSimpleQuery. */
+	private const SIMPLE_STRING_COLUMNS = [
+		'title' => 'd.title',
+		'content' => 'd.content',
+		'source' => 'd.source',
+		'hash' => 'd.hash',
+		'owner' => 'd.owner_id',
+		'owner_id' => 'd.owner_id',
+		'provider' => 'd.provider_id',
+		'provider_id' => 'd.provider_id',
+		'document_id' => 'd.document_id',
+	];
+	/** String-array columns addressable through ISearchRequestSimpleQuery. */
+	private const SIMPLE_ARRAY_COLUMNS = [
+		'tags' => 'd.tags',
+		'metatags' => 'd.metatags',
+		'subtags' => 'd.subtags',
+		'links' => 'd.links',
+	];
+	/** Integer columns addressable through ISearchRequestSimpleQuery. */
+	private const SIMPLE_INT_COLUMNS = [
+		'modified_time' => 'd.modified_time',
+		'lastModified' => 'd.modified_time',
+	];
+	/** Internal or access-list fields that must never fall through to d.info. */
+	private const SIMPLE_RESERVED_FIELDS = [
+		'id' => true,
+		'indexed_at' => true,
+		'config' => true,
+		'access' => true,
+		'users' => true,
+		'groups' => true,
+		'circles' => true,
+		'tsv' => true,
+		'title_search' => true,
+		'tags_text' => true,
+		'parts_text' => true,
+		'parts' => true,
+		'info' => true,
+		'subtags_map' => true,
+		'combined' => true,
+		'more' => true,
+	];
 	private const DEFAULT_TRIGRAM_THRESHOLD = 0.3;
 	private const WORD_SIMILARITY_THRESHOLD = 0.6;
 	private const HEADLINE_OPTIONS = 'StartSel="",StopSel="",MaxFragments=3,MaxWords=30,MinWords=12,FragmentDelimiter="' . self::FRAGMENT_DELIMITER . '"';
@@ -258,7 +302,7 @@ class SearchService {
 
 		$languages = $this->configService->getLanguages();
 		$search = $request->getSearch();
-		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens);
+		[$filterConditions, $filterParams] = $this->filters($request, $providerId, $viewerTokens, $languages);
 
 		$size = max(1, min($request->getSize(), $this->configService->getMaxResults()));
 		$page = max(1, $request->getPage());
@@ -619,9 +663,10 @@ class SearchService {
 
 	/**
 	 * @param list<string> $viewerTokens
+	 * @param non-empty-list<string> $languages
 	 * @return array{0: list<string>, 1: list<string>} conditions (each usable by an index), their params
 	 */
-	private function filters(ISearchRequest $request, string $providerId, array $viewerTokens): array {
+	private function filters(ISearchRequest $request, string $providerId, array $viewerTokens, array $languages): array {
 		$conditions = ['d.provider_id = ?', 'd.access && CAST(? AS text[])'];
 		$params = [$providerId, PgArray::toLiteral($viewerTokens)];
 
@@ -675,8 +720,230 @@ class SearchService {
 			$conditions[] = $groupSql;
 			array_push($params, ...$groupParams);
 		}
+		foreach ($request->getSimpleQueries() as $simpleQuery) {
+			if (!$simpleQuery instanceof ISearchRequestSimpleQuery) {
+				$conditions[] = 'FALSE';
+				continue;
+			}
+			[$sqSql, $sqParams] = $this->simpleQueryCondition($simpleQuery, $languages);
+			$conditions[] = $sqSql;
+			array_push($params, ...$sqParams);
+		}
 
 		return [$conditions, $params];
+	}
+
+	/**
+	 * Compile one ISearchRequestSimpleQuery into a parameterised SQL predicate.
+	 *
+	 * @param non-empty-list<string> $languages
+	 * @return array{0: string, 1: list<string>}
+	 */
+	private function simpleQueryCondition(ISearchRequestSimpleQuery $query, array $languages): array {
+		$target = self::resolveSimpleField($query->getField());
+		$rawValues = $query->getValues();
+		if ($target === null || $rawValues === []) {
+			return ['FALSE', []];
+		}
+		[$kind, $ref] = $target;
+		$type = $query->getType();
+
+		if ($type === ISearchRequestSimpleQuery::COMPARE_TYPE_KEYWORD || $type === ISearchRequestSimpleQuery::COMPARE_TYPE_ARRAY) {
+			$flat = [];
+			if ($type === ISearchRequestSimpleQuery::COMPARE_TYPE_ARRAY) {
+				foreach ($rawValues as $item) {
+					foreach (is_array($item) ? $item : [$item] as $sub) {
+						if (is_string($sub) || is_int($sub)) {
+							$flat[] = (string)$sub;
+						}
+					}
+				}
+			} else {
+				foreach ($rawValues as $item) {
+					if (is_string($item) || is_int($item)) {
+						$flat[] = (string)$item;
+					}
+				}
+			}
+			$vals = self::validFilterStrings($flat);
+			if ($vals === []) {
+				return ['FALSE', []];
+			}
+			return match ($kind) {
+				'string_col' => count($vals) === 1
+					? ["$ref = ?", [$vals[0]]]
+					: ["$ref = ANY (CAST(? AS text[]))", [PgArray::toLiteral($vals)]],
+				'array_col' => count($vals) === 1
+					? ["$ref @> CAST(? AS text[])", [PgArray::toLiteral([$vals[0]])]]
+					: ["$ref && CAST(? AS text[])", [PgArray::toLiteral($vals)]],
+				'int_col' => self::simpleIntIn($ref, $vals),
+				'part' => count($vals) === 1
+					? ['(pg_catalog.jsonb_exists(d.parts, ?) AND (d.parts ->> ?) = ?)', [$ref, $ref, $vals[0]]]
+					: ['(pg_catalog.jsonb_exists(d.parts, ?) AND (d.parts ->> ?) = ANY (CAST(? AS text[])))', [$ref, $ref, PgArray::toLiteral($vals)]],
+				'info' => count($vals) === 1
+					? [
+						"((jsonb_typeof(d.info -> ?) = 'string' AND (d.info ->> ?) = ?) OR (jsonb_typeof(d.info -> ?) = 'array' AND pg_catalog.jsonb_exists_any(d.info -> ?, CAST(? AS text[]))))",
+						[$ref, $ref, $vals[0], $ref, $ref, PgArray::toLiteral([$vals[0]])],
+					]
+					: [
+						"((jsonb_typeof(d.info -> ?) = 'string' AND (d.info ->> ?) = ANY (CAST(? AS text[]))) OR (jsonb_typeof(d.info -> ?) = 'array' AND pg_catalog.jsonb_exists_any(d.info -> ?, CAST(? AS text[]))))",
+						[$ref, $ref, PgArray::toLiteral($vals), $ref, $ref, PgArray::toLiteral($vals)],
+					],
+			};
+		}
+
+		$intOp = match ($type) {
+			ISearchRequestSimpleQuery::COMPARE_TYPE_INT_EQ => '=',
+			ISearchRequestSimpleQuery::COMPARE_TYPE_INT_GTE => '>=',
+			ISearchRequestSimpleQuery::COMPARE_TYPE_INT_GT => '>',
+			ISearchRequestSimpleQuery::COMPARE_TYPE_INT_LTE => '<=',
+			ISearchRequestSimpleQuery::COMPARE_TYPE_INT_LT => '<',
+			default => null,
+		};
+		if ($intOp !== null) {
+			$first = $rawValues[0] ?? null;
+			if (!is_int($first) && !(is_string($first) && preg_match('/^-?\d{1,64}\z/', $first) === 1)) {
+				return ['FALSE', []];
+			}
+			$numStr = (string)$first;
+			return match ($kind) {
+				'int_col' => filter_var($numStr, FILTER_VALIDATE_INT) !== false
+					? ["$ref $intOp ?", [$numStr]]
+					: ["($ref::numeric $intOp CAST(? AS numeric))", [$numStr]],
+				'info' => [
+					"((CASE WHEN jsonb_typeof(d.info -> ?) = 'number' THEN (d.info ->> ?)::numeric END) $intOp CAST(? AS numeric))",
+					[$ref, $ref, $numStr],
+				],
+				default => ['FALSE', []],
+			};
+		}
+
+		if ($type === ISearchRequestSimpleQuery::COMPARE_TYPE_BOOL) {
+			$first = $rawValues[0] ?? null;
+			if (is_bool($first)) {
+				$boolJson = $first ? 'true' : 'false';
+			} elseif ($first === 'true' || $first === 'false') {
+				$boolJson = $first;
+			} else {
+				return ['FALSE', []];
+			}
+			return $kind === 'info'
+				? ['((d.info -> ?) = CAST(? AS jsonb))', [$ref, $boolJson]]
+				: ['FALSE', []];
+		}
+
+		if ($type === ISearchRequestSimpleQuery::COMPARE_TYPE_WILDCARD || $type === ISearchRequestSimpleQuery::COMPARE_TYPE_REGEX) {
+			$compiled = self::compilePattern($rawValues[0] ?? null, $type === ISearchRequestSimpleQuery::COMPARE_TYPE_REGEX);
+			if ($compiled === null) {
+				return ['FALSE', []];
+			}
+			[$op, $bound] = $compiled;
+			return match ($kind) {
+				'string_col' => ["$ref $op ?", [$bound]],
+				'array_col' => ["EXISTS (SELECT 1 FROM unnest($ref) AS elem WHERE elem $op ?)", [$bound]],
+				'part' => ["(pg_catalog.jsonb_exists(d.parts, ?) AND (d.parts ->> ?) $op ?)", [$ref, $ref, $bound]],
+				'info' => ["(jsonb_typeof(d.info -> ?) = 'string' AND (d.info ->> ?) $op ?)", [$ref, $ref, $bound]],
+				default => ['FALSE', []],
+			};
+		}
+
+		if ($type === ISearchRequestSimpleQuery::COMPARE_TYPE_TEXT) {
+			$first = $rawValues[0] ?? null;
+			if (!is_string($first) || trim($first) === '') {
+				return ['FALSE', []];
+			}
+			$rawField = $query->getField();
+			if (isset(self::FIELD_WEIGHTS[$rawField])) {
+				$fieldQueries = $this->buildQueries($first, $languages, [], self::FIELD_WEIGHTS[$rawField]);
+				return $fieldQueries === null ? ['FALSE', []] : $this->matchCondition($fieldQueries);
+			}
+			return match ($kind) {
+				'string_col' => $this->simpleTextExpr($ref, [], $first, $languages, null),
+				'array_col' => $this->simpleTextExpr("array_to_string($ref, ' ')", [], $first, $languages, null),
+				'part' => $this->simpleTextExpr('(d.parts ->> ?)', [$ref], $first, $languages, ['pg_catalog.jsonb_exists(d.parts, ?)', [$ref]]),
+				'info' => $this->simpleTextExpr('(d.info ->> ?)', [$ref], $first, $languages, ["jsonb_typeof(d.info -> ?) = 'string'", [$ref]]),
+				default => ['FALSE', []],
+			};
+		}
+
+		return ['FALSE', []];
+	}
+
+	/**
+	 * @return array{0: 'string_col'|'array_col'|'int_col'|'part'|'info', 1: string}|null
+	 */
+	private static function resolveSimpleField(string $field): ?array {
+		if ($field === '' || strlen($field) > self::MAX_FILTER_PATTERN || str_contains($field, "\0") || !mb_check_encoding($field, 'UTF-8')) {
+			return null;
+		}
+		if (isset(self::SIMPLE_STRING_COLUMNS[$field])) {
+			return ['string_col', self::SIMPLE_STRING_COLUMNS[$field]];
+		}
+		if (isset(self::SIMPLE_ARRAY_COLUMNS[$field])) {
+			return ['array_col', self::SIMPLE_ARRAY_COLUMNS[$field]];
+		}
+		if (isset(self::SIMPLE_INT_COLUMNS[$field])) {
+			return ['int_col', self::SIMPLE_INT_COLUMNS[$field]];
+		}
+		if (str_starts_with($field, 'parts.')) {
+			$partKey = substr($field, 6);
+			return $partKey === '' ? null : ['part', $partKey];
+		}
+		if (str_starts_with($field, 'info.')) {
+			$infoKey = substr($field, 5);
+			return ($infoKey === '' || str_starts_with($infoKey, '_')) ? null : ['info', $infoKey];
+		}
+		if (isset(self::SIMPLE_RESERVED_FIELDS[$field]) || str_starts_with($field, '_')) {
+			return null;
+		}
+		return ['info', $field];
+	}
+
+	/**
+	 * @param list<string> $vals
+	 * @return array{0: string, 1: list<string>}
+	 */
+	private static function simpleIntIn(string $col, array $vals): array {
+		$ints = [];
+		foreach ($vals as $val) {
+			if (preg_match('/^-?\d{1,64}\z/', $val) === 1 && filter_var($val, FILTER_VALIDATE_INT) !== false) {
+				$ints[] = $val;
+			}
+		}
+		if ($ints === []) {
+			return ['FALSE', []];
+		}
+		return count($ints) === 1
+			? ["$col = ?", [$ints[0]]]
+			: ["$col = ANY (CAST(? AS bigint[]))", ['{' . implode(',', $ints) . '}']];
+	}
+
+	/**
+	 * @param list<string> $exprParams
+	 * @param non-empty-list<string> $languages
+	 * @param array{0: string, 1: list<string>}|null $guard
+	 * @return array{0: string, 1: list<string>}
+	 */
+	private function simpleTextExpr(string $expr, array $exprParams, string $text, array $languages, ?array $guard): array {
+		$clean = (string)preg_replace('/[^\P{Cc}\t\n\r]+/u', '', mb_scrub($text, 'UTF-8'));
+		if (trim($clean) === '') {
+			return ['FALSE', []];
+		}
+		$conditions = self::languageConditions($languages);
+		$branches = [];
+		$params = [];
+		foreach ($languages as $i => $language) {
+			[$langCond, $langParams] = $conditions[$i];
+			$queryText = $language === 'turkish' ? strtr($clean, ['I' => 'ı', 'İ' => 'i']) : $clean;
+			$normExpr = "CASE WHEN d.config = 'turkish' THEN translate($expr, 'Iİ', 'ıi') ELSE $expr END";
+			$branches[] = "($langCond AND numnode(plainto_tsquery(CAST(? AS pg_catalog.regconfig), ?)) > 0 AND to_tsvector(CAST(? AS pg_catalog.regconfig), $normExpr) @@ plainto_tsquery(CAST(? AS pg_catalog.regconfig), ?))";
+			$params = [...$params, ...$langParams, $language, $queryText, $language, ...$exprParams, ...$exprParams, $language, $queryText];
+		}
+		$matchSql = count($branches) === 1 ? $branches[0] : '(' . implode(' OR ', $branches) . ')';
+		if ($guard !== null) {
+			return ["({$guard[0]} AND $matchSql)", [...$guard[1], ...$params]];
+		}
+		return [$matchSql, $params];
 	}
 
 	/**
@@ -775,24 +1042,36 @@ class SearchService {
 		}
 		foreach ($pairs as [$field, $pattern]) {
 			$column = self::FILTER_COLUMNS[$field] ?? null;
-			if ($column === null || !is_string($pattern) || $pattern === '' || strlen($pattern) > self::MAX_FILTER_PATTERN) {
+			$compiled = $column !== null ? self::compilePattern($pattern, $regex) : null;
+			if ($column === null || $compiled === null) {
 				continue;
 			}
-			if (str_contains($pattern, "\0") || !mb_check_encoding($pattern, 'UTF-8')) {
-				continue;
-			}
-			if ($regex) {
-				if (!self::isPortableRegex($pattern)) {
-					continue;
-				}
-				$entries[] = "$column ~* ?";
-				$params[] = '^(?:' . $pattern . ')$';
-			} else {
-				$entries[] = "$column ILIKE ?";
-				$params[] = strtr($pattern, ['\\' => '\\\\', '%' => '\\%', '_' => '\\_', '*' => '%', '?' => '_']);
-			}
+			[$op, $bound] = $compiled;
+			$entries[] = "$column $op ?";
+			$params[] = $bound;
 		}
 		return $entries === [] ? ['FALSE', []] : ['(' . implode(' OR ', $entries) . ')', $params];
+	}
+
+	/**
+	 * Validate and convert a wildcard or regex pattern under A1's length, UTF-8/NUL, and portability bounds.
+	 *
+	 * @return array{0: '~*'|'ILIKE', 1: string}|null
+	 */
+	private static function compilePattern(mixed $pattern, bool $regex): ?array {
+		if (!is_string($pattern) || $pattern === '' || strlen($pattern) > self::MAX_FILTER_PATTERN) {
+			return null;
+		}
+		if (str_contains($pattern, "\0") || !mb_check_encoding($pattern, 'UTF-8')) {
+			return null;
+		}
+		if ($regex) {
+			if (!self::isPortableRegex($pattern)) {
+				return null;
+			}
+			return ['~*', '^(?:' . $pattern . ')$'];
+		}
+		return ['ILIKE', strtr($pattern, ['\\' => '\\\\', '%' => '\\%', '_' => '\\_', '*' => '%', '?' => '_'])];
 	}
 
 	/** A regex both PCRE and PostgreSQL accept with the same meaning, as far as can be told cheaply. */
