@@ -26,6 +26,7 @@ A search platform for Nextcloud's [Full Text Search](https://github.com/nextclou
 - The PHP version your Nextcloud release requires (8.1+ for Nextcloud 30, 8.3+ for 35), with `zip` for office documents
 - Optional: `catdoc` for Office 97–2003 files (`apt install catdoc`; it provides `catdoc`, `xls2csv` and `catppt`). Without it, `.doc`, `.xls` and `.ppt` files are indexed by name only.
 - Recommended: `poppler-utils` for faster, more robust PDF text (`apt install poppler-utils`). Without it, a bundled parser ([smalot/pdfparser](https://github.com/smalot/pdfparser)) reads PDFs in PHP.
+- On Docker or Nextcloud AIO, install these tools inside the Nextcloud PHP container rather than on the host OS; see [docs/DOCKER.md](docs/DOCKER.md).
 - Optional: the `pg_trgm` extension for typo tolerance. Since PostgreSQL 13 it is a trusted extension and the app creates it automatically when the Nextcloud database user owns the database. Otherwise a superuser can run `CREATE EXTENSION pg_trgm;` in the Nextcloud database.
 
 ## Installation
@@ -48,11 +49,13 @@ sudo -u www-data php /var/www/nextcloud/occ app:enable fulltextsearch_pgsql
 
 `composer install` only matters for PDFs on servers without `pdftotext`: without it the app still works, and PDFs need `pdftotext`. App Store archives already include the parser. `--ignore-platform-req=php` keeps the dev tools' PHP limits from blocking the install; none of them are installed.
 
-For text from old Office files and faster PDFs, install the optional tools:
+For text from old Office files and faster PDFs, install the optional tools on bare-metal Debian/Ubuntu servers:
 
 ```bash
 sudo apt install poppler-utils catdoc
 ```
+
+On **Docker or Nextcloud AIO**, tools installed on the host OS are invisible inside the Nextcloud PHP container: pass `poppler-utils` in `NEXTCLOUD_ADDITIONAL_APKS` on AIO or build a custom image for standard Docker, and note that Alpine images (including AIO) have no `catdoc` apk package. See [docs/DOCKER.md](docs/DOCKER.md) for custom Dockerfiles, static musl `catdoc` builds on Alpine/AIO, and persisting binaries across AIO updates.
 
 For typo correction and title substrings, the Nextcloud database user should own the database, as in [Nextcloud's PostgreSQL setup](https://docs.nextcloud.com/server/latest/admin_manual/configuration_database/linux_database_configuration.html). The app can then enable `pg_trgm` itself on PostgreSQL 13+.
 
@@ -136,6 +139,8 @@ To re-index everything:
 occ fulltextsearch:reset && occ fulltextsearch:index
 ```
 
+If you install `catdoc` after initial indexing, you can selectively re-index only empty `.doc`, `.xls`, and `.ppt` files without resetting the whole index; see [Selective re-indexing](docs/DOCKER.md#selective-re-indexing).
+
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## Upgrading PostgreSQL
@@ -187,7 +192,7 @@ Coming from Elasticsearch? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
 **PDFs have no content.** The indexing warning says why. `occ fulltextsearch:check` shows `pdf_tool`, the tool PDFs currently go through. The bundled parser skips large files, files it cannot parse and encrypted ones; installing `poppler-utils` handles more of them. Scanned PDFs contain images, not text.
 
-**Office documents have no content.** The indexing warning says why. `.doc`, `.xls` and `.ppt` files need `catdoc` (`occ fulltextsearch:check` shows `"catdoc"`); password-protected files cannot be read. For `.docx`, `.xlsx` and `.pptx` indexed before this version, re-index (see [Upgrading](#upgrading)).
+**Office documents have no content.** The indexing warning says why. `.doc`, `.xls` and `.ppt` files need `catdoc` (`occ fulltextsearch:check` shows `"catdoc"`); password-protected files cannot be read. In Docker or Nextcloud AIO setups, `catdoc` must be installed inside the Nextcloud container rather than on the host OS (Alpine images have no `catdoc` package), and files indexed beforehand need selective or full re-indexing — see [docs/DOCKER.md](docs/DOCKER.md). For `.docx`, `.xlsx` and `.pptx` indexed before this version, re-index (see [Upgrading](#upgrading)).
 
 **A document was indexed in the wrong language.** Detection needs a sentence or two of running text in one of the configured languages; titles, lists of names and numbers, and very short texts fall back to the first language. `SELECT document_id, config FROM ftspg_oc_index;` shows each document's language. Make sure the language is configured, then re-index.
 

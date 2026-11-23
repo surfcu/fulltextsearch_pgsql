@@ -5,7 +5,7 @@ Switching platforms means rebuilding the index; nothing is copied from Elasticse
 ## Before you start
 
 - Nextcloud's own database must be PostgreSQL 13+ (with a UTF-8 locale for non-ASCII case folding and accent matching).
-- A bundled pure-PHP parser ([smalot/pdfparser](https://github.com/smalot/pdfparser)) indexes PDFs out of the box up to 64 MB; installing `poppler-utils` (`pdftotext`) is recommended for faster extraction and larger or complex PDFs. Install `catdoc` if you want Office 97–2003 (`.doc`, `.xls`, `.ppt`) content indexed.
+- A bundled pure-PHP parser ([smalot/pdfparser](https://github.com/smalot/pdfparser)) indexes PDFs out of the box up to 64 MB; installing `poppler-utils` (`pdftotext`) is recommended for faster extraction and larger or complex PDFs. Install `catdoc` if you want Office 97–2003 (`.doc`, `.xls`, `.ppt`) content indexed. On Docker or Nextcloud AIO, both tools must be installed inside the Nextcloud PHP container (see [DOCKER.md](DOCKER.md)).
 - Expect the index to take roughly 1–2× the size of the extracted text in your database, and plan backups accordingly.
 
 ## Steps

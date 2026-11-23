@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add a dedicated Docker and Nextcloud AIO installation guide (`docs/DOCKER.md`) covering container-side `poppler-utils` and static musl `catdoc` builds for Alpine/AIO, host persistence across AIO updates, `cp1254` `catdocrc` configuration for Turkish archives, and selective re-indexing of empty `.doc`/`.xls`/`.ppt` files without a full reset, and cross-reference it from `README.md`, `docs/TURKISH.md`, and `docs/MIGRATION.md`.
+
 ## [1.7.0] - 2026-11-20
 
 ### Added

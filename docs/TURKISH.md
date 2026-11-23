@@ -44,13 +44,15 @@ occ fulltextsearch:reset && occ fulltextsearch:index
 
 Her belge, içeriğindeki *ve*, *için*, *the*, *which* gibi sık kelimelere bakılarak kendi dilinde dizinlenir ve her arama iki dilde birden yapılır. Metni olmayan ya da çok kısa belgeler (yalnızca dosya adı) ana dilde dizinlenir. Aynı ayar **Yönetim ayarları → Tam metin arama** sayfasından da yapılabilir.
 
-Eski Office dosyaları (`.doc`, `.xls`, `.ppt`) için sunucuya `catdoc` paketini kurun: `apt install catdoc`.
+Eski Office dosyaları (`.doc`, `.xls`, `.ppt`) için sunucuya `catdoc` paketini kurun (`apt install catdoc`); eski kodlamalı (Unicode olmayan) Türkçe arşivler için `catdocrc` dosyasında `source_charset=cp1254` ayarlayın.
 
 Daha hızlı ve kapsamlı PDF metin çıkarımı için `poppler-utils` paketini kurmanız önerilir (kurulu değilse yerleşik PHP ayrıştırıcısı kullanılır):
 
 ```bash
 sudo apt install poppler-utils
 ```
+
+**Docker ve Nextcloud AIO:** `apt install` yalnızca doğrudan sunucu (bare-metal) kurulumları içindir; konteyner ortamlarında `poppler-utils` ve `catdoc` araçları ana makinede değil **Nextcloud PHP konteynerinin içinde** bulunmalıdır. AIO'da `poppler-utils` için `NEXTCLOUD_ADDITIONAL_APKS` kullanılır; Alpine tabanlı imajlarda (AIO dâhil) `catdoc` paketi olmadığından statik musl derlemesi gerekir. Kurulum, AIO güncellemelerinde kalıcılık ve `cp1254` ayarı için [DOCKER.md](DOCKER.md) kılavuzuna bakın.
 
 Yazım hatalarına toleranslı arama için `pg_trgm` eklentisi gerekir. PostgreSQL 13 ve sonrasında, veritabanının sahibi Nextcloud kullanıcısıysa uygulama bunu kendisi oluşturur. Değilse bir süper kullanıcı şunu çalıştırabilir:
 
@@ -158,3 +160,5 @@ Türkçe ve İngilizce belgeler karışıksa, kök bulma yapmayan `simple` yapı
 **PDF'lerin içeriği aranmıyor.** `poppler-utils` kurulu mu kontrol edin. Taranmış (görüntü) PDF'lerde metin yoktur; bunlar yalnızca adlarıyla bulunur.
 
 **Yazım hatası toleransı çalışmıyor.** `occ fulltextsearch:check` çıktısında `"pg_trgm": false` görünüyorsa eklentiyi oluşturun ve ardından `occ fulltextsearch:test` çalıştırın.
+
+**Eski Office dosyalarının (`.doc`, `.xls`, `.ppt`) içeriği aranmıyor.** `occ fulltextsearch:check` çıktısında `"catdoc"` yolunun göründüğünü doğrulayın. Docker veya Nextcloud AIO kullanıyorsanız `catdoc` ana makineye değil Nextcloud konteynerinin içine kurulmalıdır (Alpine tabanlı imajlarda `catdoc` paketi yoktur). `catdoc` sonradan eklendiyse boş kalan `.doc`/`.xls`/`.ppt` dosyalarını tüm dizini sıfırlamadan seçici olarak yeniden dizinlemek ve eski Türkçe arşivler için `source_charset=cp1254` ayarlamak üzere [DOCKER.md](DOCKER.md#selective-re-indexing) kılavuzuna bakın.
